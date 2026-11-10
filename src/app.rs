@@ -3,15 +3,16 @@
 use crate::render::Renderer;
 use crate::types::Color;
 use crate::ui::{KeyInput, Ui, WheelPhase, WindowRequest};
-use crate::view::{Cursor, ViewFn};
+use crate::view::{Cursor, Mods, ViewFn};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
+use winit::dpi::{LogicalPosition, LogicalSize as Size};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{CursorIcon, Window, WindowId};
 
 /// Who draws the window's title bar.
@@ -121,9 +122,11 @@ impl<S: 'static> App<S> {
             gfx: Rc::new(RefCell::new(None)),
             cursor: (0.0, 0.0),
             shown_cursor: Cursor::Default,
-            command: false,
+            mods: Default::default(),
             wake_at: None,
             transparent: false,
+            clipboard: Clipboard::new(&event_loop),
+            ime: (false, None),
         };
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -272,15 +275,242 @@ struct Runner<S> {
     cursor: (f32, f32),
     /// Pointer shape last given to the window.
     shown_cursor: Cursor,
-    /// Ctrl / Cmd is held: key presses are shortcuts, not text.
-    command: bool,
+    mods: winit::keyboard::ModifiersState,
     /// When the UI asked to be redrawn without input (caret blink).
     wake_at: Option<web_time::Instant>,
     /// The surface was set up with alpha (`App::transparent` on a desktop).
     transparent: bool,
+    clipboard: Clipboard,
+    /// IME allowed, and the caret area last reported to it.
+    ime: (bool, Option<crate::Rect>),
+}
+
+/// The system clipboard: `arboard` on desktops (feature `clipboard`), the browser's clipboard
+/// events on the web, otherwise a buffer private to the app.
+struct Clipboard {
+    local: String,
+    #[cfg(all(feature = "clipboard", not(target_arch = "wasm32")))]
+    sys: Option<arboard::Clipboard>,
+    /// Web: paste / cut arriving from the page's clipboard events.
+    #[cfg(target_arch = "wasm32")]
+    inbox: Rc<RefCell<Vec<WebClip>>>,
+    #[cfg(target_arch = "wasm32")]
+    shared: String,
+}
+
+#[cfg(target_arch = "wasm32")]
+enum WebClip {
+    Paste(String),
+    Cut,
+}
+
+impl Clipboard {
+    #[allow(unused_variables)]
+    fn new(event_loop: &EventLoop<Wake>) -> Self {
+        #[cfg(target_arch = "wasm32")]
+        let inbox = {
+            use wasm_bindgen::closure::Closure;
+            let inbox: Rc<RefCell<Vec<WebClip>>> = Rc::default();
+            let (a, b) = (inbox.clone(), inbox.clone());
+            let (pa, pb) = (event_loop.create_proxy(), event_loop.create_proxy());
+            let on_paste = Closure::<dyn FnMut(String)>::new(move |t: String| {
+                a.borrow_mut().push(WebClip::Paste(t));
+                let _ = pa.send_event(Wake);
+            });
+            let on_cut = Closure::<dyn FnMut()>::new(move || {
+                b.borrow_mut().push(WebClip::Cut);
+                let _ = pb.send_event(Wake);
+            });
+            clip_install(&on_paste, &on_cut);
+            (on_paste.forget(), on_cut.forget());
+            inbox
+        };
+        Clipboard {
+            local: String::new(),
+            #[cfg(all(feature = "clipboard", not(target_arch = "wasm32")))]
+            sys: None,
+            #[cfg(target_arch = "wasm32")]
+            inbox,
+            #[cfg(target_arch = "wasm32")]
+            shared: String::new(),
+        }
+    }
+
+    #[cfg(all(feature = "clipboard", not(target_arch = "wasm32")))]
+    fn sys(&mut self) -> Option<&mut arboard::Clipboard> {
+        if self.sys.is_none() {
+            self.sys = arboard::Clipboard::new().ok(); // lazily: no X11 round-trips at startup
+        }
+        self.sys.as_mut()
+    }
+
+    fn set(&mut self, text: String) {
+        #[cfg(all(feature = "clipboard", not(target_arch = "wasm32")))]
+        if let Some(c) = self.sys() {
+            let _ = c.set_text(text.clone());
+        }
+        #[cfg(target_arch = "wasm32")]
+        clip_write(&text);
+        self.local = text;
+    }
+
+    fn get(&mut self) -> String {
+        #[cfg(all(feature = "clipboard", not(target_arch = "wasm32")))]
+        if let Some(t) = self.sys().and_then(|c| c.get_text().ok()) {
+            return t;
+        }
+        self.local.clone()
+    }
+}
+
+// The browser only lets a page touch the clipboard inside `copy` / `cut` / `paste` events,
+// and only fires them if the key press keeps its default action. winit cancels every key
+// press on the canvas, so Cmd/Ctrl+C/X/V are taken out of its way first (capture phase).
+// The selection is mirrored here so the synchronous `copy` handler can hand it over.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
+let sel = "";
+export function clip_selection(s) { sel = s; }
+export function clip_write(s) {
+  try { navigator.clipboard.writeText(s).catch(() => {}); } catch (_) {}
+}
+export function clip_install(onPaste, onCut) {
+  window.addEventListener("keydown", (e) => {
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && ["KeyC", "KeyX", "KeyV"].includes(e.code)) e.stopPropagation();
+  }, true);
+  const give = (e) => {
+    if (!sel || !e.clipboardData) return false;
+    e.clipboardData.setData("text/plain", sel);
+    e.preventDefault();
+    return true;
+  };
+  document.addEventListener("copy", (e) => { give(e); });
+  document.addEventListener("cut", (e) => { if (give(e)) onCut(); });
+  document.addEventListener("paste", (e) => {
+    const t = e.clipboardData && e.clipboardData.getData("text/plain");
+    if (t) { e.preventDefault(); onPaste(t); }
+  });
+}
+"#)]
+extern "C" {
+    fn clip_selection(s: &str);
+    fn clip_write(s: &str);
+    fn clip_install(on_paste: &wasm_bindgen::closure::Closure<dyn FnMut(String)>, on_cut: &wasm_bindgen::closure::Closure<dyn FnMut()>);
 }
 
 impl<S: 'static> Runner<S> {
+    /// Carries out what the UI asked of the window and keeps IME / clipboard in sync with it.
+    /// Must run while a press is still being handled: AppKit starts a window move from the
+    /// current mouse-down event.
+    fn sync(&mut self) {
+        let Some(w) = &self.window else { return };
+        let cursor = self.app.ui.cursor;
+        if cursor != self.shown_cursor {
+            self.shown_cursor = cursor;
+            w.set_cursor(match cursor {
+                Cursor::Default => CursorIcon::Default,
+                Cursor::Pointer => CursorIcon::Pointer,
+                Cursor::Text => CursorIcon::Text,
+                Cursor::ResizeH => CursorIcon::EwResize,
+                Cursor::ResizeV => CursorIcon::NsResize,
+                Cursor::Grab => CursorIcon::Grab,
+                Cursor::Grabbing => CursorIcon::Grabbing,
+                Cursor::NotAllowed => CursorIcon::NotAllowed,
+            });
+        }
+        for r in std::mem::take(&mut self.app.ui.requests) {
+            match r {
+                WindowRequest::DragWindow => {
+                    let _ = w.drag_window();
+                }
+                WindowRequest::Zoom => w.set_maximized(!w.is_maximized()),
+                WindowRequest::SetClipboard(t) => self.clipboard.set(t),
+            }
+        }
+        let ui = &self.app.ui;
+        if ui.has_focus() != self.ime.0 {
+            self.ime = (ui.has_focus(), None);
+            w.set_ime_allowed(self.ime.0);
+        }
+        let area = ui.ime_area();
+        if self.ime.0 && area != self.ime.1 {
+            if let Some(r) = area {
+                w.set_ime_cursor_area(LogicalPosition::new(r.x as f64, r.y as f64), Size::new(r.w as f64, r.h as f64));
+            }
+            self.ime.1 = area;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let sel = ui.selection_text().unwrap_or_default();
+            if sel != self.clipboard.shared {
+                clip_selection(&sel);
+                self.clipboard.shared = sel;
+            }
+        }
+    }
+
+    /// A key press with Cmd/Ctrl held: editing shortcuts (by the letter of the layout, or by
+    /// its position for layouts without Latin letters, like Russian).
+    fn shortcut(&mut self, logical: &Key, physical: PhysicalKey) -> bool {
+        let ch = match logical {
+            Key::Character(c) if c.is_ascii() => c.to_ascii_lowercase().chars().next(),
+            _ => match physical {
+                PhysicalKey::Code(KeyCode::KeyA) => Some('a'),
+                PhysicalKey::Code(KeyCode::KeyC) => Some('c'),
+                PhysicalKey::Code(KeyCode::KeyV) => Some('v'),
+                PhysicalKey::Code(KeyCode::KeyX) => Some('x'),
+                PhysicalKey::Code(KeyCode::KeyY) => Some('y'),
+                PhysicalKey::Code(KeyCode::KeyZ) => Some('z'),
+                _ => None,
+            },
+        };
+        let ui = &mut self.app.ui;
+        match ch {
+            Some('a') => ui.key(KeyInput::SelectAll),
+            Some('c') => ui.key(KeyInput::Copy),
+            Some('x') => ui.key(KeyInput::Cut),
+            Some('v') => {
+                let t = self.clipboard.get();
+                self.app.ui.paste(&t)
+            }
+            Some('z') if self.mods.shift_key() => ui.key(KeyInput::Redo),
+            Some('z') => ui.key(KeyInput::Undo),
+            Some('y') if !cfg!(target_os = "macos") => ui.key(KeyInput::Redo),
+            _ => false,
+        }
+    }
+
+    /// Navigation keys. Cmd (Meta) + arrows follow macOS: ←/→ to the row's ends, ↑/↓ to the
+    /// text's ends, Backspace to the row start. Ctrl/Alt + arrows go by words.
+    fn nav_key(&mut self, k: KeyInput) -> bool {
+        let ui = &mut self.app.ui;
+        let m = self.mods;
+        if !m.super_key() {
+            return ui.key(k);
+        }
+        let plain = Mods { shift: m.shift_key(), command: false, alt: m.alt_key() };
+        let row = |ui: &mut Ui<S>, k: KeyInput| {
+            ui.set_modifiers(plain);
+            let r = ui.key(k);
+            ui.set_modifiers(Mods { command: true, ..plain });
+            r
+        };
+        match k {
+            KeyInput::Left => row(ui, KeyInput::Home),
+            KeyInput::Right => row(ui, KeyInput::End),
+            KeyInput::Up => ui.key(KeyInput::Home),
+            KeyInput::Down => ui.key(KeyInput::End),
+            KeyInput::Backspace => {
+                ui.set_modifiers(Mods { shift: true, ..plain });
+                let r = ui.key(KeyInput::Home);
+                ui.set_modifiers(Mods { command: true, ..plain });
+                // Without a selection (caret already at the row start) delete one character.
+                r && ui.key(KeyInput::Backspace)
+            }
+            _ => ui.key(k),
+        }
+    }
+
     fn redraw(&mut self) {
         let Some(window) = &self.window else { return };
         let mut slot = self.gfx.borrow_mut();
@@ -326,6 +556,8 @@ impl<S: 'static> Runner<S> {
         if ui.animating {
             window.request_redraw();
         }
+        drop(slot);
+        self.sync(); // the caret may have moved for the IME
     }
 
     fn scale(&self) -> f32 {
@@ -335,6 +567,23 @@ impl<S: 'static> Runner<S> {
 
 impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _: Wake) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let clips = std::mem::take(&mut *self.clipboard.inbox.borrow_mut());
+            let mut used = false;
+            for c in clips {
+                used |= match c {
+                    WebClip::Paste(t) => self.app.ui.paste(&t),
+                    WebClip::Cut => self.app.ui.key(KeyInput::Cut),
+                };
+            }
+            if used {
+                self.sync();
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+        }
         // Applied here rather than left for the next frame, so a send that changes nothing
         // visible (cancelled task) costs no redraw.
         if self.app.ui.pump() {
@@ -443,7 +692,9 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
                 ui.wheel(self.cursor, dy, phase)
             }
             WindowEvent::ModifiersChanged(m) => {
-                self.command = m.state().control_key() || m.state().super_key();
+                let m = m.state();
+                self.mods = m;
+                ui.set_modifiers(Mods { shift: m.shift_key(), command: m.control_key() || m.super_key(), alt: m.alt_key() });
                 false
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
@@ -452,18 +703,31 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
                     Key::Named(NamedKey::Delete) => Some(KeyInput::Delete),
                     Key::Named(NamedKey::ArrowLeft) => Some(KeyInput::Left),
                     Key::Named(NamedKey::ArrowRight) => Some(KeyInput::Right),
+                    Key::Named(NamedKey::ArrowUp) => Some(KeyInput::Up),
+                    Key::Named(NamedKey::ArrowDown) => Some(KeyInput::Down),
                     Key::Named(NamedKey::Home) => Some(KeyInput::Home),
                     Key::Named(NamedKey::End) => Some(KeyInput::End),
                     Key::Named(NamedKey::Enter) => Some(KeyInput::Enter),
                     Key::Named(NamedKey::Escape) => Some(KeyInput::Escape),
                     _ => None,
                 };
+                let command = self.mods.control_key() || self.mods.super_key();
                 match (named, &event.text) {
-                    (Some(k), _) => ui.key(k),
-                    (None, Some(text)) if !self.command => ui.text_input(text),
+                    (Some(k), _) => self.nav_key(k),
+                    _ if command => self.shortcut(&event.logical_key, event.physical_key),
+                    (None, Some(text)) => self.app.ui.text_input(text),
                     _ => false,
                 }
             }
+            WindowEvent::Ime(ime) => match ime {
+                Ime::Preedit(text, cursor) => ui.ime_preedit(&text, cursor),
+                Ime::Commit(text) => {
+                    ui.ime_preedit("", None);
+                    ui.text_input(&text)
+                }
+                Ime::Disabled => ui.ime_preedit("", None),
+                Ime::Enabled => false,
+            },
             WindowEvent::Touch(t) => {
                 let pos = (t.location.x as f32 / scale, t.location.y as f32 / scale);
                 match t.phase {
@@ -474,32 +738,7 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
             }
             _ => false,
         };
-        // Must run while the press is still being handled: AppKit starts the move from the
-        // current mouse-down event.
-        if let Some(w) = &self.window {
-            let cursor = self.app.ui.cursor;
-            if cursor != self.shown_cursor {
-                self.shown_cursor = cursor;
-                w.set_cursor(match cursor {
-                    Cursor::Default => CursorIcon::Default,
-                    Cursor::Pointer => CursorIcon::Pointer,
-                    Cursor::Text => CursorIcon::Text,
-                    Cursor::ResizeH => CursorIcon::EwResize,
-                    Cursor::ResizeV => CursorIcon::NsResize,
-                    Cursor::Grab => CursorIcon::Grab,
-                    Cursor::Grabbing => CursorIcon::Grabbing,
-                    Cursor::NotAllowed => CursorIcon::NotAllowed,
-                });
-            }
-            for r in std::mem::take(&mut self.app.ui.requests) {
-                match r {
-                    WindowRequest::DragWindow => {
-                        let _ = w.drag_window();
-                    }
-                    WindowRequest::Zoom => w.set_maximized(!w.is_maximized()),
-                }
-            }
-        }
+        self.sync();
         if dirty {
             if let Some(w) = &self.window {
                 w.request_redraw();
