@@ -226,6 +226,16 @@ pub enum WheelPhase {
 
 thread_local! {
     static PENDING: RefCell<Vec<(f32, Box<dyn Any>)>> = const { RefCell::new(Vec::new()) };
+    static COPIES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Puts `text` on the system clipboard. Call it from any event handler, e.g. a "copy"
+/// button under a message: `button("Copy", move |_: &mut App| ruru::copy_text(msg.clone()))`.
+/// It reaches the runner as [`WindowRequest::SetClipboard`] right after the handler (a tap)
+/// or with the next frame.
+pub fn copy_text(text: impl Into<String>) {
+    let text = text.into();
+    COPIES.with(|c| c.borrow_mut().push(text));
 }
 
 /// Runs `f` on the app state after `seconds`, then redraws. Call it from any event
@@ -1342,6 +1352,8 @@ impl<S: 'static> Ui<S> {
                 i += 1;
             }
         }
+        // From handlers that ran outside a tap (keys, timers, background updates).
+        self.take_copies();
 
         // Scroll physics: inertia inside the content, a spring back from beyond its ends.
         let drag = self.ptr.drag_scroll.filter(|_| self.ptr.dragging);
@@ -1793,6 +1805,8 @@ impl<S: 'static> Ui<S> {
                 self.activate(i);
             }
         }
+        // Still inside the click: the web only lets a page write the clipboard there.
+        self.take_copies();
         true
     }
 
@@ -1831,6 +1845,11 @@ impl<S: 'static> Ui<S> {
             }
             _ => {}
         }
+    }
+
+    /// Moves texts queued by [`copy_text`] into [`Ui::requests`].
+    fn take_copies(&mut self) {
+        COPIES.with(|c| self.requests.extend(c.borrow_mut().drain(..).map(WindowRequest::SetClipboard)));
     }
 
     /// True while a text field has keyboard focus.

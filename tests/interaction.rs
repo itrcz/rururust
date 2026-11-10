@@ -2144,3 +2144,19 @@ fn scroll_bar_press_keeps_the_text_selection() {
     click(&mut ui, (t[0] + 2.0, t[1] + 5.0));
     assert!(ui.selection_text().is_some_and(|s| s.len() > 100), "a click on the bar is not a click on the text");
 }
+
+#[test]
+fn copy_text_from_a_handler_reaches_the_clipboard() {
+    let mut ui = Ui::new(String::from("answer text"), |_: &String| {
+        button("copy", |s: &mut String| ruru::copy_text(s.clone())).fill()
+    });
+    ui.frame((200.0, 200.0));
+    click(&mut ui, (100.0, 100.0));
+    assert_eq!(ui.requests, vec![ruru::WindowRequest::SetClipboard("answer text".into())], "right in the tap");
+    // From a timer: with the next frame.
+    ui.requests.clear();
+    ruru::after(0.0, |_: &mut String| ruru::copy_text("later"));
+    ui.frame((200.0, 200.0));
+    ui.frame((200.0, 200.0));
+    assert_eq!(ui.requests, vec![ruru::WindowRequest::SetClipboard("later".into())]);
+}
