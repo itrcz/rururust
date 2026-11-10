@@ -67,17 +67,17 @@ fn vs(@builtin(vertex_index) vi: u32, in: Instance) -> VOut {
     return o;
 }
 
-// Distance (x) and outward unit normal (yz) of a rounded box whose corners are
-// superellipses ("squircles"), like iOS continuous corners; pills and discs fall back to
-// true circles. The superellipse value is divided by its gradient length so it stays a
+// Distance (x) and outward unit normal (yz) of a rounded box. Corners are circular arcs
+// (as on macOS), or with `smooth` superellipses ("squircles") like iOS continuous corners;
+// pills and discs are true circles either way. The superellipse value is divided by its gradient length so it stays a
 // real distance near the edge (crisp AA, correct bevel), and the normal is analytic.
 // Inside the straight part the normal is blended across the diagonal over `soft` px so
 // the glass bevel has no crease running into the corners.
 // (Distance-with-gradient formulation after al1h3n/liquid-rust, MIT/Apache-2.0.)
-fn sdg_shape(p: vec2f, half: vec2f, r_in: f32, soft: f32) -> vec3f {
+fn sdg_shape(p: vec2f, half: vec2f, r_in: f32, soft: f32, cont: bool) -> vec3f {
     let m = min(half.x, half.y);
     let k = clamp(r_in / max(m, 0.001), 0.0, 1.0);
-    let t = smoothstep(0.55, 1.0, k);
+    let t = select(1.0, smoothstep(0.55, 1.0, k), cont);
     let n = mix(2.8, 2.0, t);
     let r = min(r_in * mix(1.2, 1.0, t), m);
     let sg = select(vec2f(-1.0), vec2f(1.0), p >= vec2f(0.0));
@@ -94,8 +94,8 @@ fn sdg_shape(p: vec2f, half: vec2f, r_in: f32, soft: f32) -> vec3f {
     return vec3f(g - r, sg * normalize(e));
 }
 
-fn sd_shape(p: vec2f, half: vec2f, r_in: f32) -> f32 {
-    return sdg_shape(p, half, r_in, 1.0).x;
+fn sd_shape(p: vec2f, half: vec2f, r_in: f32, cont: bool) -> f32 {
+    return sdg_shape(p, half, r_in, 1.0, cont).x;
 }
 
 // Quadratic smooth minimum (Inigo Quilez): the blended distance, and how much of `b` to
@@ -112,7 +112,7 @@ fn fuse(dg: vec3f, xy: vec2f, pane: vec4f, r: f32, k: f32, soft: f32) -> vec3f {
     if pane.z <= 0.0 {
         return dg;
     }
-    let b = sdg_shape(xy - pane.xy, pane.zw, r, soft);
+    let b = sdg_shape(xy - pane.xy, pane.zw, r, soft, true);
     let w = smin_w(dg.x, b.x, k);
     let n = mix(dg.yz, b.yz, w.y);
     return vec3f(w.x, n / max(length(n), 1e-4));
@@ -202,13 +202,15 @@ fn noise(p: vec2f) -> f32 {
 fn fs(in: VOut) -> @location(0) vec4f {
     let p = in.xy - in.rect.xy;
     let half = in.rect.zw;
-    let radius = in.p0.x;
+    // A negative radius marks continuous corners; glass always has them.
+    let radius = abs(in.p0.x);
     let kind = in.p0.w;
+    let cont = in.p0.x < 0.0 || kind == 2.0;
 
     // Glass only: bevel width in px, never wider than the pane's half size.
     let depth = clamp(in.c1.y * g.scale, 1.0, max(min(half.x, half.y), 1.0));
     let soft = select(1.0, depth * 0.35, kind == 2.0);
-    var dg = sdg_shape(p, half, radius, soft);
+    var dg = sdg_shape(p, half, radius, soft, cont);
     if in.np.z > 0.0 {
         dg = fuse(dg, in.xy, in.n0, in.np.x, in.np.z, soft);
         dg = fuse(dg, in.xy, in.n1, in.np.y, in.np.z, soft);
@@ -217,8 +219,8 @@ fn fs(in: VOut) -> @location(0) vec4f {
     // The clip has the same squircle corners as the view that clips, so a child filling it
     // lines up with that view's own background and border.
     var dc = sd_round_box(in.xy - in.clip.xy, in.clip.zw, 0.0);
-    if in.p1.z > 0.0 {
-        dc = sd_shape(in.xy - in.clip.xy, in.clip.zw, in.p1.z);
+    if in.p1.z != 0.0 {
+        dc = sd_shape(in.xy - in.clip.xy, in.clip.zw, abs(in.p1.z), in.p1.z < 0.0);
     }
     let clip = clamp(0.5 - dc, 0.0, 1.0);
     let alpha = clip * in.p1.w;
@@ -233,7 +235,7 @@ fn fs(in: VOut) -> @location(0) vec4f {
         var a = 0.5 - 0.5 * erf(d / (sigma * 1.41421));
         if in.c1.z > 0.5 {
             // Don't darken underneath a translucent caster.
-            a *= clamp(0.5 + sd_shape(p + in.c1.xy * g.scale, half, radius), 0.0, 1.0);
+            a *= clamp(0.5 + sd_shape(p + in.c1.xy * g.scale, half, radius, cont), 0.0, 1.0);
         }
         return premul(vec4f(in.c0.rgb, in.c0.a * a)) * alpha;
     }

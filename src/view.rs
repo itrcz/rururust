@@ -158,6 +158,8 @@ pub(crate) struct Style {
     pub max: (f32, f32),
     /// Children are cut to this view's rounded shape.
     pub clip: bool,
+    /// Continuous (squircle) corners instead of circular arcs (`.smooth()`).
+    pub smooth: bool,
     /// Size changes glide to the new value instead of jumping.
     pub animate: bool,
     /// Highlight laid over the background while the pointer is over the view.
@@ -194,6 +196,7 @@ impl Default for Style {
             min: (0.0, 0.0),
             max: (f32::INFINITY, f32::INFINITY),
             clip: false,
+            smooth: false,
             animate: false,
             hover: None,
             cursor: None,
@@ -664,6 +667,13 @@ impl<S> View<S> {
     }
     pub fn glass_with(mut self, glass: Glass) -> Self {
         self.style.glass = Some(glass);
+        self
+    }
+    /// Continuous corners, like iOS app icons: the curve eases into the straight edges instead
+    /// of a circular arc meeting them (`.radius()` sets the size). Corners are circular by
+    /// default, as on macOS; glass always has continuous ones.
+    pub fn smooth(mut self) -> Self {
+        self.style.smooth = true;
         self
     }
     /// Cuts the children to this view's rounded shape (`.radius()`): a list in a rounded

@@ -443,6 +443,8 @@ struct Xf {
     opacity: f32,
     clip: Rect,
     clip_r: f32,
+    /// The clip's corners are continuous (`.smooth()`), not circular.
+    clip_smooth: bool,
     fg: Color,
 }
 
@@ -452,17 +454,19 @@ impl Xf {
     }
     /// Narrows the clip to the screen rect `r` with corner radius `radius`. The GPU clips to
     /// one rounded rectangle, so nested clips keep the corners of whichever is inside.
-    fn clip_to(&mut self, r: Rect, radius: f32) {
+    fn clip_to(&mut self, r: Rect, radius: f32, smooth: bool) {
         let next = self.clip.intersect(&r);
         let near = |a: &Rect, b: &Rect| {
             (a.x - b.x).abs() < 0.5 && (a.y - b.y).abs() < 0.5 && (a.w - b.w).abs() < 0.5 && (a.h - b.h).abs() < 0.5
         };
-        self.clip_r = if near(&next, &r) {
-            radius
+        (self.clip_r, self.clip_smooth) = if near(&next, &r) {
+            (radius, smooth)
         } else if near(&next, &self.clip) {
-            self.clip_r
+            (self.clip_r, self.clip_smooth)
+        } else if radius > self.clip_r {
+            (radius, smooth)
         } else {
-            self.clip_r.max(radius)
+            (self.clip_r, self.clip_smooth)
         };
         self.clip = next;
     }
@@ -496,6 +500,8 @@ struct Painter<'a, S> {
     time: f32,
     /// A looping animation (spinner) is on screen.
     spin: bool,
+    /// The view being painted has `.smooth()` corners (its own quads only).
+    smooth: bool,
     /// Sizes changed during paint (lazy rows were measured): lay out again next frame.
     relayout: bool,
     /// Selectable texts and areas on screen, for input.
@@ -649,6 +655,7 @@ impl<S> Painter<'_, S> {
             opacity: t.clamp(0.0, 1.0),
             clip: screen,
             clip_r: 0.0,
+            clip_smooth: false,
             fg: m.fg,
         };
         let r = Rect::new(x, y, w, h);
@@ -698,8 +705,9 @@ impl<S> Painter<'_, S> {
             c0: [0.0; 4],
             c1: [0.0; 4],
             border: [0.0; 4],
-            p0: [radius * xf.s, 0.0, 0.0, kind],
-            p1: [0.0, 1.0, xf.clip_r, xf.opacity],
+            // A negative radius asks the shader for continuous corners (glass always has them).
+            p0: [if self.smooth && kind != KIND_GLASS { -radius * xf.s } else { radius * xf.s }, 0.0, 0.0, kind],
+            p1: [0.0, 1.0, if xf.clip_smooth { -xf.clip_r } else { xf.clip_r }, xf.opacity],
             ..Zeroable::zeroed()
         }
     }
@@ -789,16 +797,21 @@ impl<S> Painter<'_, S> {
             return; // culled
         }
 
+        self.smooth = st.smooth;
         if let Some(sh) = st.shadow {
             let translucent = st.glass.is_some() || !matches!(st.bg, Some(Fill::Solid(c)) if c.a >= 1.0);
             self.shadow(&xf, r, st.radius, sh, translucent);
         }
+        // A container draws its border last, over its children, its hover and (for glass) its
+        // background: a child background running to the edge (a sidebar in a rounded panel)
+        // would cover it otherwise.
+        let late_border = st
+            .border
+            .filter(|_| st.clip || ln.clip || st.hover.is_some() || st.glass.is_some() || !ln.children.is_empty())
+            .map(|b| (xf, b));
         if let Some(g) = st.glass {
-            self.glass(&xf, r, st.radius, g, st.border);
+            self.glass(&xf, r, st.radius, g, st.border.filter(|_| late_border.is_none()));
         }
-        // A clipping view draws its border over the children: a child background that runs to
-        // the edge (a sidebar in a rounded panel) would cover it otherwise.
-        let late_border = st.border.filter(|_| (st.clip || ln.clip) && st.glass.is_none()).map(|b| (xf, b));
         match (st.bg, st.border.filter(|_| late_border.is_none()), st.glass) {
             (Some(bg), border, None) => self.fill(&xf, r, st.radius, bg, border),
             (Some(bg), _, Some(_)) => self.fill(&xf, r, st.radius, bg, None),
@@ -822,8 +835,11 @@ impl<S> Painter<'_, S> {
                 self.fill(&xf, r, st.radius, Fill::Solid(c.alpha(c.a * t.min(1.0))), None);
             }
         }
+        self.smooth = false;
         if st.clip || ln.clip {
-            xf.clip_to(sr, st.radius * xf.s);
+            // Inside the border: children never show through or under it.
+            let bw = st.border.map_or(0.0, |b| b.0) * xf.s;
+            xf.clip_to(sr.inflate(-bw), (st.radius * xf.s - bw).max(0.0), st.smooth);
         }
 
         self.area_hit(&xf, id, sr);
@@ -1107,7 +1123,7 @@ impl<S> Painter<'_, S> {
                 let has_refresh = refresh.is_some();
                 self.hit(&xf, id, sr, Action::Scroll { refresh: refresh.map(|r| r.1) });
                 let mut cxf = xf;
-                cxf.clip_to(sr, st.radius * xf.s);
+                cxf.clip_to(sr, st.radius * xf.s, st.smooth);
                 let cid = child_id(id, 0, child.key);
                 self.sticky = Some(r.y + pad[1]);
                 self.tbase = tbase;
@@ -1207,7 +1223,9 @@ impl<S> Painter<'_, S> {
             }
         }
         if let Some((bxf, b)) = late_border {
+            self.smooth = st.smooth;
             self.fill(&bxf, r, st.radius, Fill::Solid(Color::CLEAR), Some(b));
+            self.smooth = false;
         }
     }
 }
@@ -1453,6 +1471,7 @@ impl<S: 'static> Ui<S> {
             opacity: 1.0,
             clip: Rect::new(0.0, 0.0, size.0, size.1),
             clip_r: 0.0,
+            clip_smooth: false,
             fg,
         };
         let frame = self.frame;
@@ -1478,6 +1497,7 @@ impl<S: 'static> Ui<S> {
             now,
             time: (now - self.started).as_secs_f32(),
             spin: false,
+            smooth: false,
             relayout: false,
             texts: &mut self.sel.texts,
             areas: &mut self.sel.areas,

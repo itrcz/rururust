@@ -2160,3 +2160,30 @@ fn copy_text_from_a_handler_reaches_the_clipboard() {
     ui.frame((200.0, 200.0));
     assert_eq!(ui.requests, vec![ruru::WindowRequest::SetClipboard("later".into())]);
 }
+
+#[test]
+fn bordered_clip_draws_its_border_over_children_and_cuts_them_inside_it() {
+    let border = Color::WHITE.alpha(0.1);
+    let mut ui = Ui::new(0, move |_: &i32| {
+        zstack(rect().fill().background(Color::RED).on_tap(|n: &mut i32| *n += 1))
+            .size(200.0, 100.0)
+            .background(Color::BLUE)
+            .radius(20.0)
+            .border(1.0, border)
+            .clip()
+            .place(Align::Start, Align::Start)
+    });
+    ui.frame((400.0, 400.0));
+    // The corner outside the arc is not the child's; just inside it is.
+    for (pos, taps) in [((3.0, 3.0), 0), ((9.0, 9.0), 1), ((100.0, 50.0), 2)] {
+        click(&mut ui, pos);
+        assert_eq!(ui.state, taps, "tap at {pos:?}");
+    }
+    let qs: Vec<ruru::Quad> = ui.list.cmds.iter().filter_map(|c| if let ruru::Cmd::Quad(q) = c { Some(*q) } else { None }).collect();
+    let last = qs.last().unwrap();
+    assert_eq!(last.border, [border.r, border.g, border.b, border.a], "the border comes last, over the child");
+    let red = Color::RED;
+    let child = qs.iter().find(|q| q.c0 == [red.r, red.g, red.b, red.a]).unwrap();
+    assert_eq!(child.clip, [1.0, 1.0, 198.0, 98.0], "children are cut inside the border");
+    assert_eq!(child.p1[2], 19.0, "with the inner radius");
+}
