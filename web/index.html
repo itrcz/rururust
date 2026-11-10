@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+    <title>ruru showcase</title>
+    <style>
+      html, body { margin: 0; height: 100%; overflow: hidden; background: #05060f; }
+      canvas { touch-action: none; }
+      #err {
+        display: none; position: fixed; inset: 0; z-index: 10; overflow: auto; margin: 0; padding: 24px;
+        background: #05060f; color: #ff9f9f; font: 13px/1.5 ui-monospace, Menlo, monospace; white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <pre id="err"></pre>
+    <script>
+      // Anything that goes wrong is shown on the page instead of a blank screen.
+      function fail(msg) {
+        var el = document.getElementById("err");
+        el.style.display = "block";
+        el.textContent += msg + "\n\n";
+      }
+      window.addEventListener("error", function (e) {
+        var m = String(e.message || e.error || "");
+        // winit leaves its event loop by throwing this on purpose; it is not an error.
+        if (m.indexOf("Using exceptions for control flow") >= 0) return;
+        fail(m || "Failed to load " + ((e.target && e.target.src) || "a resource"));
+      }, true);
+      window.addEventListener("unhandledrejection", function (e) { fail(String(e.reason)); });
+      var consoleError = console.error;
+      console.error = function () {
+        consoleError.apply(console, arguments);
+        fail(Array.prototype.join.call(arguments, " "));
+      };
+      if (location.protocol === "file:") {
+        fail("This page must be served over http, not opened as a file.\nRun:  python3 -m http.server -d web 8080\nthen open http://localhost:8080");
+      }
+    </script>
+    <script type="module">
+      import init from "./pkg/showcase.js";
+      init().catch((e) => {
+        if (!String(e).includes("Using exceptions for control flow")) fail(String(e));
+      });
+    </script>
+  </body>
+</html>
