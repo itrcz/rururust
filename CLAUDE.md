@@ -27,7 +27,8 @@ cargo check --no-default-features --features "<набор>" --lib  # прове�
 | `src/ui.rs` | `Ui<S>`: кадр, `Painter` (дерево → `DrawList`), пружины, физика скролла, ввод, таймеры |
 | `src/render.rs` | wgpu: батчи, снимок сцены и пирамида размытия для стекла, текстуры картинок, текст через glyphon |
 | `src/shaders/quad.wgsl` | все фигуры одним инстансным шейдером; `blur.wgsl` — пирамида |
-| `src/text.rs` | шейпинг и кэш (cosmic-text); кэш высот строк `list` |
+| `src/text.rs` | шейпинг и кэш (cosmic-text); кэш высот строк `list`; геометрия текста: `hit`, `caret`, `range_rects`, `word_at`, `para_at` |
+| `src/edit.rs` | редактор `text_field` (подмодуль `ui`: видит его поля): каретка, выделение, undo, буфер, IME, multiline |
 | `src/task.rs` | канал «фон → состояние»: `Link`, `Task`, `spawn`, `sleep`, `Ui::pump` |
 | `src/app.rs` | winit: окно, события, пробуждения; единственное место, знающее про платформу |
 | `src/markdown.rs`, `src/headless.rs` | под фичами `markdown`, `headless` |
