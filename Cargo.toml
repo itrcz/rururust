@@ -64,6 +64,10 @@ required-features = ["app"]
 name = "panels"
 required-features = ["app", "headless"]
 
+[[example]]
+name = "menus"
+required-features = ["app", "svg", "headless"]
+
 [[test]]
 name = "interaction"
 

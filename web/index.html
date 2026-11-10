@@ -39,7 +39,9 @@
       }
     </script>
     <script type="module">
-      import init from "./pkg/showcase.js";
+      // ?ex=menus runs another example built with ./web/build.sh menus
+      const ex = (new URLSearchParams(location.search).get("ex") || "showcase").replace(/[^a-z_]/g, "");
+      const { default: init } = await import(`./pkg/${ex}.js`);
       init().catch((e) => {
         if (!String(e).includes("Using exceptions for control flow")) fail(String(e));
       });

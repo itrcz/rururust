@@ -30,7 +30,9 @@ fn main() {
 ```sh
 cargo run --release --example showcase                       # окно (меняй размер: телефон → планшет → десктоп)
 cargo run --release --example showcase -- --screenshot a.png # рендер в PNG без окна
+cargo run --release --example menus                          # меню, поповеры, тултипы, контекстное меню, шорткаты
 ./web/build.sh && python3 -m http.server -d web 8080          # браузер: http://localhost:8080
+./web/build.sh menus                                          # другой пример в браузере: http://localhost:8080/?ex=menus
 cargo test
 ```
 
@@ -57,7 +59,11 @@ cargo install wasm-bindgen-cli --version 0.2.130 --locked   # версия ка�
 | Фрагменты (`Span`) | `.bold()` `.italic()` `.code()` `.color(c)`, `.link(url)`, `.weight(Weight::Semibold)`, `.size(pt)` (строка подрастает), `.background(c)` — скруглённая плашка под фрагментом с полями по бокам, режется по строкам при переносе и не меняет высоту строки; `Span::icon(&img)` — значок в строке размером 1 em, красится цветом фрагмента |
 | Markdown | `markdown(src)` / `markdown_with(src, images)`; `markdown_styled(src, &MarkdownStyle { size: 14.0, line_height: 1.625, strong: Weight::Semibold, code_background: Some(c), ..Default::default() })` — кегль, межстрочный, отступ между блоками, цвет и иконки ссылок (`link_icons`: по префиксу URL), заголовки, inline-код, `code_block`, `table` (`TableStyle`: кегль, поля ячеек, линии между строками, вес шапки, `columns` — доли ширины), `quote`; `Default` = вид `markdown()`; таблицы — колонками |
 | Картинки и иконки | `image(&Image)`, `icon(&Image)` — глиф, красится цветом текста; `Image::decode` (PNG/JPEG), `Image::from_svg` |
-| Контролы | `button` `toggle` `slider` `text_field` `picker` `tab_bar` |
+| Контролы | `button` `toggle` `slider` `text_field` `picker` `tab_bar`; `slider(v, f).steps(5)` — прилипает к 5 делениям и рисует точки |
+| Поповер | `.popover(open, Placement::top().start(), \|s\| s.open = false, content)` на якоре — слой поверх всего у якоря; переворачивается на другую сторону и сдвигается, чтобы не вылезать за окно; клик мимо только закрывает (не доходит до того, что под ним), Escape тоже; появляется за ~120 мс. `Placement::top/bottom/left/right()` + `.start/center/end()` + `.gap(pt)` |
+| Меню | `menu(vec![MenuItem::action("Rename", f).icon(&img).shortcut("⌥⌘R"), MenuItem::separator(), MenuItem::section("Plugins"), MenuItem::submenu("Copy", items)])`; у пункта `.hint(..)` `.disabled()` `.checked(b)`; подсветка под мышью, ↑↓ ←→ Enter Esc; `.menu_style(MenuStyle { highlight, row_height, font_size, .. })`. Открыть: `.menu(menu(..))` / `.menu_at(placement, ..)` — по клику на якорь, `.context_menu(menu(..))` — по правому клику у курсора, или внутри `.popover` (выбор пункта вызывает `on_dismiss`) |
+| Тултип | `.tooltip("Back")`, `.tooltip_shortcut("Back", "⌘[")`, `.tooltip_with(view)` — через 0.5 с покоя мыши (таймер, не кадры), соседний сразу; клик и уход прячут; ввод не перехватывает |
+| Шорткаты | `.shortcut(Shortcut::cmd('k'), \|s\| ..)` на корне или поддереве; `.shift()` `.alt()`, `Shortcut::key('/')`; в поле ввода текстовые комбинации (обычные клавиши, Cmd+A/C/V/X/Z/Y) достаются полю. `.on_secondary(f)` — правый клик |
 | Выделение текста | `.selectable()` на контейнере или `list` — текст внутри выделяется мышью (протяжка, двойной клик — слово, тройной — абзац, Shift+клик — продлить, протяжка к краю `scroll` — автоскролл) и копируется Cmd/Ctrl+C как plain text, Cmd/Ctrl+A — всё; одно выделение через строки ленивого списка, невидимые строки строятся только при копировании. `.selection_color(c)` — цвет подсветки (и в полях ввода) для поддерева; `.copy_as("- ")` — чем заменить текст поддерева при копировании (`""` — пропустить); `.copy_sep("\t")` — разделитель между детьми (по умолчанию `\n` в `vstack`, пробел в `hstack`, пустая строка между строками `list`); `ui.selection_text()`. `markdown()` выделяем сам: блоки через пустую строку, пункты списков с `- ` / `1. `, ячейки таблиц через таб: `scroll(list(n, 80.0, row).selectable().selection_color(Color::WHITE.alpha(0.22)))` |
 | Ссылки | `Span::new("docs").link(url).color(c)` — рука над ссылкой, подчёркивание при наведении; `.on_link(\|s, url\| ..)` на поддереве — свой обработчик, без него клик открывает http(s)/mailto в браузере (`WindowRequest::OpenUrl`); нажатие на ссылке, ушедшее дальше 4 pt, становится выделением. В `markdown()` ссылки живые |
 | Ввод текста | `text_field(value, placeholder, on_change)`: `.multiline()` / `.max_lines(n)` — растёт от 1 строки до `n`, дальше скролл; `.on_submit(f)` — Enter отправляет, Shift/Alt+Enter — перенос; `.plain()` — без своего фона, отступов и кольца фокуса (контейнер рисует приложение); `.font_size()`, `.placeholder_color(c)`. Выделение мышью / Shift+стрелки / двойной и тройной клик / Cmd+A, слова — Alt/Ctrl+←→, Cmd+←→ — края строки, буфер обмена Cmd/Ctrl+C/X/V, undo/redo Cmd+Z / Shift+Cmd+Z, IME (preedit подчёркнут) |
@@ -117,6 +123,7 @@ ruru = { version = "0.1", default-features = false, features = ["app"] }        
 | `src/text.rs` | Шейпинг и кэш текста (cosmic-text), встроенные шрифты Inter и JetBrains Mono; геометрия текста: точка ↔ байт, каретка, прямоугольники выделения, слово / абзац |
 | `src/edit.rs` | Редактор `text_field`: каретка, выделение, undo, буфер обмена, IME, многострочность (подмодуль `ui`) |
 | `src/select.rs` | Выделение и копирование read-only текста (`.selectable()`), ссылки (подмодуль `ui`) |
+| `src/popup.rs` | Слои над деревом: поповеры, меню с подменю и клавиатурой, контекстные меню, тултипы; шорткаты (подмодуль `ui`) |
 | `src/task.rs` | Канал «фон → состояние»: `Link`, `Task`, `spawn`, `sleep`, `Ui::pump` |
 | `src/markdown.rs` | Markdown → обычные view |
 | `src/app.rs` | Окно и события (winit), один путь для native и web |
