@@ -20,6 +20,10 @@ static MONO: &[u8] = include_bytes!("../assets/JetBrainsMono.ttf");
 pub(crate) struct ListCache {
     pub width: f32,
     pub heights: Vec<f32>,
+    /// Rows painted last frame, and the first of them whose top was inside the viewport:
+    /// what a new width re-measures at once and the row it keeps in place.
+    pub seen: (usize, usize),
+    pub anchor: usize,
 }
 
 pub(crate) struct Entry {

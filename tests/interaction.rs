@@ -1838,3 +1838,105 @@ fn trackpad_new_gesture_during_the_bounce_follows_the_fingers() {
     assert!((top_y(&ui) - held).abs() < 0.5, "back and forth is not reversible: {held} → {}", top_y(&ui));
     pad(&mut ui, 0.0, Ended, &mut ys);
 }
+
+// ---------------------------------------------------------------- resizing a chat feed
+
+const PARA: &str = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ";
+
+/// A feed like a chat: rows of wrapping text of different lengths, each with a marker quad
+/// on top whose blue channel encodes the row.
+fn feed(stick: bool) -> Ui<()> {
+    Ui::new((), move |_: &()| {
+        let rows = list(60, 120.0, |i| {
+            vstack((rect().height(2.0).fill_width().background(Color::rgba(1.0, 0.0, i as f32 / 64.0, 1.0)), text(PARA.repeat(1 + i % 4))))
+                .align(Align::Start)
+                .padding_v(8.0)
+        })
+        .selectable();
+        let column = zstack(rows.fill_width().max_width(700.0)).fill_width();
+        let s = scroll(column.padding_ltrb(16.0, 10.0, 16.0, 30.0)).fill();
+        if stick { s.stick_to_bottom() } else { s }
+    })
+}
+
+fn marker_y(ui: &Ui<()>, i: usize) -> Option<f32> {
+    quads(ui, Color::rgba(1.0, 0.0, i as f32 / 64.0, 1.0)).first().map(|r| r[1])
+}
+
+/// Bottom of the last row's text on screen.
+fn last_text_bottom(ui: &Ui<()>) -> f32 {
+    texts(ui).iter().map(|t| t.pos.1 + t.size.1).fold(f32::MIN, f32::max)
+}
+
+#[test]
+fn resizing_keeps_a_stuck_feed_on_the_bottom_every_frame() {
+    let mut ui = feed(true);
+    for _ in 0..4 {
+        ui.frame((640.0, 500.0));
+    }
+    let rest = last_text_bottom(&ui);
+    assert!(marker_y(&ui, 59).is_some(), "starts at the end");
+    // Dragging the window edge: a new width every frame.
+    let mut w = 640.0;
+    for _ in 0..40 {
+        w -= 9.0;
+        ui.frame((w, 500.0));
+        let b = last_text_bottom(&ui);
+        assert!((b - rest).abs() < 1.0, "at width {w} the end jumped: {rest} → {b}");
+    }
+    for _ in 0..40 {
+        w += 9.0;
+        ui.frame((w, 500.0));
+        let b = last_text_bottom(&ui);
+        assert!((b - rest).abs() < 1.0, "at width {w} the end jumped: {rest} → {b}");
+    }
+}
+
+#[test]
+fn scrolling_up_into_unmeasured_rows_moves_by_the_wheel_delta() {
+    let mut ui = feed(true);
+    for _ in 0..4 {
+        ui.frame((640.0, 500.0));
+    }
+    // Rows above the end were never measured: each comes in at its real height, not 120.
+    for _ in 0..25 {
+        let before: Vec<(usize, f32)> = (0..60).filter_map(|i| marker_y(&ui, i).map(|y| (i, y))).collect();
+        ui.wheel((300.0, 250.0), 100.0, ruru::WheelPhase::Line);
+        ui.frame((640.0, 500.0));
+        for (i, y) in before {
+            if let Some(y2) = marker_y(&ui, i) {
+                assert!((y2 - y - 100.0).abs() < 0.5, "row {i} moved {} instead of 100", y2 - y);
+            }
+        }
+    }
+}
+
+#[test]
+fn resizing_keeps_the_top_row_of_a_parked_feed_in_place() {
+    use ruru::WheelPhase::*;
+    let mut ui = feed(false);
+    for _ in 0..3 {
+        ui.frame((640.0, 500.0));
+    }
+    // Scroll into the middle and let every row on the way be measured.
+    for _ in 0..30 {
+        ui.wheel((300.0, 250.0), -150.0, Line);
+        ui.frame((640.0, 500.0));
+        ui.frame((640.0, 500.0));
+    }
+    let top = (0..60).find(|&i| marker_y(&ui, i).is_some_and(|y| y >= 0.0)).unwrap();
+    let y0 = marker_y(&ui, top).unwrap();
+    let mut w = 640.0;
+    for _ in 0..30 {
+        w -= 9.0;
+        ui.frame((w, 500.0));
+        let y = marker_y(&ui, top).unwrap_or(f32::NAN);
+        assert!((y - y0).abs() < 1.0, "at width {w} row {top} moved {y0} → {y}");
+    }
+    for _ in 0..30 {
+        w += 9.0;
+        ui.frame((w, 500.0));
+        let y = marker_y(&ui, top).unwrap_or(f32::NAN);
+        assert!((y - y0).abs() < 1.0, "at width {w} row {top} moved {y0} → {y}");
+    }
+}

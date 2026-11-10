@@ -820,35 +820,87 @@ impl<S> Painter<'_, S> {
                 // heights are remembered so the scroll range converges on the truth.
                 let top = (xf.clip.y - xf.ty) / xf.s;
                 let bottom = top + xf.clip.h / xf.s;
-                let mut y = r.y;
+                let prev = self.text.lists.get(&id).map_or((0, 0), |c| c.seen);
+                let known = |t: &TextSystem, i: usize| t.lists.get(&id).and_then(|c| c.heights.get(i)).copied().unwrap_or(f32::NAN);
+                let est = |h: f32| if h.is_nan() { row_h } else { h };
+                let scroll = self.tctx.scroll.map(|s| s.0);
+                // The anchor: the first row on screen that was on screen last frame too (its
+                // height is known), so rows coming in above it at another height than
+                // estimated grow upwards instead of pushing what is being read.
+                let (mut first, mut y) = (count, r.y);
+                let mut anchor = None;
                 for i in 0..count {
-                    let known = self.text.lists.get(&id).and_then(|c| c.heights.get(i)).copied().unwrap_or(f32::NAN);
-                    let h = if known.is_nan() { row_h } else { known };
-                    if y + h <= top {
-                        y += h;
-                        continue;
-                    }
+                    let h = est(known(self.text, i));
                     if y >= bottom {
                         break;
                     }
+                    if y + h > top {
+                        first = first.min(i);
+                        if anchor.is_none() && y >= top && (scroll.is_none() || (prev.0..prev.1).contains(&i)) {
+                            anchor = Some((i, y));
+                        }
+                    }
+                    y += h;
+                }
+                let (j, ay) = match anchor {
+                    Some(a) => a,
+                    // Nothing seen before is on screen (a jump): plain top-down from the first.
+                    None => (first, r.y + (0..first).map(|i| est(known(self.text, i))).sum::<f32>()),
+                };
+                let measure = |p: &mut Self, i: usize| {
                     let rv = row(i);
                     let cid = child_id(id, i, rv.key);
-                    let saved_row = self.tctx.row;
-                    self.enter_row(id, i, count);
-                    let mut lx = Lx { text: self.text, springs: self.springs, frame: self.frame, along: None, menu: self.open_menu, tip: self.tip };
+                    let mut lx = Lx { text: p.text, springs: p.springs, frame: p.frame, along: None, menu: p.open_menu, tip: p.tip, shift: 0.0 };
                     let n = layout(&rv, (Some(r.w), None), &mut lx, cid);
+                    (i, rv, n, cid)
+                };
+                let mut rows = Vec::new();
+                // Downwards from the anchor…
+                let mut y = ay;
+                let mut i = j;
+                while i < count && y < bottom {
+                    let m = measure(self, i);
+                    let h = m.2.size.1;
+                    rows.push((y, m));
+                    y += h;
+                    i += 1;
+                }
+                // …and upwards from it, keeping the anchor in place.
+                let (mut y, mut i, mut shift) = (ay, j, 0.0);
+                while i > 0 && y > top && scroll.is_some() {
+                    i -= 1;
+                    let m = measure(self, i);
+                    let h = m.2.size.1;
+                    shift += h - est(known(self.text, i));
+                    y -= h;
+                    rows.push((y, m));
+                }
+                if shift.abs() > 0.01 {
+                    if let Some(s) = scroll.and_then(|sid| self.scrolls.get_mut(&sid)) {
+                        s.offset += shift;
+                        s.max += shift;
+                    }
+                }
+                rows.sort_by_key(|r| r.1 .0);
+                let mut seen = (usize::MAX, 0, usize::MAX);
+                for (y, (i, rv, n, cid)) in rows {
+                    let known = known(self.text, i);
                     if known.is_nan() || (n.size.1 - known).abs() > 0.5 {
                         if let Some(slot) = self.text.lists.get_mut(&id).and_then(|c| c.heights.get_mut(i)) {
                             *slot = n.size.1;
                             self.relayout = true;
                         }
                     }
-                    let h = n.size.1;
+                    seen = (seen.0.min(i), seen.1.max(i + 1), if y >= top { seen.2.min(i) } else { seen.2 });
+                    let saved_row = self.tctx.row;
+                    self.enter_row(id, i, count);
                     self.path.push((id, i));
                     self.paint(rv, &n, (r.x, y), xf, cid);
                     self.path.pop();
                     self.tctx.row = saved_row;
-                    y += h;
+                }
+                if let Some(c) = self.text.lists.get_mut(&id) {
+                    (c.seen, c.anchor) = if seen.0 == usize::MAX { ((0, 0), 0) } else { ((seen.0, seen.1), seen.2.min(seen.1)) };
                 }
             }
             Kind::Overlay { open, mode, child, on_dismiss } => {
@@ -1005,10 +1057,20 @@ impl<S> Painter<'_, S> {
                 let (frame, now) = (self.frame, self.now);
                 let s = self.scrolls.entry(id).or_default();
                 let max = (content - r.h).max(0.0);
+                let parked = s.offset >= s.max - 1.0 && s.vel == 0.0;
+                if ln.shift != 0.0 && s.used != 0 {
+                    // A lazy list inside re-wrapped for a new width: same rows on screen.
+                    let (lo, hi) = s.bounds();
+                    let inside = s.offset >= lo && s.offset <= hi;
+                    s.offset += ln.shift;
+                    if inside {
+                        s.offset = s.offset.clamp(lo, max.max(lo));
+                    }
+                }
                 // Chat-style: start at the end and follow new content while parked there.
                 // Shrinking too: a lazy row measured smaller than its estimate must not
                 // leave the view hanging past the end and bouncing back.
-                if stick && (s.used == 0 || (s.offset >= s.max - 1.0 && s.vel == 0.0 && max != s.max)) {
+                if stick && (s.used == 0 || (parked && max != s.max)) {
                     s.offset = max;
                 }
                 s.max = max;
@@ -1320,7 +1382,7 @@ impl<S: 'static> Ui<S> {
         if tip_show.is_some() {
             self.tip_seen = Some(now);
         }
-        let mut lx = Lx { text: &mut self.text, springs: &mut self.springs, frame: self.frame, along: None, menu: self.open_menu, tip: tip_show };
+        let mut lx = Lx { text: &mut self.text, springs: &mut self.springs, frame: self.frame, along: None, menu: self.open_menu, tip: tip_show, shift: 0.0 };
         let root = layout(&view, (Some(size.0), Some(size.1)), &mut lx, 1);
         self.list.cmds.clear();
         self.list.images.clear();

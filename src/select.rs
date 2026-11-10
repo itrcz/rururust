@@ -87,7 +87,7 @@ pub(crate) struct TextCtx<S> {
     pub row: u32,
     link: Option<Rc<dyn Fn(&mut S, &str)>>,
     pub color: Color,
-    scroll: Option<(u64, Rect)>,
+    pub scroll: Option<(u64, Rect)>,
 }
 
 impl<S> Clone for TextCtx<S> {

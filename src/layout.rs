@@ -19,6 +19,9 @@ pub(crate) struct Lx<'a> {
     pub menu: Option<u64>,
     /// The view whose tooltip shows.
     pub tip: Option<u64>,
+    /// How far lazy lists moved their anchor row while re-measuring for a new width; the
+    /// enclosing scroll view takes it into its offset (see `LNode::shift`).
+    pub shift: f32,
 }
 
 impl Lx<'_> {
@@ -55,6 +58,9 @@ pub(crate) struct LNode {
     pub text: u64,
     /// Content height (Scroll nodes only).
     pub content_h: f32,
+    /// Scroll nodes: how much the content above the visible rows grew (a lazy list re-wrapped
+    /// its rows); the offset follows so the screen stays put.
+    pub shift: f32,
     /// Shaped labels with their sizes (Tabs nodes only).
     pub texts: Vec<(u64, (f32, f32))>,
     /// Text that did not fit its lines and fades out (Text nodes only).
@@ -192,16 +198,49 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
         Kind::Toggle(..) => TOGGLE,
         Kind::Slider(..) => (inner.0.unwrap_or(200.0), SLIDER_H),
         Kind::Menu { items, style } => crate::ui::popup::layout_menu(items, style, lx, id, &mut node),
-        Kind::List { count, row_h, .. } => {
+        Kind::List { count, row_h, row } => {
             // Rows are built during paint (only the visible ones); here we just need the
             // total height: measured rows as measured, the rest at the estimate.
             let w = inner.0.unwrap_or(0.0);
             let cache = lx.text.lists.entry(id).or_default();
-            if cache.width != w {
-                cache.width = w;
-                cache.heights.clear(); // rows wrap differently at another width
-            }
             cache.heights.resize(*count, f32::NAN);
+            if cache.width != w {
+                let was = std::mem::replace(&mut cache.width, w);
+                // Rows wrap differently at another width. Forgetting every height would swap
+                // the total for estimates and make a resizing window jump each frame; the old
+                // heights stay as estimates, and the rows that were on screen are measured
+                // again right here (an extra layout of a few lazy rows, like paint does), so
+                // the end of a feed stays on the bottom and the anchor row stays put.
+                if was > 0.0 {
+                    let (seen, anchor) = (cache.seen, cache.anchor);
+                    let est = |h: f32| if h.is_nan() { *row_h } else { h };
+                    let old: Vec<f32> = cache.heights.iter().map(|&h| est(h)).collect();
+                    let (a, b) = (seen.0.min(*count), (seen.1 + 2).min(*count));
+                    let on_screen: f32 = old[a..seen.1.min(*count)].iter().sum();
+                    let mut measure = |i: usize| {
+                        let rv = row(i);
+                        layout(&rv, (Some(w + pad_w), None), lx, child_id(id, i, rv.key)).size.1
+                    };
+                    let mut fresh: Vec<(usize, f32)> = (a..b).map(|i| (i, measure(i))).collect();
+                    // Narrower rows grow: cover the old screen height upwards too.
+                    let mut covered: f32 = fresh.iter().map(|f| f.1).sum();
+                    let mut i = a;
+                    while i > 0 && covered < on_screen + 2.0 * row_h {
+                        i -= 1;
+                        let h = measure(i);
+                        covered += h;
+                        fresh.push((i, h));
+                    }
+                    let cache = lx.text.lists.entry(id).or_default();
+                    for (i, h) in fresh {
+                        if i < anchor {
+                            lx.shift += h - old[i];
+                        }
+                        cache.heights[i] = h;
+                    }
+                }
+            }
+            let cache = lx.text.lists.entry(id).or_default();
             (w, cache.heights.iter().map(|h| if h.is_nan() { *row_h } else { *h }).sum())
         }
         Kind::Overlay { mode, child, .. } => {
@@ -226,7 +265,9 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
             (w, h)
         }
         Kind::Scroll { child, .. } => {
+            let outer = std::mem::take(&mut lx.shift);
             let c = layout(child, (inner.0, None), lx, child_id(id, 0, child.key));
+            node.shift = std::mem::replace(&mut lx.shift, outer);
             node.content_h = c.size.1;
             let s = (inner.0.unwrap_or(c.size.0), inner.1.unwrap_or(c.size.1));
             node.children.push(c);
