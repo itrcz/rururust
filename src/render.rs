@@ -16,7 +16,8 @@ use wgpu::util::DeviceExt;
 struct Globals {
     screen: [f32; 2],
     scale: f32,
-    _pad: f32,
+    /// Number of mips in the backdrop pyramid.
+    levels: f32,
 }
 
 /// Quads then text, drawn in that order. `backdrop` = re-blur the scene first.
@@ -36,7 +37,10 @@ struct Level {
 struct Targets {
     size: (u32, u32),
     scene: Level,
-    levels: Vec<Level>,
+    /// Sharp copy of the scene: glass refracts it while the scene itself is drawn into.
+    copy: wgpu::TextureView,
+    /// Blur pyramid: mip i is the scene downsampled 2^(i+1) times.
+    mips: Vec<Level>,
     quad_bind: wgpu::BindGroup,
 }
 
@@ -53,7 +57,6 @@ pub struct Renderer {
     instance_cap: usize,
     blur_layout: wgpu::BindGroupLayout,
     down: wgpu::RenderPipeline,
-    up: wgpu::RenderPipeline,
     blit: wgpu::RenderPipeline,
     targets: Option<Targets>,
     swash: SwashCache,
@@ -115,7 +118,8 @@ impl Renderer {
                     count: None,
                 },
                 tex_entry(1),
-                sampler_entry(2),
+                tex_entry(2),
+                sampler_entry(3),
             ],
         });
         let quad_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/quad.wgsl"));
@@ -195,7 +199,7 @@ impl Renderer {
                 cache: None,
             })
         };
-        let (down, up, blit) = (fullscreen("down"), fullscreen("up"), fullscreen("blit"));
+        let (down, blit) = (fullscreen("down"), fullscreen("blit"));
 
         // Bound when a frame has no glass at all.
         let dummy = device.create_texture_with_data(
@@ -214,7 +218,7 @@ impl Renderer {
             &[0, 0, 0, 255],
         );
         let dummy_view = dummy.create_view(&Default::default());
-        let quad_bind_plain = Self::quad_bind(&device, &quad_layout, &globals, &dummy_view, &sampler);
+        let quad_bind_plain = Self::quad_bind(&device, &quad_layout, &globals, &dummy_view, &dummy_view, &sampler);
 
         let instance_cap = 256;
         let instances = Self::instance_buffer(&device, instance_cap);
@@ -237,7 +241,6 @@ impl Renderer {
             instance_cap,
             blur_layout,
             down,
-            up,
             blit,
             targets: None,
             swash: SwashCache::new(),
@@ -261,7 +264,8 @@ impl Renderer {
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
         globals: &wgpu::Buffer,
-        backdrop: &wgpu::TextureView,
+        sharp: &wgpu::TextureView,
+        pyramid: &wgpu::TextureView,
         sampler: &wgpu::Sampler,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -269,24 +273,28 @@ impl Renderer {
             layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(backdrop) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(sharp) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(pyramid) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(sampler) },
             ],
         })
     }
 
-    fn level(&self, w: u32, h: u32) -> Level {
-        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+    fn texture(&self, w: u32, h: u32, mips: u32) -> wgpu::Texture {
+        self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("ruru layer"),
             size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
-            mip_level_count: 1,
+            mip_level_count: mips,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: self.format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
-        });
-        let view = tex.create_view(&Default::default());
+        })
+    }
+
+    /// A view plus a bind group that samples exactly that view.
+    fn level(&self, view: wgpu::TextureView) -> Level {
         let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ruru layer"),
             layout: &self.blur_layout,
@@ -302,12 +310,26 @@ impl Renderer {
         if self.targets.as_ref().is_some_and(|t| t.size == size) {
             return;
         }
-        // More levels on high-DPI screens so the blur is the same size in points.
-        let n = if scale >= 1.5 { 5 } else { 4 };
-        let scene = self.level(size.0, size.1);
-        let levels: Vec<Level> = (1..=n).map(|i| self.level(size.0 >> i, size.1 >> i)).collect();
-        let quad_bind = Self::quad_bind(&self.device, &self.quad_layout, &self.globals, &levels[0].view, &self.sampler);
-        self.targets = Some(Targets { size, scene, levels, quad_bind });
+        let scene = self.level(self.texture(size.0, size.1, 1).create_view(&Default::default()));
+        let copy = self.texture(size.0, size.1, 1).create_view(&Default::default());
+        // One pyramid serves every blur radius: mip i blurs by roughly 2^(i+1) px.
+        // An extra level on high-DPI screens keeps the maximum blur the same in points.
+        let (pw, ph) = (size.0.div_ceil(2), size.1.div_ceil(2));
+        let fit = 32 - pw.min(ph).max(1).leading_zeros();
+        let n = (if scale >= 1.5 { 6 } else { 5 }).min(fit);
+        let pyramid = self.texture(pw, ph, n);
+        let mips: Vec<Level> = (0..n)
+            .map(|i| {
+                self.level(pyramid.create_view(&wgpu::TextureViewDescriptor {
+                    base_mip_level: i,
+                    mip_level_count: Some(1),
+                    ..Default::default()
+                }))
+            })
+            .collect();
+        let all = pyramid.create_view(&Default::default());
+        let quad_bind = Self::quad_bind(&self.device, &self.quad_layout, &self.globals, &copy, &all, &self.sampler);
+        self.targets = Some(Targets { size, scene, copy, mips, quad_bind });
     }
 
     fn pass<'e>(
@@ -397,8 +419,7 @@ impl Renderer {
         let has_glass = batches.iter().any(|b| b.backdrop);
 
         // ---- 2. upload
-        let g = Globals { screen: [size.0 as f32, size.1 as f32], scale, _pad: 0.0 };
-        self.queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&g));
+        
         if quads.len() > self.instance_cap {
             self.instance_cap = quads.len().next_power_of_two();
             self.instances = Self::instance_buffer(&self.device, self.instance_cap);
@@ -447,6 +468,9 @@ impl Renderer {
         if has_glass {
             self.ensure_targets(size, scale);
         }
+        let levels = self.targets.as_ref().map_or(0, |t| t.mips.len()) as f32;
+        let g = Globals { screen: [size.0 as f32, size.1 as f32], scale, levels };
+        self.queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(&g));
         let targets = if has_glass { self.targets.as_ref() } else { None };
         let (scene_view, bind) = match targets {
             Some(t) => (&t.scene.view, &t.quad_bind),
@@ -458,14 +482,11 @@ impl Renderer {
         let mut i = 0;
         while i < batches.len() {
             if let (true, Some(t)) = (batches[i].backdrop, targets) {
-                // Blur everything drawn so far: scene -> ½ -> ¼ -> … and back up to ½.
-                let n = t.levels.len();
-                Self::fullscreen(&mut encoder, &self.down, &t.scene, &t.levels[0].view);
-                for l in 1..n {
-                    Self::fullscreen(&mut encoder, &self.down, &t.levels[l - 1], &t.levels[l].view);
-                }
-                for l in (1..n).rev() {
-                    Self::fullscreen(&mut encoder, &self.up, &t.levels[l], &t.levels[l - 1].view);
+                // Snapshot everything drawn so far (sharp), then build its blur pyramid.
+                Self::fullscreen(&mut encoder, &self.blit, &t.scene, &t.copy);
+                Self::fullscreen(&mut encoder, &self.down, &t.scene, &t.mips[0].view);
+                for l in 1..t.mips.len() {
+                    Self::fullscreen(&mut encoder, &self.down, &t.mips[l - 1], &t.mips[l].view);
                 }
             }
             let mut j = i + 1;

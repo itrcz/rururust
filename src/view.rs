@@ -59,25 +59,52 @@ pub struct Shadow {
     pub y: f32,
 }
 
-/// Backdrop-blur material.
+/// Glass material: the content behind it is lightly frosted and refracted through a
+/// bevelled rim. Defaults follow iOS "regular" glass.
 #[derive(Clone, Copy, Debug)]
 pub struct Glass {
-    /// Color mixed over the blurred backdrop; alpha is the mix strength.
+    /// Color mixed over the backdrop; alpha is the mix strength.
     pub tint: Color,
     /// Saturation boost of the backdrop (1 = unchanged).
     pub saturation: f32,
-    /// Width of the bevelled rim in points; the backdrop is refracted through it
-    /// (0 = flat frosted glass).
+    /// Blur of the backdrop in points (0 = perfectly clear glass).
+    pub frost: f32,
+    /// How strongly the rim bends the backdrop, 0..=1 (0 = flat pane).
     pub refraction: f32,
-    /// Brightness of the specular rim.
-    pub rim: f32,
-    /// Colour fringing at the rim, 0..=1 (costs two extra texture samples there).
+    /// Width of the bevelled rim in points (capped at half the pane's smaller side).
+    pub depth: f32,
+    /// Colour fringing inside the bevel, 0..=1 (costs extra texture samples there).
     pub dispersion: f32,
+    /// Brightness of the specular rim line.
+    pub rim: f32,
+}
+
+impl Glass {
+    /// iOS-like regular glass: light frost, strong lensing at the rim.
+    pub const fn regular() -> Self {
+        Glass {
+            tint: Color::WHITE.alpha(0.06),
+            saturation: 1.35,
+            frost: 10.0,
+            refraction: 0.7,
+            depth: 30.0,
+            dispersion: 0.2,
+            rim: 0.3,
+        }
+    }
+    /// Nearly transparent glass for small controls over rich content.
+    pub const fn clear() -> Self {
+        Glass { tint: Color::WHITE.alpha(0.02), saturation: 1.15, frost: 5.0, rim: 0.4, ..Self::regular() }
+    }
+    /// Heavily blurred "frosted" material for panels with a lot of text.
+    pub const fn frosted() -> Self {
+        Glass { tint: Color::WHITE.alpha(0.10), saturation: 1.7, frost: 44.0, refraction: 0.5, ..Self::regular() }
+    }
 }
 
 impl Default for Glass {
     fn default() -> Self {
-        Glass { tint: Color::WHITE.alpha(0.10), saturation: 1.7, refraction: 14.0, rim: 0.5, dispersion: 0.5 }
+        Self::regular()
     }
 }
 

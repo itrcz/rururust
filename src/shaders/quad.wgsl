@@ -3,11 +3,12 @@
 struct Globals {
     screen: vec2f, // physical pixels
     scale: f32,    // points -> pixels
-    _pad: f32,
+    levels: f32,   // mips in the backdrop pyramid
 }
 @group(0) @binding(0) var<uniform> g: Globals;
-@group(0) @binding(1) var backdrop: texture_2d<f32>;
-@group(0) @binding(2) var samp: sampler;
+@group(0) @binding(1) var sharp: texture_2d<f32>; // the scene behind the glass, unblurred
+@group(0) @binding(2) var pyr: texture_2d<f32>;   // its blur pyramid
+@group(0) @binding(3) var samp: sampler;
 
 struct Instance {
     @location(0) rect: vec4f,
@@ -99,6 +100,50 @@ fn refract_offset(slope: f32, eta: f32) -> f32 {
     return tan(theta - asin(clamp(sin(theta) / eta, -1.0, 1.0)));
 }
 
+// Bicubic B-spline fetch from one pyramid mip with 4 bilinear taps: hides the blocky
+// look of a magnified low-resolution level.
+fn bspline(uv: vec2f, mip: f32) -> vec3f {
+    let size = vec2f(textureDimensions(pyr, u32(mip)));
+    let t = uv * size - 0.5;
+    let i = floor(t);
+    let f = t - i;
+    let f2 = f * f;
+    let f3 = f2 * f;
+    let w0 = (1.0 - f) * (1.0 - f) * (1.0 - f) / 6.0;
+    let w1 = (3.0 * f3 - 6.0 * f2 + 4.0) / 6.0;
+    let w2 = (-3.0 * f3 + 3.0 * f2 + 3.0 * f + 1.0) / 6.0;
+    let w3 = f3 / 6.0;
+    let g0 = w0 + w1;
+    let g1 = w2 + w3;
+    let h0 = (i - 0.5 + w1 / g0) / size;
+    let h1 = (i + 1.5 + w3 / g1) / size;
+    let a = textureSampleLevel(pyr, samp, vec2f(h0.x, h0.y), mip).rgb;
+    let b = textureSampleLevel(pyr, samp, vec2f(h1.x, h0.y), mip).rgb;
+    let c = textureSampleLevel(pyr, samp, vec2f(h0.x, h1.y), mip).rgb;
+    let d = textureSampleLevel(pyr, samp, vec2f(h1.x, h1.y), mip).rgb;
+    return g0.y * (g0.x * a + g1.x * b) + g1.y * (g0.x * c + g1.x * d);
+}
+
+// The backdrop at pixel `q`, blurred by a gaussian of `sigma` px: the sharp scene for
+// tiny radii, otherwise two neighbouring pyramid levels blended continuously.
+// Level n of the 13-tap pyramid has a sigma of about 0.96 * 2^n px.
+fn frost(q: vec2f, sigma: f32) -> vec3f {
+    let uv = q / g.screen;
+    let level = log2(max(sigma, 1e-4) / 1.9) + 1.0;
+    if level <= 0.0 || g.levels < 1.0 {
+        return textureSampleLevel(sharp, samp, uv, 0.0).rgb;
+    }
+    if level < 1.0 {
+        return mix(textureSampleLevel(sharp, samp, uv, 0.0).rgb, bspline(uv, 0.0), level);
+    }
+    let l = min(level, g.levels);
+    let lo = min(floor(l), g.levels - 1.0);
+    if lo < 1.0 {
+        return bspline(uv, 0.0);
+    }
+    return mix(bspline(uv, lo - 1.0), bspline(uv, lo), clamp(l - lo, 0.0, 1.0));
+}
+
 fn sd_round_box(p: vec2f, half: vec2f, r: f32) -> f32 {
     let q = abs(p) - half + r;
     return length(max(q, vec2f(0.0))) + min(max(q.x, q.y), 0.0) - r;
@@ -126,7 +171,8 @@ fn fs(in: VOut) -> @location(0) vec4f {
     let radius = in.p0.x;
     let kind = in.p0.w;
 
-    let depth = max(in.c1.y * g.scale, 1.0); // glass only: bevel width in px
+    // Glass only: bevel width in px, never wider than the pane's half size.
+    let depth = clamp(in.c1.y * g.scale, 1.0, max(min(half.x, half.y), 1.0));
     let dg = sdg_shape(p, half, radius, select(1.0, depth * 0.35, kind == 2.0));
     let d = dg.x;
     let cover = clamp(0.5 - d, 0.0, 1.0);
@@ -146,27 +192,29 @@ fn fs(in: VOut) -> @location(0) vec4f {
 
     var col: vec4f;
     if kind == 2.0 {
-        // Glass. The pane is flat in the middle and bevelled at the rim; the backdrop is
-        // refracted through that bevel (index 1.5), slightly differently per colour channel.
+        // Glass. The pane is flat in the middle and bevelled at the rim. The backdrop is only
+        // lightly frosted and is refracted through that bevel (index 1.5), slightly
+        // differently per colour channel: most of the look is bent light, not blur.
         let nrm = dg.yz;
         let t = clamp(-d / depth, 0.0, 1.0);
+        let sigma = in.p1.x * 0.5 * g.scale;
         var bg: vec3f;
-        if t < 1.0 {
+        if t < 1.0 && in.p1.y > 0.0 {
             let slope = bevel_slope(t);
+            let reach = nrm * in.p1.y * depth;
             let disp = in.c1.w * 0.25;
-            let off = nrm * depth / g.screen;
-            let uv = in.xy / g.screen;
+            let mid = frost(in.xy - reach * refract_offset(slope, 1.5), sigma);
             if disp > 0.0 {
                 bg = vec3f(
-                    textureSampleLevel(backdrop, samp, uv - off * refract_offset(slope, 1.5 - disp), 0.0).r,
-                    textureSampleLevel(backdrop, samp, uv - off * refract_offset(slope, 1.5), 0.0).g,
-                    textureSampleLevel(backdrop, samp, uv - off * refract_offset(slope, 1.5 + disp), 0.0).b,
+                    frost(in.xy - reach * refract_offset(slope, 1.5 - disp), sigma).r,
+                    mid.g,
+                    frost(in.xy - reach * refract_offset(slope, 1.5 + disp), sigma).b,
                 );
             } else {
-                bg = textureSampleLevel(backdrop, samp, uv - off * refract_offset(slope, 1.5), 0.0).rgb;
+                bg = mid;
             }
         } else {
-            bg = textureSampleLevel(backdrop, samp, in.xy / g.screen, 0.0).rgb;
+            bg = frost(in.xy, sigma);
         }
         let luma = dot(bg, vec3f(0.2126, 0.7152, 0.0722));
         bg = mix(vec3f(luma), bg, in.c1.x);

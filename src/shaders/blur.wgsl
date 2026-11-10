@@ -1,4 +1,5 @@
-// Dual-Kawase blur: a few cheap down/up-sample passes give a wide, smooth blur.
+// Backdrop pyramid for glass: each level is a 2x downsample of the one before. Glass
+// samples it at a continuous level, so one pyramid serves every blur radius on screen.
 
 @group(0) @binding(0) var src: texture_2d<f32>;
 @group(0) @binding(1) var samp: sampler;
@@ -17,29 +18,25 @@ fn vs(@builtin(vertex_index) i: u32) -> VOut {
     return o;
 }
 
+// 2x downsample with the 13-tap filter from Jimenez, "Next Generation Post Processing in
+// Call of Duty: Advanced Warfare": wide enough that a moving backdrop doesn't shimmer.
 @fragment
 fn down(in: VOut) -> @location(0) vec4f {
-    let h = 1.0 / vec2f(textureDimensions(src));
-    var c = textureSample(src, samp, in.uv) * 4.0;
-    c += textureSample(src, samp, in.uv + vec2f(-h.x, -h.y));
-    c += textureSample(src, samp, in.uv + vec2f(h.x, -h.y));
-    c += textureSample(src, samp, in.uv + vec2f(-h.x, h.y));
-    c += textureSample(src, samp, in.uv + vec2f(h.x, h.y));
-    return c / 8.0;
-}
-
-@fragment
-fn up(in: VOut) -> @location(0) vec4f {
-    let h = 1.0 / vec2f(textureDimensions(src));
-    var c = textureSample(src, samp, in.uv + vec2f(-2.0 * h.x, 0.0));
-    c += textureSample(src, samp, in.uv + vec2f(2.0 * h.x, 0.0));
-    c += textureSample(src, samp, in.uv + vec2f(0.0, -2.0 * h.y));
-    c += textureSample(src, samp, in.uv + vec2f(0.0, 2.0 * h.y));
-    c += textureSample(src, samp, in.uv + vec2f(-h.x, h.y)) * 2.0;
-    c += textureSample(src, samp, in.uv + vec2f(h.x, h.y)) * 2.0;
-    c += textureSample(src, samp, in.uv + vec2f(-h.x, -h.y)) * 2.0;
-    c += textureSample(src, samp, in.uv + vec2f(h.x, -h.y)) * 2.0;
-    return c / 12.0;
+    let t = 1.0 / vec2f(textureDimensions(src));
+    let a = textureSample(src, samp, in.uv + t * vec2f(-2.0, -2.0));
+    let b = textureSample(src, samp, in.uv + t * vec2f(0.0, -2.0));
+    let c = textureSample(src, samp, in.uv + t * vec2f(2.0, -2.0));
+    let d = textureSample(src, samp, in.uv + t * vec2f(-1.0, -1.0));
+    let e = textureSample(src, samp, in.uv + t * vec2f(1.0, -1.0));
+    let f = textureSample(src, samp, in.uv + t * vec2f(-2.0, 0.0));
+    let g = textureSample(src, samp, in.uv);
+    let h = textureSample(src, samp, in.uv + t * vec2f(2.0, 0.0));
+    let i = textureSample(src, samp, in.uv + t * vec2f(-1.0, 1.0));
+    let j = textureSample(src, samp, in.uv + t * vec2f(1.0, 1.0));
+    let k = textureSample(src, samp, in.uv + t * vec2f(-2.0, 2.0));
+    let l = textureSample(src, samp, in.uv + t * vec2f(0.0, 2.0));
+    let m = textureSample(src, samp, in.uv + t * vec2f(2.0, 2.0));
+    return (d + e + i + j) * 0.125 + g * 0.125 + (b + f + h + l) * 0.0625 + (a + c + k + m) * 0.03125;
 }
 
 @fragment

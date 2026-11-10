@@ -206,7 +206,9 @@ impl<S> Painter<'_, S> {
     fn glass(&mut self, xf: &Xf, r: Rect, radius: f32, g: Glass, border: Option<(f32, Color)>) {
         let mut q = self.quad(xf, r, radius, KIND_GLASS);
         q.c0 = g.tint.arr();
-        q.c1 = [g.saturation, g.refraction * xf.s, g.rim, g.dispersion];
+        q.c1 = [g.saturation, g.depth * xf.s, g.rim, g.dispersion];
+        q.p1[0] = g.frost * xf.s;
+        q.p1[1] = g.refraction;
         if let Some((w, c)) = border {
             q.border = c.arr();
             q.p0[1] = w * xf.s;
