@@ -207,8 +207,10 @@ fn fs(in: VOut) -> @location(0) vec4f {
     let kind = in.p0.w;
     let cont = in.p0.x < 0.0 || kind == 2.0;
 
-    // Glass only: bevel width in px, never wider than the pane's half size.
-    let depth = clamp(in.c1.y * g.scale, 1.0, max(min(half.x, half.y), 1.0));
+    // Glass only: bevel width in px. On a narrow pane (a tab bar) it stops at 60% of the
+    // half height, so a flat band stays in the middle and the labels there read undistorted;
+    // the lens sideways reach shrinks with it.
+    let depth = clamp(in.c1.y * g.scale, 1.0, max(min(half.x, half.y) * 0.6, 1.0));
     let soft = select(1.0, depth * 0.35, kind == 2.0);
     var dg = sdg_shape(p, half, radius, soft, cont);
     if in.np.z > 0.0 {

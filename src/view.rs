@@ -75,6 +75,14 @@ pub struct Shadow {
 
 /// Glass material: the content behind it is lightly frosted and refracted through a
 /// bevelled rim. Defaults follow iOS "regular" glass.
+///
+/// Start from a preset and turn three knobs, each 0..=1:
+/// ```
+/// # use ruru::{Glass, Color};
+/// let g = Glass::dark().blur(0.4).distortion(0.6).opacity(0.5);
+/// let tinted = Glass::light().tint(Color::BLUE).opacity(0.2);
+/// ```
+/// The fields stay public for fine tuning.
 #[derive(Clone, Copy, Debug)]
 pub struct Glass {
     /// Color mixed over the backdrop; alpha is the mix strength.
@@ -114,7 +122,43 @@ impl Glass {
     pub const fn frosted() -> Self {
         Glass { tint: Color::WHITE.alpha(0.10), saturation: 1.7, frost: 44.0, refraction: 0.5, ..Self::regular() }
     }
+    /// Smoked glass: darkens what is behind it, for light text over busy content.
+    pub const fn dark() -> Self {
+        Glass { tint: Color::rgba(0.06, 0.06, 0.08, 0.45), saturation: 1.25, frost: 16.0, rim: 0.25, ..Self::regular() }
+    }
+    /// Milky glass: brightens what is behind it, for dark text over busy content.
+    pub const fn light() -> Self {
+        Glass { tint: Color::WHITE.alpha(0.45), saturation: 1.25, frost: 16.0, rim: 0.4, ..Self::regular() }
+    }
+
+    /// Blur of what is behind, 0..=1: 0 is clear glass, 1 heavy frost (`frost` 0..=50 pt).
+    pub fn blur(mut self, amount: f32) -> Self {
+        self.frost = BLUR_MAX * amount.clamp(0.0, 1.0);
+        self
+    }
+    /// Bending of the backdrop at the rim, 0..=1: 0 is a flat pane, 1 a strong lens
+    /// (sets `refraction` and the colour fringing that comes with it, `dispersion`).
+    pub fn distortion(mut self, amount: f32) -> Self {
+        let a = amount.clamp(0.0, 1.0);
+        self.refraction = a;
+        self.dispersion = 0.3 * a;
+        self
+    }
+    /// Colour of the tint. Its alpha, when below 1, is taken as the [`opacity`](Self::opacity).
+    pub fn tint(mut self, color: Color) -> Self {
+        let a = if color.a < 1.0 { color.a } else { self.tint.a };
+        self.tint = color.alpha(a);
+        self
+    }
+    /// How dense the tint is, 0..=1: 0 shows only the (blurred) backdrop, 1 is solid tint.
+    pub fn opacity(mut self, opacity: f32) -> Self {
+        self.tint.a = opacity.clamp(0.0, 1.0);
+        self
+    }
 }
+
+/// Frost at `.blur(1.0)`, in points.
+const BLUR_MAX: f32 = 50.0;
 
 impl Glass {
     /// Scales the whole effect: 0 is an invisible pane, 1 leaves the material as it is,

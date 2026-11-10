@@ -34,6 +34,11 @@ struct Demo {
     drift: f32,
     /// Glass effect strength slider, 0..=1 (0.5 = the stock material).
     glass: f32,
+    /// Glass lab: dark or light preset, and its three knobs.
+    lab_dark: bool,
+    lab_blur: f32,
+    lab_distortion: f32,
+    lab_opacity: f32,
     tab: usize,
     name: String,
     notes: String,
@@ -175,6 +180,59 @@ fn settings(s: &Demo) -> View<Demo> {
     .padding_xy(0.0, 4.0)
 }
 
+/// Glass lab: a dark or light pane and a narrow pill over stripes and text, with the
+/// three knobs of `Glass` on sliders.
+fn glass_lab(s: &Demo) -> View<Demo> {
+    let preset = if s.lab_dark { Glass::dark() } else { Glass::light() };
+    let m = preset.blur(s.lab_blur).distortion(s.lab_distortion).opacity(s.lab_opacity);
+    let ink = if s.lab_dark { Color::WHITE } else { Color::BLACK };
+    let stripes = hstack(PALETTE.iter().map(|(a, b)| rect().fill().gradient(*a, *b, 160.0)).collect::<Vec<_>>()).fill();
+    let words = text("Busy content under the glass: stripes, Handgloves 0123456789, and lines of text that the blur should soften without losing the edge of the pane. ".repeat(3))
+        .font_size(17.0)
+        .weight(Weight::Bold)
+        .color(Color::WHITE)
+        .padding(14.0);
+    let pane = vstack((
+        text(if s.lab_dark { "Dark glass" } else { "Light glass" }).font_size(20.0).weight(Weight::Bold),
+        text(format!("blur {:.2} · distortion {:.2} · opacity {:.2}", s.lab_blur, s.lab_distortion, s.lab_opacity)).font_size(12.0),
+    ))
+    .spacing(2.0)
+    .align(Align::Start)
+    .padding_xy(18.0, 14.0)
+    .glass_with(m)
+    .radius(22.0)
+    .color(ink);
+    let pill = hstack((text("Narrow"), text("pill"), text("bar"))).spacing(18.0).padding_xy(20.0, 9.0).glass_with(m).radius(20.0).color(ink);
+    let stage = zstack((
+        stripes,
+        words.place(Align::Start, Align::Start),
+        vstack((pane, pill)).spacing(14.0).place(Align::Center, Align::Center).padding(16.0),
+    ))
+    .height(250.0)
+    .fill_width()
+    .radius(24.0)
+    .clip();
+    let mode = |label: &str, dark: bool| {
+        let on = s.lab_dark == dark;
+        button(label, move |s: &mut Demo| s.lab_dark = dark).background(Color::WHITE.alpha(if on { 0.28 } else { 0.08 })).fill_width()
+    };
+    vstack((
+        text("Glass lab").font_size(22.0).weight(Weight::Bold).fill_width().padding_ltrb(4.0, 0.0, 0.0, 0.0),
+        stage,
+        card(s, (
+            hstack((mode("Dark", true), mode("Light", false))).spacing(10.0).fill_width().padding_xy(16.0, 12.0),
+            divider(),
+            slider_row("Blur", format!("{:.0}%", s.lab_blur * 100.0), slider(s.lab_blur, |s: &mut Demo, v| s.lab_blur = v)),
+            divider(),
+            slider_row("Distortion", format!("{:.0}%", s.lab_distortion * 100.0), slider(s.lab_distortion, |s: &mut Demo, v| s.lab_distortion = v)),
+            divider(),
+            slider_row("Opacity", format!("{:.0}%", s.lab_opacity * 100.0), slider(s.lab_opacity, |s: &mut Demo, v| s.lab_opacity = v)),
+        )),
+    ))
+    .spacing(12.0)
+    .fill_width()
+}
+
 // ---------------------------------------------------------------- pages
 
 fn home(s: &Demo, env: &Env) -> View<Demo> {
@@ -210,6 +268,7 @@ fn home(s: &Demo, env: &Env) -> View<Demo> {
         ))
         .spacing(7.0)
         .fill_width(),
+        glass_lab(s),
         // On a desktop the settings live in the right-hand panel instead.
         if env.class() == SizeClass::Desktop { rect() } else { settings(s) },
         vstack(
@@ -497,6 +556,10 @@ impl Demo {
             focus: false,
             drift: 0.35,
             glass: 0.5,
+            lab_dark: true,
+            lab_blur: 0.3,
+            lab_distortion: 0.7,
+            lab_opacity: 0.45,
             tab: 0,
             name: String::new(),
             notes: String::new(),
@@ -528,9 +591,15 @@ fn main() {
             let num = |k: usize, d: u32| args.get(i + k).and_then(|t| t.parse().ok()).unwrap_or(d);
             state.tab = num(2, 0) as usize;
             let (frames, width) = (num(3, 1), num(4, 420));
+            // Optional: points to scroll down before the shot; `--light` for the light glass lab.
+            let down = num(5, 0) as f32;
+            state.lab_dark = !args.iter().any(|a| a == "--light");
             let mut ui = ruru::Ui::new(state, view);
             ui.show_fps = true;
-            let wait = |_: &mut ruru::Ui<Demo>, n: u32| {
+            let wait = |ui: &mut ruru::Ui<Demo>, n: u32| {
+                if n == 1 && down > 0.0 {
+                    ui.wheel((width as f32 * 0.5, 400.0), -down, ruru::WheelPhase::Line);
+                }
                 if n > 0 {
                     std::thread::sleep(std::time::Duration::from_millis(16));
                 }
