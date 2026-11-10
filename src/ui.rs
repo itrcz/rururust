@@ -270,7 +270,16 @@ enum Action<S> {
     /// Secondary click: run the handler, or (`None`) open the context menu of view `.1`.
     /// Ignored by the primary button.
     Secondary(Option<Box<dyn Fn(&mut S)>>, u64),
+    /// The scroll bar of scroll view `scroll`: screen y and length of the thumb's travel,
+    /// thumb length (screen), the offset range and one page (content units).
+    ScrollBar { scroll: u64, y0: f32, track: f32, len: f32, lo: f32, hi: f32, page: f32 },
 }
+
+/// Scroll bar: hover strip along the right edge, thumb width thin / hovered, its inset.
+const BAR_STRIP: f32 = 14.0;
+const BAR_THIN: f32 = 5.0;
+const BAR_WIDE: f32 = 9.0;
+const BAR_SALT: u64 = 0x5C_B0A2;
 
 /// Something the UI asks of the window it lives in. The core knows nothing about windows:
 /// the runner drains [`Ui::requests`] after each event and carries them out (or ignores them
@@ -410,6 +419,8 @@ struct Pointer {
     last_move: Option<Instant>,
     /// Time and place of the last press on a window-drag area, to spot a double click.
     drag_down: Option<(Instant, (f32, f32))>,
+    /// A scroll bar thumb held by the mouse: the scroll view, and where on the thumb.
+    bar: Option<(u64, f32)>,
 }
 
 // ---------------------------------------------------------------- painter
@@ -453,6 +464,8 @@ struct Painter<'a, S> {
     zones: &'a mut Vec<Zone>,
     /// Views under the pointer (from the last frame's zones).
     hovered: &'a [u64],
+    /// The scroll view whose bar thumb is being dragged.
+    bar_drag: Option<u64>,
     springs: &'a mut HashMap<(u64, u8), Spring>,
     scrolls: &'a mut HashMap<u64, ScrollState>,
     pressed: Option<u64>,
@@ -1098,27 +1111,47 @@ impl<S> Painter<'_, S> {
                     self.spinner(&cxf, (r.x + r.w * 0.5, r.y + pad[1] + pull * 0.5), progress, refreshing);
                 }
 
-                // Overlay scroll bar: shows while scrolling, fades out when idle.
+                // Overlay scroll bar, as on macOS: shows while scrolling or when the pointer
+                // comes to the edge, widens with a track under the pointer, and its thumb can
+                // be dragged; fades out when idle.
+                let bar_id = id ^ BAR_SALT;
+                let grabbed = self.bar_drag == Some(id);
+                let near = self.hovered.contains(&bar_id);
                 let idle = active_at.map_or(f32::MAX, |t| (now - t).as_secs_f32());
-                let show = hi > lo && match indicator {
-                    Indicator::Never => false,
-                    Indicator::Always => true,
-                    Indicator::Auto => idle < 1.2,
-                };
-                if show && indicator == Indicator::Auto {
+                let scrolls = hi > lo && indicator != Indicator::Never;
+                let show = scrolls && (indicator == Indicator::Always || idle < 1.2 || near || grabbed);
+                if show && indicator == Indicator::Auto && !near && !grabbed {
                     self.wake = Some(self.wake.map_or(1.22 - idle, |w| w.min(1.22 - idle)));
                 }
                 let a = self.spring(id, 8, if show { 1.0 } else { 0.0 }).clamp(0.0, 1.0);
+                let wide = self.crisp(id, 9, if show && (near || grabbed) { 1.0 } else { 0.0 }).clamp(0.0, 1.0);
+                let strip = Rect::new(r.x + r.w - BAR_STRIP, r.y, BAR_STRIP, r.h);
+                let mut bxf = cxf;
+                bxf.clip_r = 0.0;
+                if scrolls {
+                    // Always there, so hovering the edge reveals the bar; once shown it keeps
+                    // the arrow pointer over text that runs under it.
+                    let cursor = (a > 0.5).then_some(Cursor::Default);
+                    self.zone(&bxf, bar_id, xf.rect(strip), cursor);
+                }
                 if a > 0.01 {
                     let track = r.h - 8.0;
                     // Its length mirrors how much of the content is visible; it squashes
                     // against the end while the content is stretched.
                     let len = ((track * r.h / content.max(1.0)).max(34.0) - over).clamp(10.0, track.max(10.0));
                     let at = ((offset - lo) / (hi - lo).max(1.0)).clamp(0.0, 1.0);
-                    let bar = Rect::new(r.x + r.w - 7.0, r.y + 4.0 + (track - len) * at, 4.0, len);
-                    let mut bxf = cxf;
-                    bxf.clip_r = 0.0;
-                    self.fill(&bxf, bar, 2.0, Fill::Solid(xf.fg.alpha(0.45 * a)), None);
+                    let w = BAR_THIN + (BAR_WIDE - BAR_THIN) * wide;
+                    if wide > 0.01 {
+                        let rail = Rect::new(r.x + r.w - BAR_WIDE - 4.0, r.y, BAR_WIDE + 4.0, r.h);
+                        self.fill(&bxf, rail, 0.0, Fill::Solid(xf.fg.alpha(0.06 * wide * a)), None);
+                    }
+                    let bar = Rect::new(r.x + r.w - 2.0 - w, r.y + 4.0 + (track - len) * at, w, len);
+                    self.fill(&bxf, bar, w * 0.5, Fill::Solid(xf.fg.alpha((0.45 + 0.1 * wide) * a)), None);
+                    if a > 0.5 {
+                        let y0 = (r.y + 4.0) * xf.s + xf.ty;
+                        let action = Action::ScrollBar { scroll: id, y0, track: track * xf.s, len: len * xf.s, lo, hi, page: (r.h * 0.9).max(1.0) };
+                        self.hit(&bxf, bar_id, xf.rect(strip), action);
+                    }
                 }
             }
             Kind::Toggle(on, f) => {
@@ -1413,6 +1446,7 @@ impl<S: 'static> Ui<S> {
             springs: &mut self.springs,
             scrolls: &mut self.scrolls,
             pressed: self.ptr.pressed,
+            bar_drag: self.ptr.bar.map(|b| b.0),
             frame,
             text: &mut self.text,
             focus: self.focus,
@@ -1533,6 +1567,38 @@ impl<S: 'static> Ui<S> {
             })
     }
 
+    /// A press on a scroll bar: on the thumb it grabs it, on the track it pages towards the
+    /// press.
+    fn bar_press(&mut self, i: usize, y: f32) {
+        let Action::ScrollBar { scroll, y0, track, len, lo, hi, page } = self.hits[i].action else { return };
+        let Some(s) = self.scrolls.get_mut(&scroll) else { return };
+        let at = ((s.offset - lo) / (hi - lo).max(1.0)).clamp(0.0, 1.0);
+        let top = y0 + (track - len) * at;
+        if y >= top && y <= top + len {
+            self.ptr.bar = Some((scroll, y - top));
+            return;
+        }
+        let dir = if y < top { -1.0 } else { 1.0 };
+        s.offset = (s.offset + dir * page).clamp(lo, hi);
+        s.vel = 0.0;
+        s.active_at = Some(Instant::now());
+    }
+
+    /// Thumb dragged: the offset follows proportionally, no rubber band.
+    fn bar_drag(&mut self, sid: u64, grab: f32, y: f32) -> bool {
+        let Some(&Action::ScrollBar { y0, track, len, lo, hi, .. }) =
+            self.hits.iter().map(|h| &h.action).find(|a| matches!(a, Action::ScrollBar { scroll, .. } if *scroll == sid))
+        else {
+            return false;
+        };
+        let Some(s) = self.scrolls.get_mut(&sid) else { return false };
+        let at = ((y - grab - y0) / (track - len).max(1.0)).clamp(0.0, 1.0);
+        let next = lo + at * (hi - lo);
+        s.vel = 0.0;
+        s.active_at = Some(Instant::now());
+        std::mem::replace(&mut s.offset, next) != next
+    }
+
     fn slide(&mut self, i: usize, x: f32) {
         if let Action::Slider(x0, range, steps, f) = &self.hits[i].action {
             f(&mut self.state, popup::snap(((x - x0) / range).clamp(0.0, 1.0), *steps));
@@ -1568,6 +1634,14 @@ impl<S: 'static> Ui<S> {
             self.run_dismiss(d);
             return true;
         }
+        self.ptr.bar = None;
+        if let Some(i) = hit.filter(|_| !touch) {
+            if let Action::ScrollBar { .. } = self.hits[i].action {
+                // The bar is not text: the selection and focus stay as they are.
+                self.bar_press(i, pos.1);
+                return true;
+            }
+        }
         self.focus = None;
         if let Some(i) = hit {
             if matches!(self.hits[i].action, Action::DragWindow) && !touch {
@@ -1600,7 +1674,8 @@ impl<S: 'static> Ui<S> {
     /// Recomputes what is under the mouse; true if that changed (a frame is needed).
     fn update_hover(&mut self) -> bool {
         let (ids, cursor, tip) = hover_at(&self.zones, self.mouse);
-        self.cursor = cursor;
+        // A dragged scroll bar thumb keeps the arrow wherever the pointer wanders.
+        self.cursor = if self.ptr.bar.is_some() { Cursor::Default } else { cursor };
         match (tip, &self.tip) {
             (Some(id), Some(t)) if t.id == id => {}
             (Some(id), _) => {
@@ -1640,6 +1715,10 @@ impl<S: 'static> Ui<S> {
             }
             changed
         };
+        if let Some((sid, grab)) = self.ptr.bar {
+            self.cursor = Cursor::Default;
+            return self.bar_drag(sid, grab, pos.1) || hover;
+        }
         // Touch: a vertical drag inside a scroll view scrolls it and cancels the tap.
         if let Some(sid) = self.ptr.drag_scroll {
             if !self.ptr.dragging && (pos.1 - self.ptr.down_at.1).abs() > 8.0 {
@@ -1691,6 +1770,10 @@ impl<S: 'static> Ui<S> {
     pub fn pointer_up(&mut self, pos: (f32, f32)) -> bool {
         let pressed = self.ptr.pressed.take();
         self.ptr.down = false;
+        if self.ptr.bar.take().is_some() {
+            self.update_hover();
+            return true;
+        }
         let was_dragging = std::mem::take(&mut self.ptr.dragging);
         self.ptr.drag_scroll = None;
         self.sel_release();

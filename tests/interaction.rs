@@ -2044,3 +2044,103 @@ fn chat_window_selects_paragraphs_cells_and_code() {
     let s = ui.selection_text().unwrap_or_default();
     assert!(s.contains("Last line.") && s.contains("fn main"), "across messages: {s:?}");
 }
+
+// ---------------------------------------------------------------- scroll bar
+
+fn bar_ui() -> Ui<()> {
+    let mut ui = Ui::new((), |_: &()| {
+        let rows = list(60, 40.0, |i| text(format!("row {i} with a line of text that runs right up to the edge of the view")).fill_width().height(40.0));
+        scroll(vstack((rect().height(1.0).fill_width(), rows)).background(Color::RED).selectable())
+    });
+    ui.frame((300.0, 400.0));
+    ui
+}
+
+/// The scroll bar thumb: a narrow quad at the right edge.
+fn thumb(ui: &Ui<()>) -> Option<[f32; 4]> {
+    ui.list.cmds.iter().find_map(|c| match c {
+        ruru::Cmd::Quad(q) if q.rect[0] > 280.0 && q.rect[2] <= 10.0 && q.rect[3] > 20.0 && q.rect[3] < 390.0 => Some(q.rect),
+        _ => None,
+    })
+}
+
+fn settle_bar(ui: &mut Ui<()>) {
+    for _ in 0..80 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        ui.frame((300.0, 400.0));
+    }
+}
+
+#[test]
+fn scroll_bar_shows_on_hover_at_the_edge_and_widens() {
+    let mut ui = bar_ui();
+    settle_bar(&mut ui);
+    assert!(thumb(&ui).is_none(), "hidden while idle");
+    ui.pointer_move((150.0, 200.0));
+    settle_bar(&mut ui);
+    assert!(thumb(&ui).is_none(), "the middle of the view does not reveal it");
+    assert_eq!(ui.cursor, ruru::Cursor::Text);
+    ui.pointer_move((294.0, 200.0));
+    settle_bar(&mut ui);
+    let t = thumb(&ui).expect("hovering the edge reveals the bar");
+    assert!(t[2] > 8.0, "and widens it: {t:?}");
+    assert_eq!(ui.cursor, ruru::Cursor::Default, "an arrow over the bar, not an I-beam");
+    assert!(!ui.animating && ui.wake_in.is_none_or(|w| w > 0.5), "no redraws while it rests under the pointer: {} {:?}", ui.animating, ui.wake_in);
+    // Leaving: it narrows and fades within about a second, through wake-ups.
+    ui.pointer_move((150.0, 200.0));
+    ui.frame((300.0, 400.0));
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        ui.frame((300.0, 400.0));
+    }
+    assert!(thumb(&ui).is_none(), "fades out");
+}
+
+#[test]
+fn scroll_bar_thumb_drags_proportionally_and_the_track_pages() {
+    let mut ui = bar_ui();
+    ui.pointer_move((294.0, 200.0));
+    settle_bar(&mut ui);
+    let t = thumb(&ui).unwrap();
+    let (x, y) = (t[0] + t[2] * 0.5, t[1] + t[3] * 0.5);
+    ui.pointer_down((x, y), false);
+    for k in 1..=5 {
+        ui.pointer_move((x - 30.0, y + 20.0 * k as f32)); // sideways drift does not matter
+        ui.frame((300.0, 400.0));
+        assert_eq!(ui.cursor, ruru::Cursor::Default);
+    }
+    ui.pointer_up((x - 30.0, y + 100.0));
+    ui.frame((300.0, 400.0));
+    // Content 2401, view 400: 100 pt of thumb travel over (392 - thumb) of track.
+    let len = 392.0 * 400.0 / 2401.0;
+    let want = 100.0 * 2001.0 / (392.0 - len);
+    assert!((-top_y(&ui) - want).abs() < 1.0, "offset {} want {want}", -top_y(&ui));
+    assert!(ui.selection_text().is_none_or(|s| s.is_empty()), "the drag selects nothing");
+    // Dragging past the end stops on it: no rubber band.
+    let t = thumb(&ui).unwrap();
+    ui.pointer_down((t[0] + 2.0, t[1] + 5.0), false);
+    ui.pointer_move((t[0] + 2.0, 2000.0));
+    ui.pointer_up((t[0] + 2.0, 2000.0));
+    ui.frame((300.0, 400.0));
+    assert_eq!(-top_y(&ui), 2001.0);
+    // A click on the track above the thumb pages up by most of a screen.
+    ui.pointer_move((294.0, 30.0));
+    ui.frame((300.0, 400.0));
+    ui.pointer_down((294.0, 30.0), false);
+    ui.pointer_up((294.0, 30.0));
+    ui.frame((300.0, 400.0));
+    assert_eq!(-top_y(&ui), 2001.0 - 360.0);
+}
+
+#[test]
+fn scroll_bar_press_keeps_the_text_selection() {
+    let mut ui = bar_ui();
+    ui.key(KeyInput::SelectAll);
+    ui.frame((300.0, 400.0));
+    assert!(ui.selection_text().is_some_and(|s| s.len() > 100));
+    ui.pointer_move((294.0, 200.0));
+    settle_bar(&mut ui);
+    let t = thumb(&ui).unwrap();
+    click(&mut ui, (t[0] + 2.0, t[1] + 5.0));
+    assert!(ui.selection_text().is_some_and(|s| s.len() > 100), "a click on the bar is not a click on the text");
+}
