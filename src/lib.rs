@@ -51,7 +51,7 @@ pub use view::{
     text_field, toggle, vstack, zstack, Align, Children, Cursor, Dim, Fill, Glass, Image, Indicator, Shadow, Truncate,
     View, Weight,
 };
-pub use view::{drawer, rich_text, Env, SizeClass, Span, ViewFn};
+pub use view::{drawer, rich_text, Env, Mods, SizeClass, Span, ViewFn};
 #[cfg(feature = "markdown")]
 mod markdown;
 #[cfg(feature = "markdown")]

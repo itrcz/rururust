@@ -12,6 +12,9 @@ use bytemuck::{Pod, Zeroable};
 use std::collections::HashMap;
 use web_time::Instant;
 
+#[path = "edit.rs"]
+pub(crate) mod edit;
+
 // ---------------------------------------------------------------- draw list
 
 pub(crate) const KIND_FILL: f32 = 0.0;
@@ -194,8 +197,8 @@ enum Action<S> {
     Block(Option<Box<dyn Fn(&mut S)>>),
     /// The body of an overlay: taps on it do nothing (and don't dismiss).
     Swallow,
-    /// Text field: shaped-text key (0 when empty), screen x of the text origin, scale.
-    Field { key: u64, x0: f32, scale: f32, value: String, on_change: Box<dyn Fn(&mut S, String)> },
+    /// Text field (see `edit.rs`).
+    Field(Box<edit::FieldHit<S>>),
     /// Tab bar: screen x of the first tab, width of one tab, number of tabs.
     Tabs { x0: f32, tab_w: f32, n: usize, on_select: Box<dyn Fn(&mut S, usize)> },
     OpenMenu,
@@ -208,12 +211,14 @@ enum Action<S> {
 /// Something the UI asks of the window it lives in. The core knows nothing about windows:
 /// the runner drains [`Ui::requests`] after each event and carries them out (or ignores them
 /// where they make no sense, like on the web).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WindowRequest {
     /// Start moving the window with the pressed pointer (a press on `.window_drag()`).
     DragWindow,
     /// Zoom / maximize or restore the window (a double click on `.window_drag()`).
     Zoom,
+    /// Put this text on the system clipboard (copy / cut in a text field).
+    SetClipboard(String),
 }
 
 /// Keys the UI understands besides typed text.
@@ -223,10 +228,20 @@ pub enum KeyInput {
     Delete,
     Left,
     Right,
+    Up,
+    Down,
+    /// Start / end of the visual row; with `command` held, of the whole text.
     Home,
     End,
     Enter,
     Escape,
+    /// Shortcuts the runner maps from Cmd/Ctrl+A, C, X, Z, Shift+Z. Pasting goes through
+    /// [`Ui::paste`], since only the runner can read the clipboard.
+    SelectAll,
+    Copy,
+    Cut,
+    Undo,
+    Redo,
 }
 
 /// An open picker menu, painted above everything else.
@@ -237,20 +252,6 @@ struct Menu<S> {
     selected: usize,
     on_select: Rc<dyn Fn(&mut S, usize)>,
     fg: Color,
-}
-
-fn prev_char(s: &str, i: usize) -> usize {
-    s[..i].char_indices().next_back().map_or(0, |(p, _)| p)
-}
-fn next_char(s: &str, i: usize) -> usize {
-    s[i..].chars().next().map_or(s.len(), |c| i + c.len_utf8())
-}
-fn floor_char(s: &str, i: usize) -> usize {
-    let mut i = i.min(s.len());
-    while !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
 }
 
 /// Seconds between two presses that make a double click.
@@ -376,7 +377,7 @@ struct Painter<'a, S> {
     frame: u64,
     text: &'a mut TextSystem,
     focus: Option<u64>,
-    caret: usize,
+    ed: &'a mut edit::Editor,
     caret_on: bool,
     open_menu: Option<u64>,
     menu: Option<Menu<S>>,
@@ -613,7 +614,7 @@ impl<S> Painter<'_, S> {
 
         // Pointer shape and hover: explicit, or what the kind of view suggests.
         let cursor = st.cursor.or(match &v.kind {
-            Kind::TextField { .. } => Some(Cursor::Text),
+            Kind::TextField(_) => Some(Cursor::Text),
             Kind::Toggle(..) | Kind::Slider(..) | Kind::Tabs { .. } | Kind::Picker { .. } => Some(Cursor::Pointer),
             _ if v.on_tap.is_some() => Some(Cursor::Pointer),
             _ => None,
@@ -733,34 +734,7 @@ impl<S> Painter<'_, S> {
                 self.list.images.push(img);
                 self.list.cmds.push(Cmd::Quad(q));
             }
-            Kind::TextField { value, on_change, .. } => {
-                let focused = self.focus == Some(id);
-                let f = self.spring(id, 3, if focused { 1.0 } else { 0.0 }).clamp(0.0, 1.0);
-                if f > 0.01 {
-                    self.fill(&xf, r, st.radius, Fill::Solid(Color::CLEAR), Some((2.0, Color::BLUE.alpha(f))));
-                }
-                let inner = Rect::new(r.x + pad[0], r.y + pad[1], r.w - pad[0] - pad[2], r.h - pad[1] - pad[3]);
-                let caret = if focused { floor_char(&value, self.caret) } else { 0 };
-                let cx = if value.is_empty() { 0.0 } else { self.text.caret_x(ln.text, caret) };
-                // Keep the caret in view when the text is longer than the field.
-                let shift = if focused { (cx - inner.w + 2.0).max(0.0) } else { 0.0 };
-                let mut cxf = xf;
-                cxf.clip = xf.clip.intersect(&xf.rect(inner.inflate(1.0)));
-                cxf.clip_r = 0.0;
-                let color = if value.is_empty() { xf.fg.alpha(xf.fg.a * 0.4) } else { xf.fg };
-                self.label(&cxf, ln.text, (inner.x - shift, inner.y), (inner.w, inner.h), color);
-                if focused && self.caret_on {
-                    let bar = Rect::new(inner.x + cx - shift, inner.y + 1.0, 2.0, inner.h - 2.0);
-                    self.fill(&cxf, bar, 1.0, Fill::Solid(Color::BLUE), None);
-                }
-                self.hit(&xf, id, sr, Action::Field {
-                        key: if value.is_empty() { 0 } else { ln.text },
-                        x0: (inner.x - shift) * xf.s + xf.tx,
-                        scale: xf.s,
-                        value,
-                        on_change,
-                    });
-            }
+            Kind::TextField(f) => self.paint_field(f, &st, r, sr, xf, id),
             Kind::Tabs { labels, selected, on_select } => {
                 let n = labels.len().max(1);
                 let tab_w = (r.w - 2.0 * TABS_PAD) / n as f32;
@@ -974,8 +948,8 @@ pub struct Ui<S> {
     last_frame: Option<Instant>,
     frame: u64,
     focus: Option<u64>,
-    caret: usize,
-    caret_at: Option<Instant>,
+    /// Caret, selection, undo history and IME state of the focused text field.
+    ed: edit::Editor,
     open_menu: Option<u64>,
     started: Instant,
     timers: Vec<(Instant, Box<dyn FnOnce(&mut S)>)>,
@@ -1019,8 +993,7 @@ impl<S: 'static> Ui<S> {
             last_frame: None,
             frame: 0,
             focus: None,
-            caret: 0,
-            caret_at: None,
+            ed: edit::Editor::default(),
             open_menu: None,
             started: Instant::now(),
             timers: Vec::new(),
@@ -1139,7 +1112,7 @@ impl<S: 'static> Ui<S> {
         self.list.images.clear();
         self.hits.clear();
         self.zones.clear();
-        let blink = self.caret_at.map_or(0.0, |t| (now - t).as_secs_f32());
+        let blink = self.ed.blink_at.map_or(0.0, |t| (now - t).as_secs_f32());
         let fg = if self.background.luminance() < 0.5 { Color::WHITE } else { Color::BLACK };
         let xf = Xf {
             s: 1.0,
@@ -1162,7 +1135,7 @@ impl<S: 'static> Ui<S> {
             frame,
             text: &mut self.text,
             focus: self.focus,
-            caret: self.caret,
+            ed: &mut self.ed,
             caret_on: blink % 1.0 < 0.5,
             open_menu: self.open_menu,
             menu: None,
@@ -1186,7 +1159,7 @@ impl<S: 'static> Ui<S> {
             }
         }
         let timer_wake = self.timers.iter().map(|t| t.0.saturating_duration_since(now).as_secs_f32()).reduce(f32::min);
-        self.wake_in = [self.focus.map(|_| 0.5 - blink % 0.5), paint_wake, scroll_wake, timer_wake]
+        self.wake_in = [self.focus.filter(|_| self.ed.blinks()).map(|_| 0.5 - blink % 0.5), paint_wake, scroll_wake, timer_wake]
             .into_iter()
             .flatten()
             .reduce(f32::min)
@@ -1293,10 +1266,8 @@ impl<S: 'static> Ui<S> {
                 }
             }
             self.slide(i, pos.0);
-            if let Action::Field { key, x0, scale, .. } = &self.hits[i].action {
-                self.focus = Some(self.hits[i].id);
-                self.caret = if *key == 0 { 0 } else { self.text.index_at(*key, (pos.0 - x0) / scale) };
-                self.caret_at = Some(Instant::now());
+            if matches!(self.hits[i].action, Action::Field(_)) {
+                self.field_press(i, pos);
             }
         }
         true
@@ -1367,6 +1338,9 @@ impl<S: 'static> Ui<S> {
                 if matches!(self.hits[i].action, Action::Tabs { .. }) {
                     return true; // the drop follows the pointer
                 }
+                if matches!(self.hits[i].action, Action::Field(_)) {
+                    return self.field_drag(i, pos);
+                }
             }
         }
         hover
@@ -1415,60 +1389,32 @@ impl<S: 'static> Ui<S> {
         self.focus.is_some()
     }
 
-    fn edit(&mut self, f: impl FnOnce(&mut String, &mut usize)) -> bool {
-        let Some(i) = self.focus.and_then(|id| self.hits.iter().position(|h| h.id == id)) else { return false };
-        let Action::Field { value, on_change, .. } = &mut self.hits[i].action else { return false };
-        let mut next = value.clone();
-        let mut caret = floor_char(&next, self.caret);
-        f(&mut next, &mut caret);
-        self.caret = caret;
-        self.caret_at = Some(Instant::now());
-        if next != *value {
-            // Remember it right away: several keys can arrive before the next frame.
-            *value = next.clone();
-            on_change(&mut self.state, next);
-        }
-        true
-    }
-
     /// Typed text (already translated by the keyboard layout). Returns true if it was used.
     pub fn text_input(&mut self, text: &str) -> bool {
         if text.is_empty() || text.chars().any(char::is_control) {
             return false;
         }
-        self.edit(|v, c| {
-            v.insert_str(*c, text);
-            *c += text.len();
-        })
+        self.field_type(text)
     }
 
-    /// Editing / navigation key. Returns true if it was used.
+    /// Editing / navigation key; Shift and the other modifiers come from
+    /// [`set_modifiers`](Self::set_modifiers). Returns true if it was used.
     pub fn key(&mut self, key: KeyInput) -> bool {
         match key {
-            KeyInput::Escape | KeyInput::Enter => {
-                self.open_menu.take().is_some() | self.focus.take().is_some()
+            KeyInput::Escape => self.open_menu.take().is_some() | self.blur(),
+            KeyInput::Enter if self.open_menu.is_some() => {
+                self.open_menu = None;
+                true
             }
-            _ => self.edit(|v, c| match key {
-                KeyInput::Backspace if *c > 0 => {
-                    let p = prev_char(v, *c);
-                    v.replace_range(p..*c, "");
-                    *c = p;
-                }
-                KeyInput::Delete if *c < v.len() => {
-                    let n = next_char(v, *c);
-                    v.replace_range(*c..n, "");
-                }
-                KeyInput::Left => *c = prev_char(v, *c),
-                KeyInput::Right => *c = next_char(v, *c),
-                KeyInput::Home => *c = 0,
-                KeyInput::End => *c = v.len(),
-                _ => {}
-            }),
+            _ => self.field_key(key),
         }
     }
 
     /// Mouse wheel / trackpad scroll; `dy` in points, positive = content moves down.
     pub fn wheel(&mut self, pos: (f32, f32), dy: f32, phase: WheelPhase) -> bool {
+        if self.field_wheel(pos, dy) {
+            return true;
+        }
         let now = Instant::now();
         // Topmost scroll view under the cursor; an overlay's backdrop stops the search.
         for h in self.hits.iter().rev() {
