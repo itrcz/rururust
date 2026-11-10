@@ -42,9 +42,9 @@ fn rail(s: &S) -> View<S> {
             .hover(Color::WHITE.alpha(0.08))
     };
     vstack((
-        item("☰", s.sidebar).on_tap(|s: &mut S| s.sidebar = !s.sidebar),
+        item(if s.sidebar { "«" } else { "»" }, s.sidebar).on_tap(|s: &mut S| s.sidebar = !s.sidebar),
         item("⌂", false).on_tap(|_: &mut S| {}),
-        item("✎", false).on_tap(|_: &mut S| {}),
+        item("+", false).on_tap(|_: &mut S| {}),
         spacer(),
         zstack(text("IT").font_size(12.0).weight(Weight::Bold)).size(28.0, 28.0).radius(14.0).background(Color::BLUE),
     ))
