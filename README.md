@@ -47,8 +47,12 @@ cargo install wasm-bindgen-cli --version 0.2.130 --locked   # версия ка�
 
 | Область | API |
 | --- | --- |
-| Раскладка | `vstack` `hstack` `zstack` `spacer` `rect`, `.padding()` `.size()` `.fill_width()` `.place()` |
-| Текст | `text`, `rich_text(Vec<Span>)` (жирный, курсив, код, цвет), `markdown(src)` / `markdown_with(src, images)` |
+| Раскладка | `vstack` `hstack` `zstack` `spacer` `rect`, `.padding()` `.padding_h()` / `.padding_v()` (складываются) `.size()` `.fill_width()` `.place()` |
+| Пределы размера | `.max_width(w)` `.min_width(w)` `.max_height(h)` `.min_height(h)` — `.fill_width().max_width(720.0)`: колонка чтения, не шире 720 |
+| Обрезка | `.clip()` — дети режутся по скруглённой форме узла (`.radius()`), вложенные клипы пересекаются; текст режется прямоугольником |
+| Анимация размера | `.animate()` — новый размер узла доезжает пружиной, содержимое режется краем, а не сжимается: `sidebar.width(if open { 280.0 } else { 0.0 }).animate()`. Пример: `examples/panels.rs` |
+| Наведение и курсор | `.hover(цвет)` — подсветка поверх фона, проявляется ~0.1 с; `.cursor(Cursor::Pointer / Text / ResizeH / …)`; по умолчанию «рука» у нажимаемого, I-beam у поля; `ui.cursor` |
+| Текст | `text`, `rich_text(Vec<Span>)` (жирный, курсив, код, цвет), `markdown(src)` / `markdown_with(src, images)`; `.lines(n)` — не больше n строк с «…», `.truncate(Truncate::Fade)` — затухание к краю (одна строка, если `.lines` не задан) |
 | Картинки и иконки | `image(&Image)`, `icon(&Image)` — глиф, красится цветом текста; `Image::decode` (PNG/JPEG), `Image::from_svg` |
 | Контролы | `button` `toggle` `slider` `text_field` `picker` `tab_bar` |
 | Скролл | `scroll(...)`: резинка на концах, инерция, `.on_refresh(refreshing, f)`, `.indicator(Auto/Always/Never)`, `.stick_to_bottom()`; `.sticky()` у детей |
