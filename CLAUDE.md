@@ -28,6 +28,7 @@ cargo check --no-default-features --features "<набор>" --lib  # прове�
 | `src/render.rs` | wgpu: батчи, снимок сцены и пирамида размытия для стекла, текстуры картинок, текст через glyphon |
 | `src/shaders/quad.wgsl` | все фигуры одним инстансным шейдером; `blur.wgsl` — пирамида |
 | `src/text.rs` | шейпинг и кэш (cosmic-text); кэш высот строк `list` |
+| `src/task.rs` | канал «фон → состояние»: `Link`, `Task`, `spawn`, `sleep`, `Ui::pump` |
 | `src/app.rs` | winit: окно, события, пробуждения; единственное место, знающее про платформу |
 | `src/markdown.rs`, `src/headless.rs` | под фичами `markdown`, `headless` |
 

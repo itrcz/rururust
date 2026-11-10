@@ -57,10 +57,27 @@ cargo install wasm-bindgen-cli --version 0.2.130 --locked   # версия ка�
 | Стекло | `.glass()` / `.glass_with(Glass)`; `Glass::regular()` `clear()` `frosted()`, `.strength(k)`; близкие панели слипаются сами |
 | Адаптивность | `fn view(s: &S, env: &Env)`; `env.class()` → `Phone` / `Tablet` / `Desktop` |
 | Время | `after(seconds, |s: &mut S| ...)` — таймер на состоянии (скрыть снекбар, закончить обновление) |
+| Фон | `spawn(|link| async move {..})` → `Task` (drop = отмена), `link.send(|s| ..)` из любого потока, `sleep(секунды).await` |
 | Отладка | `App::show_fps(true)`, `ruru::headless::render_png` |
 
 Модель: состояние `S` → `view(&S)` → дерево → layout → draw list → GPU. Обработчики — замыкания
 `Fn(&mut S)`. Кадр рисуется только по событию, по таймеру или пока идёт анимация.
+
+Фоновая работа: обновления состояния приходят из другого потока через `Link` и применяются в начале
+следующего кадра. Пока `Task` жив, работа идёт; сбросил его (`s.reply = None`) — отменилась.
+
+```rust
+s.reply = Some(spawn(|link: Link<App>| async move {
+    for word in answer.split_inclusive(' ') {
+        if link.cancelled() { return; }
+        sleep(0.03).await;
+        link.send(move |s| s.text.push_str(word));
+    }
+}));
+```
+
+Кто встраивает `Ui` без `app`, сам вызывает `set_waker` (на UI-потоке, чтобы `send` будил цикл), а на wasm
+ещё и `set_spawner`.
 
 ## Брать только часть
 
@@ -84,6 +101,7 @@ ruru = { version = "0.1", default-features = false, features = ["app"] }        
 | `src/render.rs` | wgpu: один инстансный пайплайн на все фигуры, снимок сцены + пирамида размытия для стекла |
 | `src/shaders/` | SDF-сквирклы, градиенты, тени, стекло (преломление по Снеллу, дисперсия, слияние панелей) |
 | `src/text.rs` | Шейпинг и кэш текста (cosmic-text), встроенные шрифты Inter и JetBrains Mono |
+| `src/task.rs` | Канал «фон → состояние»: `Link`, `Task`, `spawn`, `sleep`, `Ui::pump` |
 | `src/markdown.rs` | Markdown → обычные view |
 | `src/app.rs` | Окно и события (winit), один путь для native и web |
 
@@ -98,6 +116,5 @@ ruru = { version = "0.1", default-features = false, features = ["app"] }        
 - Текст нельзя выделить и скопировать (важно для чата); ссылки в markdown не кликаются; таблицы — упрощённо.
 - Резинка и pull-to-refresh от трекпада работают только на macOS (нужны фазы жеста); в браузере и
   с мышью скролл останавливается на краях. Тач-перетаскивание работает везде.
-- `after()` — только таймеры на UI-потоке; для сетевых запросов нужен канал из фона (не сделан).
 - Нет accessibility, тем, горизонтального скролла, диффинга дерева.
 - Сборки под iOS/Android/Windows/Linux не проверялись.
