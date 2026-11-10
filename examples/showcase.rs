@@ -36,6 +36,7 @@ struct Demo {
     glass: f32,
     tab: usize,
     name: String,
+    notes: String,
     city: usize,
     photos: Vec<Image>,
     icons: Rc<Icons>,
@@ -265,11 +266,20 @@ fn chat(s: &Demo) -> View<Demo> {
     // pictures, cards), so system blocks can sit in the flow between messages.
     let (messages, photos, material) = (s.messages.clone(), s.photos.clone(), glass(s));
     let rows = list(s.messages.len(), 120.0, move |i| bubble(material, &messages[i], &photos));
+    // The composer draws its own capsule; the field inside is plain. Enter sends,
+    // Shift+Enter breaks the line, and the field grows up to six rows.
     let input = hstack((
-        text_field(s.draft.as_str(), "Message", |s: &mut Demo, v| s.draft = v),
-        zstack(icon(&s.icons.send)).size(46.0, 46.0).radius(23.0).background(Color::BLUE).on_tap(send),
+        text_field(s.draft.as_str(), "Message", |s: &mut Demo, v| s.draft = v)
+            .multiline()
+            .on_submit(send)
+            .plain()
+            .padding_ltrb(14.0, 9.0, 4.0, 9.0),
+        zstack(icon(&s.icons.send)).size(38.0, 38.0).radius(19.0).background(Color::BLUE).on_tap(send),
     ))
-    .spacing(10.0)
+    .align(Align::End)
+    .padding(4.0)
+    .glass_with(glass(s))
+    .radius(23.0)
     .fill_width();
     vstack((
         scroll(vstack((header, rows)).spacing(8.0).fill_width().padding_ltrb(18.0, 0.0, 18.0, 12.0))
@@ -284,7 +294,7 @@ fn chat(s: &Demo) -> View<Demo> {
                     *Rc::make_mut(&mut s.messages) = all;
                 });
             }),
-        input.padding_ltrb(18.0, 6.0, 18.0, 0.0),
+        vstack(input).fill_width().padding_ltrb(18.0, 6.0, 18.0, 0.0),
     ))
     .fill()
 }
@@ -340,6 +350,7 @@ fn forms(s: &Demo) -> View<Demo> {
         card(s, (
             text(hello).font_size(20.0).weight(Weight::Semibold).centered(),
             field("NAME", text_field(s.name.as_str(), "Your name", |s: &mut Demo, v| s.name = v)),
+            field("NOTES", text_field(s.notes.as_str(), "Notes (Enter starts a new line)", |s: &mut Demo, v| s.notes = v).max_lines(4)),
             field("CITY", picker(&CITIES, s.city, |s: &mut Demo, i| s.city = i).fill_width()),
             button("Clear", |s: &mut Demo| s.name.clear()).fill_width(),
         ))
@@ -484,6 +495,7 @@ impl Demo {
             glass: 0.5,
             tab: 0,
             name: String::new(),
+            notes: String::new(),
             city: 0,
             photos: (0..7).map(|i| plasma(i as f32 * 1.3 + 0.4)).collect(),
             icons: Rc::new(icons()),
