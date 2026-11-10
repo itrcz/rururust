@@ -174,7 +174,9 @@ pub fn markdown_styled_with<S>(source: &str, style: &MarkdownStyle, images: impl
     let st = style;
     let mut blocks: Vec<View<S>> = Vec::new();
     let mut spans: Vec<Span> = Vec::new();
-    let (mut bold, mut italic, mut linked) = (0u32, 0u32, 0u32);
+    let (mut bold, mut italic) = (0u32, 0u32);
+    let mut links: Vec<String> = Vec::new(); // open links, innermost last
+    let mut list_from: Option<usize> = None; // first block of the outermost open list
     let mut heading: Option<HeadingLevel> = None;
     let mut code: Option<String> = None;
     let mut lists: Vec<Option<u64>> = Vec::new(); // open lists: next number, or None for bullets
@@ -210,13 +212,22 @@ pub fn markdown_styled_with<S>(source: &str, style: &MarkdownStyle, images: impl
             body = body.font_size(size).weight(st.heading_weight);
         }
         let mut block = if depth > 0 {
-            let marker = text(bullet.take().unwrap_or_default())
+            let mark = bullet.take().unwrap_or_default();
+            // Copied as plain-text markdown: "- ", "2. ", "- [x] ", nested by two spaces.
+            let plain = match mark.as_str() {
+                "•" => "-".to_string(),
+                "☐" => "- [ ]".to_string(),
+                "☑" => "- [x]".to_string(),
+                m => m.to_string(),
+            };
+            let marker = text(mark)
                 .font_size(st.size)
                 .line_height(st.line_height)
                 .width(st.list_indent)
-                .opacity(0.7);
+                .opacity(0.7)
+                .copy_as(format!("{}{plain} ", "  ".repeat(depth - 1)));
             let indent = st.list_nest * (depth as f32 - 1.0);
-            hstack((marker, body)).align(Align::Start).padding_ltrb(indent, 0.0, 0.0, 0.0)
+            hstack((marker, body)).align(Align::Start).padding_ltrb(indent, 0.0, 0.0, 0.0).copy_sep("")
         } else {
             body
         };
@@ -242,10 +253,10 @@ pub fn markdown_styled_with<S>(source: &str, style: &MarkdownStyle, images: impl
                 Tag::Strong => bold += 1,
                 Tag::Emphasis => italic += 1,
                 Tag::Link { dest_url, .. } => {
-                    linked += 1;
                     if let Some((_, img)) = st.link_icons.iter().find(|(p, _)| dest_url.starts_with(p.as_str())) {
-                        spans.push(Span::icon(img).color(st.link));
+                        spans.push(Span::icon(img).color(st.link).link(dest_url.to_string()));
                     }
+                    links.push(dest_url.into_string());
                 }
                 Tag::BlockQuote(_) => quote += 1,
                 Tag::CodeBlock(_) => {
@@ -254,6 +265,9 @@ pub fn markdown_styled_with<S>(source: &str, style: &MarkdownStyle, images: impl
                 }
                 Tag::List(start) => {
                     flush(&mut spans, &mut blocks, heading, lists.len(), &mut bullet, quote);
+                    if lists.is_empty() {
+                        list_from = Some(blocks.len());
+                    }
                     lists.push(start);
                 }
                 Tag::Item => {
@@ -278,7 +292,7 @@ pub fn markdown_styled_with<S>(source: &str, style: &MarkdownStyle, images: impl
                 Tag::Image { dest_url, .. } => {
                     flush(&mut spans, &mut blocks, heading, lists.len(), &mut bullet, quote);
                     match images(&dest_url) {
-                        Some(img) => blocks.push(image(&img).fill_width().radius(14.0)),
+                        Some(img) => blocks.push(image(&img).fill_width().radius(14.0).copy_as(format!("![]({dest_url})"))),
                         None => alt = Some(String::new()),
                     }
                 }
@@ -294,10 +308,18 @@ pub fn markdown_styled_with<S>(source: &str, style: &MarkdownStyle, images: impl
                 }
                 TagEnd::Strong => bold = bold.saturating_sub(1),
                 TagEnd::Emphasis => italic = italic.saturating_sub(1),
-                TagEnd::Link => linked = linked.saturating_sub(1),
+                TagEnd::Link => {
+                    links.pop();
+                }
                 TagEnd::BlockQuote(_) => quote = quote.saturating_sub(1),
                 TagEnd::List(_) => {
                     lists.pop();
+                    // The items of one list copy as lines, not as paragraphs.
+                    if let Some(from) = list_from.filter(|_| lists.is_empty()) {
+                        let items = blocks.split_off(from.min(blocks.len()));
+                        blocks.push(vstack(items).spacing(st.gap).align(Align::Start).fill_width());
+                        list_from = None;
+                    }
                 }
                 TagEnd::TableHead => header = false,
                 TagEnd::TableCell => {
@@ -356,8 +378,9 @@ pub fn markdown_styled_with<S>(source: &str, style: &MarkdownStyle, images: impl
                         s = s.weight(if bold > 0 { st.strong } else { st.table.header_weight });
                     }
                     s.italic = italic > 0;
-                    if linked > 0 {
+                    if let Some(url) = links.last() {
                         s.color = Some(st.link);
+                        s.link = Some(url.clone());
                     } else if header && table.is_some() {
                         s.color = st.table.header_color;
                     }
@@ -368,6 +391,7 @@ pub fn markdown_styled_with<S>(source: &str, style: &MarkdownStyle, images: impl
                 let mut s = Span::new(t.into_string()).code();
                 s.color = st.code_color;
                 s.background = st.code_background;
+                s.link = links.last().cloned();
                 spans.push(s);
             }
             Event::SoftBreak => spans.push(Span::new(" ")),
@@ -381,7 +405,8 @@ pub fn markdown_styled_with<S>(source: &str, style: &MarkdownStyle, images: impl
         }
     }
     flush(&mut spans, &mut blocks, heading, lists.len(), &mut bullet, quote);
-    let out = vstack(blocks).spacing(st.gap).align(Align::Start).fill_width();
+    // Selectable by itself; inside a selectable list the list's selection wins.
+    let out = vstack(blocks).spacing(st.gap).align(Align::Start).fill_width().selectable().copy_sep("\n\n");
     match st.color {
         Some(c) => out.color(c),
         None => out,
@@ -413,7 +438,7 @@ fn table_view<S>(rows: Vec<(bool, Vec<Vec<Span>>)>, st: &MarkdownStyle) -> View<
         for c in views.len()..n {
             views.push(rect().flex(share(c))); // a short row keeps the columns in place
         }
-        out.push(hstack(views).align(Align::Start).fill_width());
+        out.push(hstack(views).align(Align::Start).fill_width().copy_sep("\t"));
     }
     vstack(out).align(Align::Start).fill_width()
 }

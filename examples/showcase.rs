@@ -263,9 +263,13 @@ fn chat(s: &Demo) -> View<Demo> {
     .radius(18.0)
     .sticky();
     // The list builds only the rows on screen; each row is ordinary views (markdown,
-    // pictures, cards), so system blocks can sit in the flow between messages.
+    // pictures, cards), so system blocks can sit in the flow between messages. The whole
+    // history is one selection: drag across messages, Cmd/Ctrl+C copies them as plain text.
+    // Links open in the browser (`.on_link()` would route them to the app instead).
     let (messages, photos, material) = (s.messages.clone(), s.photos.clone(), glass(s));
-    let rows = list(s.messages.len(), 120.0, move |i| bubble(material, &messages[i], &photos));
+    let rows = list(s.messages.len(), 120.0, move |i| bubble(material, &messages[i], &photos))
+        .selectable()
+        .selection_color(Color::hex(0x4DA3FF).alpha(0.35));
     // The composer draws its own capsule; the field inside is plain. Enter sends,
     // Shift+Enter breaks the line, and the field grows up to six rows.
     let input = hstack((

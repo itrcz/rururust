@@ -1440,3 +1440,22 @@ fn links_open_on_click_underline_on_hover_and_select_on_drag() {
     assert!(ui.requests.is_empty());
     assert_eq!(ui.state.opened, vec!["https://example.com/docs".to_string(), "javascript:alert(1)".to_string()]);
 }
+
+#[test]
+fn markdown_copies_as_plain_text_and_its_links_are_live() {
+    let src = "# Title\n\nSee [the docs](https://example.com) now.\n\n- one\n- two\n  1. nested\n\n| a | b |\n|---|---|\n| 1 |   |\n\n```\nfn main() {}\n```";
+    let mut ui = Ui::new(Vec::<String>::new(), move |_: &Vec<String>| {
+        scroll(markdown(src).on_link(|s: &mut Vec<String>, url| s.push(url.to_string())))
+    });
+    ui.frame((500.0, 800.0));
+    ui.key(KeyInput::SelectAll);
+    assert_eq!(
+        clipboard(&mut ui).as_deref(),
+        Some("Title\n\nSee the docs now.\n\n- one\n- two\n  1. nested\n\na\tb\n1\t\n\nfn main() {}")
+    );
+    // The link text is clickable.
+    let r = text_rects(&ui);
+    let para = r[1];
+    click(&mut ui, (para.0 + para.2 * 0.45, para.1 + para.3 * 0.5));
+    assert_eq!(ui.state, vec!["https://example.com".to_string()]);
+}

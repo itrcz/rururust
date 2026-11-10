@@ -296,6 +296,10 @@ struct Clipboard {
     inbox: Rc<RefCell<Vec<WebClip>>>,
     #[cfg(target_arch = "wasm32")]
     shared: String,
+    /// The `.selectable()` selection `shared` was taken from: its text is only rebuilt when
+    /// the selection changes, since that builds the view.
+    #[cfg(target_arch = "wasm32")]
+    mirrored: Option<Option<crate::ui::select::Selection>>,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -333,6 +337,8 @@ impl Clipboard {
             inbox,
             #[cfg(target_arch = "wasm32")]
             shared: String::new(),
+            #[cfg(target_arch = "wasm32")]
+            mirrored: None,
         }
     }
 
@@ -469,7 +475,18 @@ impl<S: 'static> Runner<S> {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let sel = ui.selection_text().unwrap_or_default();
+            let sel = if ui.has_focus() {
+                self.clipboard.mirrored = None;
+                ui.selection_text().unwrap_or_default()
+            } else {
+                let now = Some(ui.feed_selection().cloned());
+                if now != self.clipboard.mirrored {
+                    self.clipboard.mirrored = now;
+                    ui.feed_text().unwrap_or_default()
+                } else {
+                    self.clipboard.shared.clone()
+                }
+            };
             if sel != self.clipboard.shared {
                 clip_selection(&sel);
                 self.clipboard.shared = sel;

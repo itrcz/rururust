@@ -414,6 +414,12 @@ impl<S: 'static> Ui<S> {
         }
     }
 
+    /// The current `.selectable()` selection, to notice when it changes.
+    #[allow(dead_code)] // used by the web runner only
+    pub(crate) fn feed_selection(&self) -> Option<&Selection> {
+        self.sel.sel.as_ref()
+    }
+
     /// The selection outside text fields as plain text. Builds the view once and, of a lazy
     /// list, only the selected rows; nothing is laid out.
     pub(crate) fn feed_text(&self) -> Option<String> {
@@ -444,7 +450,7 @@ struct Collect {
 /// Walks to the area `area` (with the ids layout and paint give) and collects its text.
 fn find<S>(v: View<S>, id: u64, area: u64, path: &[(u64, usize)], c: &mut Collect) -> Option<String> {
     if id == area {
-        return Some(collect(&v, c));
+        return Some(collect(&v, c).unwrap_or_default());
     }
     match v.kind {
         Kind::Stack { children, .. } => children.into_iter().enumerate().find_map(|(i, ch)| {
@@ -474,8 +480,9 @@ fn count_text<S>(v: &View<S>) -> u32 {
     }
 }
 
-/// The selected text of a subtree, in tree order.
-fn collect<S>(v: &View<S>, c: &mut Collect) -> String {
+/// The selected text of a subtree, in tree order; `None` when nothing of it is selected.
+/// An empty text inside the selection is `Some("")`, so an empty table cell keeps its tab.
+fn collect<S>(v: &View<S>, c: &mut Collect) -> Option<String> {
     if let Some(s) = &v.style.copy_as {
         // Atomic: all of it when any of it is selected.
         let n = count_text(v);
@@ -487,25 +494,29 @@ fn collect<S>(v: &View<S>, c: &mut Collect) -> String {
             c.lo <= last && c.hi > first
         };
         c.node += n;
-        return if hit { s.clone() } else { String::new() };
+        return (hit && !s.is_empty()).then(|| s.clone());
     }
-    let join = |parts: Vec<String>, sep: &str| parts.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join(sep);
+    let join = |parts: Vec<Option<String>>, sep: &str| {
+        let parts: Vec<String> = parts.into_iter().flatten().collect();
+        (!parts.is_empty()).then(|| parts.join(sep))
+    };
     match &v.kind {
         Kind::Text(t) => {
             let me = (c.row, c.node);
             c.node += 1;
             if me < c.lo.at() || me > c.hi.at() {
-                return String::new();
+                return None;
             }
             let s = shaped_text(&t.spans, &t.content);
             let a = if c.lo.at() == me { floor_char(&s, c.lo.byte as usize) } else { 0 };
             let b = if c.hi.at() == me { floor_char(&s, c.hi.byte as usize) } else { s.len() };
-            strip_slots(&s[a..b.max(a)])
+            // An end of the selection that takes nothing of this text: as if not reached.
+            let inside = c.lo.at() < me && me < c.hi.at();
+            (a < b || inside).then(|| strip_slots(&s[a..b.max(a)]))
         }
         Kind::Stack { axis, children, .. } => {
             let parts = children.iter().map(|ch| collect(ch, c)).collect();
-            let sep = v.style.copy_sep.unwrap_or(if *axis == Axis::H { " " } else { "\n" });
-            join(parts, sep)
+            join(parts, v.style.copy_sep.unwrap_or(if *axis == Axis::H { " " } else { "\n" }))
         }
         Kind::Scroll { child, .. } => collect(child, c),
         Kind::Overlay { open, child, .. } => {
@@ -513,7 +524,7 @@ fn collect<S>(v: &View<S>, c: &mut Collect) -> String {
                 collect(child, c)
             } else {
                 c.node += count_text(child);
-                String::new()
+                None
             }
         }
         Kind::List { count, row, .. } if *count > 0 => {
@@ -525,6 +536,6 @@ fn collect<S>(v: &View<S>, c: &mut Collect) -> String {
             }
             join(parts, v.style.copy_sep.unwrap_or("\n\n"))
         }
-        _ => String::new(),
+        _ => None,
     }
 }
