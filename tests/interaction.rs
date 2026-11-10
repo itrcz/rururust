@@ -403,3 +403,99 @@ fn worker_sees_cancellation() {
     let mut ui = blank();
     assert!(!ui.pump());
 }
+
+#[test]
+fn sleep_paces_a_task_and_cancel_cuts_it_short() {
+    use std::time::{Duration, Instant};
+    let mut ui = blank();
+    let start = Instant::now();
+    let task = ruru::spawn(|link: Link<Vec<u32>>| async move {
+        for i in 0..3 {
+            ruru::sleep(0.03).await;
+            link.send(move |s| s.push(i));
+        }
+    });
+    pump_until(&mut ui, |s| s.len() == 3);
+    assert_eq!(ui.state, vec![0, 1, 2]);
+    assert!(start.elapsed() >= Duration::from_millis(90), "three sleeps of 30 ms");
+    drop(task);
+
+    // A cancel wakes a task parked in a long sleep at once; the thread then exits.
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    struct Done(std::sync::mpsc::Sender<()>);
+    impl Drop for Done {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+    let task = ruru::spawn(move |link: Link<Vec<u32>>| async move {
+        let _done = Done(done_tx);
+        ruru::sleep(60.0).await;
+        link.send(|s| s.push(99));
+    });
+    std::thread::sleep(Duration::from_millis(20));
+    let cancelled = Instant::now();
+    drop(task);
+    done_rx.recv_timeout(Duration::from_secs(1)).expect("task ended after cancel");
+    assert!(cancelled.elapsed() < Duration::from_millis(500));
+    assert!(!ui.pump());
+}
+
+#[test]
+fn sleep_outside_a_task_blocks() {
+    let start = std::time::Instant::now();
+    let fut = ruru::sleep(0.02);
+    // Polled by a foreign executor (here: a trivial one), it simply blocks until done.
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    assert!(std::future::Future::poll(std::pin::pin!(fut), &mut cx).is_ready());
+    assert!(start.elapsed() >= std::time::Duration::from_millis(20));
+}
+
+#[test]
+fn stuck_list_follows_a_growing_last_row() {
+    struct C {
+        rows: Vec<f32>,
+        tapped: usize,
+    }
+    let mut ui = Ui::new(C { rows: vec![100.0; 20], tapped: usize::MAX }, |s: &C| {
+        let rows = s.rows.clone();
+        let rows = list(s.rows.len(), 120.0, move |i| rect().fill_width().height(rows[i]).on_tap(move |s: &mut C| s.tapped = i));
+        scroll(vstack((rect().fill_width().height(40.0).sticky(), rows)).spacing(8.0).fill_width().padding_ltrb(18.0, 0.0, 18.0, 12.0))
+            .padding_ltrb(0.0, 58.0, 0.0, 0.0)
+            .stick_to_bottom()
+    });
+    // Frames as the runner draws them: one per update, plus follow-ups while animating.
+    let settle = |ui: &mut Ui<C>| {
+        ui.frame((300.0, 400.0));
+        for _ in 0..200 {
+            if !ui.animating {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(4));
+            ui.frame((300.0, 400.0));
+        }
+    };
+    settle(&mut ui);
+    let bottom_row = |ui: &mut Ui<C>| {
+        ui.state.tapped = usize::MAX;
+        ui.pointer_down((50.0, 385.0), false);
+        ui.pointer_up((50.0, 385.0));
+        ui.state.tapped
+    };
+    assert_eq!(bottom_row(&mut ui), 19, "starts at the end");
+    // An empty reply bubble: estimated at 120, measured at 10, so the content first grows
+    // and then shrinks under a view parked at the end.
+    ui.state.rows.push(10.0);
+    // Words arrive with every frame and frames are slow (a software-GL browser draws
+    // ~6 fps), so the scroll never gets to settle between them.
+    for _ in 0..8 {
+        *ui.state.rows.last_mut().unwrap() += 15.0;
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        ui.frame((300.0, 400.0));
+        if ui.animating {
+            ui.frame((300.0, 400.0)); // the runner redraws at once after a row was measured
+        }
+        assert_eq!(bottom_row(&mut ui), 20, "the view follows the end of the growing row");
+    }
+}

@@ -730,7 +730,9 @@ impl<S> Painter<'_, S> {
                 let s = self.scrolls.entry(id).or_default();
                 let max = (content - r.h).max(0.0);
                 // Chat-style: start at the end and follow new content while parked there.
-                if stick && (s.used == 0 || (s.offset >= s.max - 1.0 && s.vel == 0.0 && max > s.max)) {
+                // Shrinking too: a lazy row measured smaller than its estimate must not
+                // leave the view hanging past the end and bouncing back.
+                if stick && (s.used == 0 || (s.offset >= s.max - 1.0 && s.vel == 0.0 && max != s.max)) {
                     s.offset = max;
                 }
                 s.max = max;
@@ -954,7 +956,10 @@ impl<S: 'static> Ui<S> {
                     s.vel += (-220.0 * (s.offset - end) - 30.0 * s.vel) * h;
                     s.offset += s.vel * h;
                 }
-                if (s.offset - end).abs() < 0.25 && s.vel.abs() < 6.0 {
+                // Crossing the edge ends the bounce: with long frames the spring overshoots,
+                // and the leftover speed would coast the list away from the edge.
+                let crossed = (s.offset - end).signum() != (before - end).signum();
+                if crossed || (s.offset - end).abs() < 0.25 && s.vel.abs() < 6.0 {
                     s.offset = end;
                     s.vel = 0.0;
                 }

@@ -41,6 +41,8 @@ pub use app::App;
 #[cfg(feature = "renderer")]
 pub use render::Renderer;
 pub use task::{link, set_spawner, set_waker, spawn, Link, Task};
+#[cfg(any(not(target_arch = "wasm32"), feature = "app"))]
+pub use task::sleep;
 pub use text::TextSystem;
 pub use types::{Color, Rect};
 pub use ui::{after, DrawList, KeyInput, Ui, WheelPhase};
@@ -65,4 +67,6 @@ pub mod prelude {
     pub use crate::{markdown, markdown_with};
     pub use crate::{drawer, rich_text, Env, SizeClass, Span};
     pub use crate::{link, spawn, Link, Task};
+    #[cfg(any(not(target_arch = "wasm32"), feature = "app"))]
+    pub use crate::sleep;
 }

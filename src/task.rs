@@ -221,6 +221,7 @@ mod imp {
     use super::*;
     use std::task::{Wake, Waker};
     use std::thread::Thread;
+    use std::time::{Duration, Instant};
 
     struct Unpark(Thread);
     impl Wake for Unpark {
@@ -232,14 +233,50 @@ mod imp {
         }
     }
 
+    thread_local! {
+        /// Set on task threads: `sleep` can hand its deadline to `block_on` instead of blocking.
+        static IN_TASK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// The earliest deadline a pending `sleep` asked to be polled again at.
+        static DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    }
+
     fn block_on(fut: impl Future<Output = ()>) {
+        IN_TASK.with(|t| t.set(true));
         let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
         let mut cx = Context::from_waker(&waker);
         let mut fut = std::pin::pin!(fut);
         while fut.as_mut().poll(&mut cx).is_pending() {
-            // Spurious unparks only cost an extra poll.
-            std::thread::park();
+            // Parking (not sleeping) keeps `Task::cancel` instant: its unpark ends the wait
+            // early. Spurious unparks only cost an extra poll.
+            match DEADLINE.with(|d| d.take()) {
+                Some(t) => std::thread::park_timeout(t.saturating_duration_since(Instant::now())),
+                None => std::thread::park(),
+            }
         }
+    }
+
+    pub(super) struct Sleep(pub(super) Instant);
+
+    impl Future for Sleep {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            let now = Instant::now();
+            if now >= self.0 {
+                return Poll::Ready(());
+            }
+            if IN_TASK.with(|t| t.get()) {
+                DEADLINE.with(|d| d.set(Some(d.get().map_or(self.0, |t| t.min(self.0)))));
+                Poll::Pending
+            } else {
+                // Some other executor: no deadline hook, so block this thread.
+                std::thread::sleep(self.0 - now);
+                Poll::Ready(())
+            }
+        }
+    }
+
+    pub(super) fn sleep(seconds: f32) -> Sleep {
+        Sleep(Instant::now() + Duration::from_secs_f32(seconds.max(0.0)))
     }
 
     pub(super) fn spawn<S: 'static, F, Fut>(link: Link<S>, work: F, cancel: Arc<AtomicBool>) -> Task
@@ -284,6 +321,18 @@ mod imp {
         Task { cancel, detached: false }
     }
 
+    #[cfg(feature = "app")]
+    pub(super) async fn sleep(seconds: f32) {
+        use wasm_bindgen_futures::js_sys::{Function, Promise};
+        let ms = (seconds.max(0.0) * 1000.0).round() as i32;
+        let promise = Promise::new(&mut |resolve: Function, _reject: Function| {
+            if let Some(w) = web_sys::window() {
+                let _ = w.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
+            }
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    }
+
     /// Sets the executor [`spawn`](super::spawn) uses on wasm, where there are no threads,
     /// e.g. `ruru::set_spawner(|f| wasm_bindgen_futures::spawn_local(f))`.
     pub fn set_spawner(f: impl Fn(Pin<Box<dyn Future<Output = ()>>>) + 'static) {
@@ -292,3 +341,23 @@ mod imp {
 }
 
 pub use imp::set_spawner;
+
+/// Waits `seconds` inside a [`spawn`]ed task without blocking the UI.
+///
+/// Natively the task thread parks until the deadline (a cancel still stops it at once);
+/// on wasm it awaits a `setTimeout`, which is why it needs the `app` feature there.
+///
+/// ```no_run
+/// # struct App { text: String }
+/// let task = ruru::spawn(|link: ruru::Link<App>| async move {
+///     for word in ["one ", "two ", "three"] {
+///         ruru::sleep(0.05).await;
+///         link.send(move |s| s.text.push_str(word));
+///     }
+/// });
+/// # task.detach();
+/// ```
+#[cfg(any(not(target_arch = "wasm32"), feature = "app"))]
+pub fn sleep(seconds: f32) -> impl Future<Output = ()> {
+    imp::sleep(seconds)
+}

@@ -49,7 +49,14 @@ impl<S: 'static> App<S> {
     pub fn run(self) {
         #[cfg(target_arch = "wasm32")]
         console_error_panic_hook::set_once();
-        let event_loop = EventLoop::new().expect("event loop");
+        let event_loop = EventLoop::<Wake>::with_user_event().build().expect("event loop");
+        // Links wake the loop through the proxy: no polling, idle stays at 0% CPU.
+        let proxy = event_loop.create_proxy();
+        crate::task::set_waker(move || {
+            let _ = proxy.send_event(Wake);
+        });
+        #[cfg(target_arch = "wasm32")]
+        crate::task::set_spawner(wasm_bindgen_futures::spawn_local);
         let runner = Runner {
             app: self,
             window: None,
@@ -70,6 +77,9 @@ impl<S: 'static> App<S> {
         }
     }
 }
+
+/// The user event a [`Link`](crate::Link) send posts: "the inbox has updates".
+struct Wake;
 
 struct Gfx {
     surface: wgpu::Surface<'static>,
@@ -170,7 +180,17 @@ impl<S: 'static> Runner<S> {
     }
 }
 
-impl<S: 'static> ApplicationHandler for Runner<S> {
+impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _: Wake) {
+        // Applied here rather than left for the next frame, so a send that changes nothing
+        // visible (cancelled task) costs no redraw.
+        if self.app.ui.pump() {
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        }
+    }
+
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         match self.wake_at {
             Some(t) if t <= web_time::Instant::now() => {
