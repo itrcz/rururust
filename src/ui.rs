@@ -796,7 +796,10 @@ impl<S> Painter<'_, S> {
         if let Some(g) = st.glass {
             self.glass(&xf, r, st.radius, g, st.border);
         }
-        match (st.bg, st.border, st.glass) {
+        // A clipping view draws its border over the children: a child background that runs to
+        // the edge (a sidebar in a rounded panel) would cover it otherwise.
+        let late_border = st.border.filter(|_| (st.clip || ln.clip) && st.glass.is_none()).map(|b| (xf, b));
+        match (st.bg, st.border.filter(|_| late_border.is_none()), st.glass) {
             (Some(bg), border, None) => self.fill(&xf, r, st.radius, bg, border),
             (Some(bg), _, Some(_)) => self.fill(&xf, r, st.radius, bg, None),
             (None, Some(b), None) => self.fill(&xf, r, st.radius, Fill::Solid(Color::CLEAR), Some(b)),
@@ -1202,6 +1205,9 @@ impl<S> Painter<'_, S> {
                 let x0 = (r.x + knob_d * 0.5) * xf.s + xf.tx;
                 self.hit(&xf, id, sr.inflate(8.0), Action::Slider(x0, range * xf.s, steps, f));
             }
+        }
+        if let Some((bxf, b)) = late_border {
+            self.fill(&bxf, r, st.radius, Fill::Solid(Color::CLEAR), Some(b));
         }
     }
 }

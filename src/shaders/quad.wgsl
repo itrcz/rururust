@@ -214,9 +214,18 @@ fn fs(in: VOut) -> @location(0) vec4f {
         dg = fuse(dg, in.xy, in.n1, in.np.y, in.np.z, soft);
     }
     let d = dg.x;
-    let cover = clamp(0.5 - d, 0.0, 1.0);
-    let clip = clamp(0.5 - sd_round_box(in.xy - in.clip.xy, in.clip.zw, in.p1.z), 0.0, 1.0);
+    // The clip has the same squircle corners as the view that clips, so a child filling it
+    // lines up with that view's own background and border.
+    var dc = sd_round_box(in.xy - in.clip.xy, in.clip.zw, 0.0);
+    if in.p1.z > 0.0 {
+        dc = sd_shape(in.xy - in.clip.xy, in.clip.zw, in.p1.z);
+    }
+    let clip = clamp(0.5 - dc, 0.0, 1.0);
     let alpha = clip * in.p1.w;
+    // Shape cut by the clip as one distance: where the edges coincide (a border on a clipped
+    // panel) the edge is antialiased once, not twice, and keeps its weight around the corners.
+    let cover = clamp(0.5 - max(d, dc), 0.0, 1.0);
+    let opacity = in.p1.w;
 
     if kind == 1.0 {
         // Soft shadow: gaussian falloff of the shape's distance field.
@@ -306,12 +315,12 @@ fn fs(in: VOut) -> @location(0) vec4f {
         // Glass is drawn without blending: it already contains the backdrop, and blending
         // it over a translucent scene (transparent window) would count that backdrop twice.
         // Its edge is blended here against the snapshot, which is what lies underneath.
-        let k = cover * alpha;
+        let k = cover * opacity;
         if k <= 0.0 {
             discard;
         }
         let under = textureSampleLevel(sharp, samp, in.xy / g.screen, 0.0);
         return mix(under, col, k);
     }
-    return col * cover * alpha;
+    return col * cover * opacity;
 }
