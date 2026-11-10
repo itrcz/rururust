@@ -33,6 +33,16 @@ pub(crate) enum Axis {
     Z,
 }
 
+/// Modifier keys held down, as the runner reports them with [`Ui::set_modifiers`](crate::Ui::set_modifiers).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Mods {
+    pub shift: bool,
+    /// Cmd on macOS, Ctrl elsewhere.
+    pub command: bool,
+    /// Option on macOS.
+    pub alt: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Weight {
     Regular = 400,
@@ -388,7 +398,7 @@ pub(crate) enum OverlayMode {
 pub(crate) enum Kind<S> {
     /// Picture; `true` = template (only its alpha is used, tinted with the text color).
     Image(Image, bool),
-    TextField { value: String, placeholder: String, on_change: Box<dyn Fn(&mut S, String)> },
+    TextField(crate::ui::edit::Field<S>),
     Picker { options: Vec<String>, selected: usize, on_select: Rc<dyn Fn(&mut S, usize)> },
     Tabs { labels: Vec<String>, selected: usize, on_select: Box<dyn Fn(&mut S, usize)> },
     Empty,
@@ -598,6 +608,9 @@ impl<S> View<S> {
     pub fn font_size(mut self, s: f32) -> Self {
         if let Kind::Text(t) = &mut self.kind {
             t.size = s;
+        }
+        if let Kind::TextField(f) = &mut self.kind {
+            f.size = s;
         }
         self
     }
@@ -822,13 +835,18 @@ pub fn drawer<S>(open: bool, on_dismiss: impl Fn(&mut S) + 'static, content: Vie
 pub fn snackbar<S>(open: bool, content: View<S>) -> View<S> {
     overlay(open, OverlayMode::Toast, None, content)
 }
-/// Single-line text input. Fills the available width.
+/// Text input. Fills the available width. Single-line by default; see
+/// [`multiline`](View::multiline), [`on_submit`](View::on_submit) and [`plain`](View::plain).
+///
+/// ```ignore
+/// text_field(&s.draft, "Message", |s, v| s.draft = v).multiline().max_lines(8).on_submit(|s| s.send())
+/// ```
 pub fn text_field<S>(
     value: impl Into<String>,
     placeholder: impl Into<String>,
     on_change: impl Fn(&mut S, String) + 'static,
 ) -> View<S> {
-    View::new(Kind::TextField { value: value.into(), placeholder: placeholder.into(), on_change: Box::new(on_change) })
+    View::new(Kind::TextField(crate::ui::edit::Field::new(value.into(), placeholder.into(), Box::new(on_change))))
         .padding_xy(14.0, 12.0)
         .background(Color::rgba(0.47, 0.47, 0.5, 0.24))
         .radius(12.0)

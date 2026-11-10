@@ -5,8 +5,11 @@ use cosmic_text::{
     fontdb, Align as TextAlign, Attrs, Buffer, CacheKeyFlags, Color as TextColor, Ellipsize, EllipsizeHeightLimit,
     Family, FontSystem, Metrics, Shaping, Weight,
 };
+use crate::types::Rect;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::ops::Range;
+use unicode_segmentation::UnicodeSegmentation;
 
 static INTER: &[u8] = include_bytes!("../assets/Inter.ttf");
 #[cfg(feature = "markdown")]
@@ -22,6 +25,8 @@ pub(crate) struct ListCache {
 pub(crate) struct Entry {
     pub buffer: Buffer,
     pub size: (f32, f32),
+    /// Byte offset of each buffer line (paragraph) in the source text.
+    starts: Vec<usize>,
     used: u64,
 }
 
@@ -121,6 +126,11 @@ impl TextSystem {
             buffer.set_rich_text(runs, &attrs, Shaping::Advanced, align);
         }
         buffer.shape_until_scroll(&mut self.fonts, false);
+        let starts = if spec.spans.is_empty() {
+            line_starts(spec.text)
+        } else {
+            line_starts(&spec.spans.iter().map(|s| s.text.as_str()).collect::<String>())
+        };
         let (mut w, mut lines) = (0.0f32, 0u32);
         for run in buffer.layout_runs() {
             w = w.max(run.line_w);
@@ -129,7 +139,7 @@ impl TextSystem {
         // A centered, wrapped block occupies its full wrap width.
         let w = if align.is_some() { width.unwrap() } else { w.ceil() };
         let size = (w, lines.max(1) as f32 * line_h);
-        self.entries.insert(key, Entry { buffer, size, used: frame });
+        self.entries.insert(key, Entry { buffer, size, starts, used: frame });
         (key, size)
     }
 
@@ -178,36 +188,138 @@ impl TextSystem {
         (key, (size.0.min(w), size.1.min(max_h)), cut)
     }
 
-    /// X offset of the caret placed before byte `index` of a single-line text.
-    pub(crate) fn caret_x(&self, key: u64, index: usize) -> f32 {
-        let mut x = 0.0;
-        if let Some(e) = self.entries.get(&key) {
-            for run in e.buffer.layout_runs() {
-                for g in run.glyphs.iter() {
-                    if g.start >= index {
-                        return g.x;
-                    }
-                    x = g.x + g.w;
-                }
-            }
+    /// Byte index (in the whole text) closest to the point `(x, y)` of the shaped text `key`.
+    /// Points above the text land at its start, below it at its end.
+    pub(crate) fn hit(&self, key: u64, x: f32, y: f32) -> usize {
+        let Some(e) = self.entries.get(&key) else { return 0 };
+        let y = y.clamp(0.0, (e.size.1 - 0.01).max(0.0));
+        match e.buffer.hit(x.max(0.0), y) {
+            Some(c) => e.starts.get(c.line).copied().unwrap_or(0) + c.index,
+            None => 0,
         }
-        x
     }
 
-    /// Byte index of the caret position closest to `x` in a single-line text.
-    pub(crate) fn index_at(&self, key: u64, x: f32) -> usize {
-        let mut end = 0;
-        if let Some(e) = self.entries.get(&key) {
-            for run in e.buffer.layout_runs() {
-                for g in run.glyphs.iter() {
-                    if x < g.x + g.w * 0.5 {
-                        return g.start;
-                    }
-                    end = g.end;
+    /// Caret before byte `i`: x, top of its visual row, and the row height.
+    /// At a soft wrap the caret goes to the start of the next row.
+    pub(crate) fn caret(&self, key: u64, i: usize) -> (f32, f32, f32) {
+        let Some(e) = self.entries.get(&key) else { return (0.0, 0.0, 0.0) };
+        let (line, local) = locate(&e.starts, i);
+        let mut end_match = None;
+        let mut last = None;
+        for run in e.buffer.layout_runs().filter(|r| r.line_i == line) {
+            last = Some((run.line_w, run.line_top, run.line_height));
+            for g in run.glyphs {
+                if local >= g.start && local < g.end {
+                    // Inside a cluster (ligature, emoji sequence): split it by graphemes.
+                    let cluster = run.text.get(g.start..g.end).unwrap_or("");
+                    let total = cluster.grapheme_indices(true).count().max(1);
+                    let before = cluster.grapheme_indices(true).filter(|(k, _)| g.start + k < local).count();
+                    return (g.x + g.w * before as f32 / total as f32, run.line_top, run.line_height);
+                }
+                if local == g.end {
+                    end_match = Some((g.x + g.w, run.line_top, run.line_height));
                 }
             }
+            if run.glyphs.is_empty() {
+                return (0.0, run.line_top, run.line_height);
+            }
         }
-        end
+        end_match.or(last).unwrap_or((0.0, 0.0, e.size.1))
+    }
+
+    /// Selection highlight of the byte range `r`: one rectangle per visual row it touches.
+    /// A row whose line break is selected gets a little extra width, so selected empty
+    /// lines stay visible.
+    pub(crate) fn range_rects(&self, key: u64, r: Range<usize>, out: &mut Vec<Rect>) {
+        let Some(e) = self.entries.get(&key) else { return };
+        if r.start >= r.end {
+            return;
+        }
+        let nl = 5.0;
+        for run in e.buffer.layout_runs() {
+            let base = e.starts.get(run.line_i).copied().unwrap_or(0);
+            let lo = run.glyphs.iter().map(|g| g.start).min().unwrap_or(0) + base;
+            let hi = run.glyphs.iter().map(|g| g.end).max().unwrap_or(0) + base;
+            let line_end = base + run.text.len();
+            if r.end < lo || r.start > hi || (r.end == lo && lo != hi) {
+                continue;
+            }
+            let (mut x0, mut x1) = (f32::MAX, f32::MIN);
+            for g in run.glyphs {
+                let (gs, ge) = (base + g.start, base + g.end);
+                if ge <= r.start || gs >= r.end {
+                    continue;
+                }
+                x0 = x0.min(g.x);
+                x1 = x1.max(g.x + g.w);
+            }
+            if hi == line_end && r.end > line_end && r.start <= line_end {
+                // The line break itself is selected.
+                if x0 > x1 {
+                    x0 = run.line_w;
+                    x1 = run.line_w;
+                }
+                x1 += nl;
+            }
+            if x0 < x1 {
+                out.push(Rect::new(x0, run.line_top, x1 - x0, run.line_height));
+            }
+        }
+    }
+
+    /// The word (or run of spaces / punctuation) around byte `i`, within its paragraph.
+    pub(crate) fn word_at(&self, key: u64, i: usize) -> Range<usize> {
+        let Some(e) = self.entries.get(&key) else { return i..i };
+        let (line, local) = locate(&e.starts, i);
+        let Some(l) = e.buffer.lines.get(line) else { return i..i };
+        let base = e.starts[line];
+        let text = l.text();
+        let mut prev: Option<Range<usize>> = None;
+        for (k, w) in text.split_word_bound_indices() {
+            let r = k..k + w.len();
+            let wordy = w.chars().any(char::is_alphanumeric);
+            if local < r.end || (local == r.end && wordy && r.end == text.len()) {
+                // Right after a word (at its end) prefer that word over the space that follows.
+                let pick = match prev {
+                    Some(p) if local == r.start && !wordy && p.end == local => p,
+                    _ => r,
+                };
+                return base + pick.start..base + pick.end;
+            }
+            prev = Some(r).filter(|_| wordy);
+        }
+        match prev {
+            Some(p) if p.end == local => base + p.start..base + p.end,
+            _ => i..i,
+        }
+    }
+
+    /// The paragraph (source line, without its line break) around byte `i`.
+    pub(crate) fn para_at(&self, key: u64, i: usize) -> Range<usize> {
+        let Some(e) = self.entries.get(&key) else { return i..i };
+        let (line, _) = locate(&e.starts, i);
+        let base = e.starts[line];
+        base..base + e.buffer.lines.get(line).map_or(0, |l| l.text().len())
+    }
+
+    /// Start and end of the visual row holding byte `i` (soft wraps count as row ends;
+    /// a trailing space at a wrap is left out of the end).
+    pub(crate) fn row_at(&self, key: u64, i: usize) -> Range<usize> {
+        let Some(e) = self.entries.get(&key) else { return i..i };
+        let (_, top, _) = self.caret(key, i);
+        for run in e.buffer.layout_runs() {
+            if (run.line_top - top).abs() > 0.5 {
+                continue;
+            }
+            let base = e.starts.get(run.line_i).copied().unwrap_or(0);
+            let lo = run.glyphs.iter().map(|g| g.start).min().unwrap_or(0);
+            let mut hi = run.glyphs.iter().map(|g| g.end).max().unwrap_or(0);
+            if hi < run.text.len() && run.text[..hi].ends_with(char::is_whitespace) {
+                hi = run.text[..hi].char_indices().next_back().map_or(hi, |(k, _)| k);
+            }
+            return base + lo..base + hi;
+        }
+        i..i
     }
 
     pub(crate) fn end_frame(&mut self) {
@@ -219,8 +331,79 @@ impl TextSystem {
     }
 }
 
+/// Byte offsets where the lines of `text` start, split the way cosmic-text splits them.
+fn line_starts(text: &str) -> Vec<usize> {
+    let b = text.as_bytes();
+    let mut starts = vec![0];
+    let mut i = 0;
+    while i < b.len() {
+        let pair = matches!((b[i], b.get(i + 1)), (b'\r', Some(b'\n')) | (b'\n', Some(b'\r')));
+        if b[i] == b'\n' || b[i] == b'\r' {
+            i += if pair { 2 } else { 1 };
+            starts.push(i);
+        } else {
+            i += 1;
+        }
+    }
+    starts
+}
+
+/// Line and offset within it of the byte `i`.
+fn locate(starts: &[usize], i: usize) -> (usize, usize) {
+    let line = starts.partition_point(|&s| s <= i).saturating_sub(1);
+    (line, i - starts.get(line).copied().unwrap_or(0))
+}
+
 impl Default for TextSystem {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shaped(ts: &mut TextSystem, text: &str, w: Option<f32>) -> u64 {
+        ts.measure(&TextSpec { spans: &[], text, size: 17.0, weight: 400, center: false }, w).0
+    }
+
+    #[test]
+    fn hit_and_caret_are_inverse_across_lines_and_wraps() {
+        let mut ts = TextSystem::new();
+        let text = "Привет, мир! 👍🏽 wraps here and there\nsecond paragraph";
+        let key = shaped(&mut ts, text, Some(120.0));
+        let (mut rows, mut first) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
+        let nl = text.find('\n').unwrap();
+        for (i, _) in text.char_indices().chain([(text.len(), ' ')]) {
+            let (x, y, h) = ts.caret(key, i);
+            rows.insert(y as i32);
+            if i <= nl {
+                first.insert(y as i32);
+            }
+            let back = ts.hit(key, x + 0.01, y + h * 0.5);
+            // A soft wrap's end and the next row's start are the same spot for the caret.
+            let same = back == i || ts.caret(key, back) == (x, y, h);
+            assert!(same || !text.is_char_boundary(i) || text[..i].ends_with(['👍', '🏽']), "{i} -> {back}");
+        }
+        assert!(rows.len() >= 4, "wrapped into rows: {rows:?}");
+        // A selection over a wrap gets one rectangle per row.
+        let mut rects = Vec::new();
+        ts.range_rects(key, 0..nl + 1, &mut rects);
+        assert!(first.len() >= 3);
+        assert_eq!(rects.len(), first.len());
+    }
+
+    #[test]
+    fn words_and_paragraphs() {
+        let mut ts = TextSystem::new();
+        let text = "раз два-три\nчетыре";
+        let key = shaped(&mut ts, text, None);
+        let two = text.find("два").unwrap();
+        assert_eq!(&text[ts.word_at(key, two + 2)], "два");
+        assert_eq!(&text[ts.word_at(key, two)], "два");
+        assert_eq!(&text[ts.word_at(key, two - 1)], "раз", "right after a word: that word");
+        assert_eq!(&text[ts.para_at(key, 2)], "раз два-три");
+        assert_eq!(&text[ts.para_at(key, text.len())], "четыре");
     }
 }

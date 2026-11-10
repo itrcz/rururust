@@ -146,12 +146,7 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
             };
             (w, h)
         }
-        Kind::TextField { value, placeholder, .. } => {
-            let shown = if value.is_empty() { placeholder } else { value };
-            let (key, size) = lx.text.measure(&TextSpec { spans: &[], text: shown, size: FIELD_FONT, weight: 400, center: false }, None);
-            node.text = key;
-            (inner.0.unwrap_or(220.0), size.1)
-        }
+        Kind::TextField(f) => crate::ui::edit::layout_field(f, inner.0, lx.text, &mut node),
         Kind::Picker { options, selected, .. } => {
             let label = options.get(*selected).map_or("", |s| s.as_str());
             let (key, size) = lx.text.measure(&TextSpec { spans: &[], text: label, size: FIELD_FONT, weight: 400, center: false }, None);

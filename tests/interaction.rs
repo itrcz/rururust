@@ -1,5 +1,5 @@
 use ruru::prelude::*;
-use ruru::Ui;
+use ruru::{KeyInput, Ui};
 
 struct S {
     n: i32,
@@ -751,4 +751,271 @@ fn animate_glides_to_the_new_size_and_settles() {
         }
     }
     assert_eq!(quads(&ui, Color::RED)[0][2], 300.0);
+}
+
+// ---------------------------------------------------------------- text editing
+
+struct Chat {
+    draft: String,
+    sent: Vec<String>,
+    taps: u32,
+}
+
+/// A multi-line composer (Enter sends) above a button: the button moves down as the
+/// field grows. The text starts at (14, 12); rows are 22 pt.
+fn chat(submit: bool) -> Ui<Chat> {
+    let mut ui = Ui::new(Chat { draft: String::new(), sent: Vec::new(), taps: 0 }, move |s: &Chat| {
+        let mut field = text_field(s.draft.as_str(), "Message", |s: &mut Chat, v| s.draft = v).multiline().max_lines(4);
+        if submit {
+            field = field.on_submit(|s: &mut Chat| s.sent.push(std::mem::take(&mut s.draft)));
+        }
+        vstack((field.width(300.0), button("x", |s: &mut Chat| s.taps += 1).size(300.0, 40.0)))
+            .align(Align::Start)
+            .place(Align::Start, Align::Start)
+    });
+    ui.frame((400.0, 600.0));
+    ui.pointer_down((100.0, 20.0), false);
+    ui.pointer_up((100.0, 20.0));
+    ui
+}
+
+fn shift(ui: &mut Ui<Chat>, on: bool) {
+    ui.set_modifiers(ruru::Mods { shift: on, ..Default::default() });
+}
+
+/// Taps at `y` and reports whether the button below the field took it.
+fn button_at(ui: &mut Ui<Chat>, y: f32) -> bool {
+    let before = ui.state.taps;
+    ui.pointer_down((100.0, y), false);
+    ui.pointer_up((100.0, y));
+    ui.state.taps > before
+}
+
+#[test]
+fn multiline_field_grows_with_its_text_up_to_max_lines() {
+    let mut ui = chat(false);
+    ui.frame((400.0, 600.0));
+    assert!(button_at(&mut ui, 60.0), "one row: field is 46 pt tall, the button follows");
+    ui.pointer_down((100.0, 20.0), false);
+    ui.pointer_up((100.0, 20.0));
+    for l in ["one", "\n", "two", "\n", "three"] {
+        if l == "\n" {
+            ui.key(KeyInput::Enter); // no on_submit: Enter breaks the line
+        } else {
+            ui.text_input(l);
+        }
+    }
+    assert_eq!(ui.state.draft, "one\ntwo\nthree");
+    ui.frame((400.0, 600.0));
+    assert!(!button_at(&mut ui, 60.0), "three rows: 90 pt of field");
+    assert!(button_at(&mut ui, 95.0));
+    // Long text wraps and grows too, but stops at max_lines (4 rows = 112 pt).
+    ui.pointer_down((100.0, 20.0), false);
+    ui.pointer_up((100.0, 20.0));
+    ui.text_input(&" word".repeat(80));
+    ui.frame((400.0, 600.0));
+    assert!(!button_at(&mut ui, 110.0));
+    assert!(button_at(&mut ui, 116.0), "capped at four rows; the rest scrolls inside");
+}
+
+#[test]
+fn enter_submits_and_shift_enter_breaks_the_line() {
+    let mut ui = chat(true);
+    ui.text_input("hello");
+    shift(&mut ui, true);
+    ui.key(KeyInput::Enter);
+    shift(&mut ui, false);
+    ui.text_input("world");
+    assert_eq!(ui.state.draft, "hello\nworld");
+    ui.key(KeyInput::Enter);
+    assert_eq!(ui.state.sent, vec!["hello\nworld".to_string()]);
+    assert_eq!(ui.state.draft, "");
+    assert!(ui.has_focus(), "the composer keeps focus after sending");
+    ui.frame((400.0, 600.0));
+    ui.text_input("next");
+    assert_eq!(ui.state.draft, "next", "typing after a send starts from the cleared draft");
+    // Alt+Enter also breaks the line.
+    ui.set_modifiers(ruru::Mods { alt: true, ..Default::default() });
+    ui.key(KeyInput::Enter);
+    assert_eq!(ui.state.draft, "next\n");
+}
+
+#[test]
+fn shift_arrows_select_and_typing_replaces_the_selection() {
+    let mut ui = chat(false);
+    ui.text_input("hello world");
+    shift(&mut ui, true);
+    for _ in 0..5 {
+        ui.key(KeyInput::Left);
+    }
+    assert_eq!(ui.selection_text().as_deref(), Some("world"));
+    shift(&mut ui, false);
+    ui.text_input("there");
+    assert_eq!(ui.state.draft, "hello there");
+    // Left with a selection collapses it to its start.
+    ui.key(KeyInput::SelectAll);
+    assert_eq!(ui.selection_text().as_deref(), Some("hello there"));
+    ui.key(KeyInput::Left);
+    ui.text_input(">");
+    assert_eq!(ui.state.draft, ">hello there");
+    // Alt+Shift+Right selects by words.
+    ui.set_modifiers(ruru::Mods { shift: true, alt: true, ..Default::default() });
+    ui.key(KeyInput::Right);
+    assert_eq!(ui.selection_text().as_deref(), Some("hello"));
+    ui.set_modifiers(ruru::Mods::default());
+    ui.key(KeyInput::Backspace);
+    assert_eq!(ui.state.draft, "> there");
+}
+
+#[test]
+fn mouse_drag_and_double_click_select() {
+    let mut ui = chat(false);
+    ui.text_input("alpha beta gamma");
+    ui.frame((400.0, 600.0));
+    // Drag from the left edge of the text to far right of it.
+    ui.pointer_down((14.0, 23.0), false);
+    ui.pointer_move((60.0, 23.0));
+    ui.pointer_move((290.0, 23.0));
+    ui.pointer_up((290.0, 23.0));
+    assert_eq!(ui.selection_text().as_deref(), Some("alpha beta gamma"));
+    // A double click picks the word under the pointer, a triple click the paragraph.
+    std::thread::sleep(std::time::Duration::from_millis(450));
+    let beta = (14.0 + 60.0, 23.0);
+    ui.pointer_down(beta, false);
+    ui.pointer_up(beta);
+    ui.pointer_down(beta, false);
+    ui.pointer_up(beta);
+    assert_eq!(ui.selection_text().as_deref(), Some("beta"));
+    ui.pointer_down(beta, false);
+    ui.pointer_up(beta);
+    assert_eq!(ui.selection_text().as_deref(), Some("alpha beta gamma"));
+}
+
+#[test]
+fn copy_cut_paste_go_through_the_runner() {
+    use ruru::WindowRequest;
+    let mut ui = chat(false);
+    ui.text_input("copy me");
+    ui.key(KeyInput::Copy);
+    assert!(ui.requests.is_empty(), "nothing selected, nothing copied");
+    ui.key(KeyInput::SelectAll);
+    ui.key(KeyInput::Copy);
+    assert_eq!(std::mem::take(&mut ui.requests), vec![WindowRequest::SetClipboard("copy me".into())]);
+    ui.key(KeyInput::Cut);
+    assert_eq!(std::mem::take(&mut ui.requests), vec![WindowRequest::SetClipboard("copy me".into())]);
+    assert_eq!(ui.state.draft, "");
+    assert!(ui.paste("line 1\r\nline 2"));
+    assert_eq!(ui.state.draft, "line 1\nline 2", "line endings are normalized");
+    ui.key(KeyInput::Escape);
+    assert!(!ui.paste("x"), "no focused field");
+}
+
+#[test]
+fn single_line_field_pastes_line_breaks_as_spaces() {
+    let mut ui = form();
+    ui.pointer_down((150.0, 20.0), false);
+    ui.pointer_up((150.0, 20.0));
+    ui.paste("a\nb");
+    assert_eq!(ui.state.name, "a b");
+    ui.key(KeyInput::Enter);
+    assert!(!ui.has_focus(), "Enter in a single-line field without on_submit ends editing");
+}
+
+#[test]
+fn undo_and_redo_restore_text_in_steps() {
+    let mut ui = chat(false);
+    ui.text_input("h");
+    ui.text_input("i");
+    ui.text_input(" ");
+    ui.text_input("y");
+    ui.text_input("o");
+    assert_eq!(ui.state.draft, "hi yo");
+    ui.key(KeyInput::Undo);
+    assert_eq!(ui.state.draft, "hi ", "a word is one step");
+    ui.key(KeyInput::Undo);
+    ui.key(KeyInput::Undo);
+    assert_eq!(ui.state.draft, "");
+    ui.key(KeyInput::Redo);
+    assert_eq!(ui.state.draft, "hi");
+    ui.paste("!");
+    ui.key(KeyInput::Redo);
+    assert_eq!(ui.state.draft, "hi!", "an edit drops the redo steps");
+    ui.key(KeyInput::Undo);
+    assert_eq!(ui.state.draft, "hi");
+}
+
+#[test]
+fn cyrillic_and_emoji_move_and_delete_by_whole_characters() {
+    let mut ui = chat(false);
+    ui.text_input("Привет 👍🏽 мир 👨‍👩‍👧");
+    ui.key(KeyInput::Backspace);
+    assert_eq!(ui.state.draft, "Привет 👍🏽 мир ", "a family emoji is one grapheme");
+    ui.key(KeyInput::Home);
+    ui.key(KeyInput::Right);
+    ui.key(KeyInput::Delete);
+    assert_eq!(ui.state.draft, "Пивет 👍🏽 мир ");
+    ui.set_modifiers(ruru::Mods { alt: true, ..Default::default() });
+    ui.key(KeyInput::Right); // to the end of «Пивет»
+    ui.set_modifiers(ruru::Mods::default());
+    ui.key(KeyInput::Right);
+    ui.key(KeyInput::Right);
+    ui.key(KeyInput::Backspace);
+    assert_eq!(ui.state.draft, "Пивет  мир ", "the skin-toned thumb goes as a whole");
+    ui.frame((400.0, 600.0));
+    // Clicking in the middle of the text lands on a character boundary.
+    for x in [20.0, 37.0, 51.0, 66.0, 90.0] {
+        ui.pointer_down((x, 23.0), false);
+        ui.pointer_up((x, 23.0));
+        ui.text_input("|");
+        assert!(ui.state.draft.contains('|'));
+        ui.key(KeyInput::Backspace);
+        assert_eq!(ui.state.draft, "Пивет  мир ");
+        std::thread::sleep(std::time::Duration::from_millis(410));
+    }
+}
+
+#[test]
+fn up_and_down_move_between_rows() {
+    let mut ui = chat(false);
+    ui.paste("abc\nlonger line\nxy");
+    ui.frame((400.0, 600.0));
+    ui.key(KeyInput::Up);
+    ui.text_input("1");
+    assert_eq!(ui.state.draft, "abc\nlo1nger line\nxy", "keeps the column");
+    ui.key(KeyInput::Up);
+    ui.key(KeyInput::End);
+    ui.text_input("2");
+    assert_eq!(ui.state.draft, "abc2\nlo1nger line\nxy");
+    ui.key(KeyInput::Down);
+    ui.key(KeyInput::Down);
+    ui.key(KeyInput::Down);
+    ui.text_input("3");
+    assert_eq!(ui.state.draft, "abc2\nlo1nger line\nxy3", "past the last row: the end");
+    ui.key(KeyInput::Up);
+    ui.key(KeyInput::Home);
+    ui.text_input("4");
+    assert_eq!(ui.state.draft, "abc2\n4lo1nger line\nxy3");
+    // Clicking on the second row puts the caret there.
+    ui.frame((400.0, 600.0));
+    ui.pointer_down((14.0, 12.0 + 22.0 + 11.0), false);
+    ui.pointer_up((14.0, 12.0 + 22.0 + 11.0));
+    ui.text_input("5");
+    assert_eq!(ui.state.draft, "abc2\n54lo1nger line\nxy3");
+}
+
+#[test]
+fn caret_blinks_with_timers_not_continuous_frames() {
+    let mut ui = chat(false);
+    ui.frame((400.0, 600.0));
+    assert!(!ui.animating || ui.wake_in.is_some());
+    let w = ui.wake_in.expect("a focused field wakes the UI to blink");
+    assert!(w > 0.0 && w <= 0.52);
+    ui.text_input("abc");
+    ui.key(KeyInput::SelectAll);
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        ui.frame((400.0, 600.0)); // let the focus ring and the press settle
+    }
+    assert!(!ui.animating);
+    assert!(ui.wake_in.is_none(), "a selection doesn't blink: no wake-ups");
 }
