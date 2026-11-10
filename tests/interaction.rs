@@ -18,7 +18,7 @@ fn view(s: &S) -> View<S> {
 }
 
 fn ui() -> Ui<S> {
-    let mut ui = Ui::new(S { n: 0, on: false, v: 0.0 }, |s| zstack(view(s)).fill());
+    let mut ui = Ui::new(S { n: 0, on: false, v: 0.0 }, |s: &S| zstack(view(s)).fill());
     ui.frame((400.0, 400.0));
     ui
 }
@@ -172,4 +172,98 @@ fn tab_drop_selects_on_tap_and_on_drag_release() {
     assert!(ui.animating, "the drop is moving");
     ui.pointer_up((10.0, 150.0));
     assert_eq!(ui.state.tab, 0);
+}
+
+#[test]
+fn view_can_adapt_to_the_screen_size() {
+    let mut ui = Ui::new(0u32, |_: &u32, env: &Env| {
+        let label = if env.is_phone() { "phone" } else { "wide" };
+        button(label, move |s: &mut u32| *s = if label == "phone" { 1 } else { 2 }).fill()
+    });
+    ui.frame((400.0, 800.0));
+    ui.pointer_down((200.0, 400.0), false);
+    ui.pointer_up((200.0, 400.0));
+    assert_eq!(ui.state, 1);
+    ui.frame((1200.0, 800.0));
+    ui.pointer_down((200.0, 400.0), false);
+    ui.pointer_up((200.0, 400.0));
+    assert_eq!(ui.state, 2);
+}
+
+#[test]
+fn lazy_list_builds_only_visible_rows() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let built = Rc::new(Cell::new(0usize));
+    let counter = built.clone();
+    let mut ui = Ui::new((), move |_: &()| {
+        let counter = counter.clone();
+        scroll(list(100_000, 40.0, move |i| {
+            counter.set(counter.get() + 1);
+            text(format!("row {i}")).height(40.0)
+        }))
+    });
+    ui.frame((300.0, 400.0));
+    assert!(built.get() > 0 && built.get() <= 12, "built {} rows for a 400 pt viewport", built.get());
+}
+
+#[test]
+fn rubber_band_springs_back_and_plain_wheel_stops_at_the_end() {
+    use ruru::WheelPhase::*;
+    let mut ui = Ui::new((), |_: &()| scroll(rect().height(2000.0).fill_width()));
+    ui.frame((300.0, 400.0));
+    // A mouse wheel cannot leave the content.
+    assert!(!ui.wheel((150.0, 200.0), 500.0, Line), "already at the top");
+    // A trackpad can pull past the top…
+    ui.wheel((150.0, 200.0), 0.0, Started);
+    assert!(ui.wheel((150.0, 200.0), 120.0, Moved));
+    ui.wheel((150.0, 200.0), 0.0, Ended);
+    // …and the content settles back on its own.
+    let mut frames = 0;
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(4));
+        ui.frame((300.0, 400.0));
+        frames += 1;
+        if !ui.animating && ui.wake_in.is_none_or(|w| w > 0.5) {
+            break;
+        }
+        assert!(frames < 2000, "never settled");
+    }
+    assert!(frames > 3, "it should animate, not jump");
+}
+
+#[test]
+fn modal_blocks_what_is_underneath_and_dismisses_on_outside_tap() {
+    struct M {
+        open: bool,
+        taps: u32,
+    }
+    let mut ui = Ui::new(M { open: true, taps: 0 }, |s: &M| {
+        zstack((
+            button("under", |s: &mut M| s.taps += 1).fill(),
+            modal(s.open, |s: &mut M| s.open = false, text("dialog").padding(40.0)),
+        ))
+        .fill()
+    });
+    for _ in 0..3 {
+        ui.frame((400.0, 600.0));
+    }
+    ui.pointer_down((10.0, 10.0), false);
+    ui.pointer_up((10.0, 10.0));
+    assert_eq!(ui.state.taps, 0, "the button under the modal must not fire");
+    assert!(!ui.state.open, "tapping outside dismisses");
+}
+
+#[test]
+fn after_runs_later_on_the_state() {
+    let mut ui = Ui::new(0u32, |_: &u32| button("go", |_: &mut u32| ruru::after(0.02, |s: &mut u32| *s = 7)).fill());
+    ui.frame((200.0, 200.0));
+    ui.pointer_down((100.0, 100.0), false);
+    ui.pointer_up((100.0, 100.0));
+    ui.frame((200.0, 200.0));
+    assert_eq!(ui.state, 0);
+    assert!(ui.wake_in.is_some(), "the UI asks to be woken for the timer");
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    ui.frame((200.0, 200.0));
+    assert_eq!(ui.state, 7);
 }

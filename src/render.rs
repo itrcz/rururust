@@ -26,12 +26,14 @@ struct Globals {
 struct Batch<'a> {
     backdrop: bool,
     quads: Range<u32>,
-    only_glass: bool,
-    glass_rects: Vec<Rect>,
     texts: Vec<&'a TextCmd>,
     /// The one picture this batch's image quads sample (index into `DrawList::images`).
     image: Option<usize>,
 }
+
+/// Panes closer than this (points) fuse; `FUSE_K` is the reach of the liquid neck.
+const FUSE_GAP: f32 = 13.0;
+const FUSE_K: f32 = 26.0;
 
 struct Level {
     view: wgpu::TextureView,
@@ -144,7 +146,8 @@ impl Renderer {
         });
         let attrs = wgpu::vertex_attr_array![
             0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4,
-            4 => Float32x4, 5 => Float32x4, 6 => Float32x4
+            4 => Float32x4, 5 => Float32x4, 6 => Float32x4, 7 => Float32x4,
+            8 => Float32x4, 9 => Float32x4
         ];
         let target = [Some(wgpu::ColorTargetState {
             format,
@@ -458,56 +461,85 @@ impl Renderer {
         // ---- 1. split the draw list into batches
         let mut quads = std::mem::take(&mut self.scratch);
         quads.clear();
-        let new_batch = |backdrop: bool, at: u32| Batch {
-            backdrop,
-            quads: at..at,
-            only_glass: backdrop,
-            glass_rects: Vec::new(),
-            texts: Vec::new(),
-            image: None,
-        };
+        let new_batch = |backdrop: bool, at: u32| Batch { backdrop, quads: at..at, texts: Vec::new(), image: None };
         let mut batches: Vec<Batch> = vec![new_batch(false, 0)];
+        // Glass samples a snapshot of the scene. A new snapshot (and blur pyramid) is only
+        // needed when something was drawn since the last one *under this pane*; `dirty`
+        // holds what was drawn since then. A row of glass buttons shares one snapshot.
+        let mut dirty: Vec<Rect> = Vec::new();
+        let mut snapshot = 0u32; // 0 = none taken yet
+        let mut panes: Vec<(usize, u32, Rect)> = Vec::new(); // glass quad index, snapshot, rect
         for cmd in &list.cmds {
             let n = quads.len() as u32;
             let cur = batches.last_mut().unwrap();
             match cmd {
                 Cmd::Quad(q) => {
                     let r = Rect::new(q.rect[0], q.rect[1], q.rect[2], q.rect[3]);
-                    if q.p0[3] == KIND_GLASS {
-                        // Glass panes that don't overlap can share one blur of the scene.
-                        let share = cur.backdrop && cur.only_glass && !cur.glass_rects.iter().any(|g| g.intersects(&r));
-                        if !share {
-                            batches.push(new_batch(true, n));
-                        }
-                        batches.last_mut().unwrap().glass_rects.push(r);
-                    } else {
-                        // A quad drawn after text that it overlaps must not end up under it.
-                        let grown = r.inflate(q.p0[2] * 3.0 + 1.0);
-                        let over_text =
-                            cur.texts.iter().any(|t| Rect::new(t.pos.0, t.pos.1, t.size.0, t.size.1).intersects(&grown));
-                        // One picture per draw call: a different one starts a new batch.
-                        let picture = (q.p0[3] == KIND_IMAGE).then_some(q.c1[0] as usize);
-                        let id = |i: usize| list.images.get(i).map(|m| m.0.id);
-                        let other_image = matches!((picture, cur.image), (Some(a), Some(b)) if id(a) != id(b));
-                        if over_text || other_image {
-                            batches.push(new_batch(false, n));
-                        }
-                        let cur = batches.last_mut().unwrap();
-                        cur.only_glass = false;
-                        if picture.is_some() {
-                            cur.image = picture;
-                        }
+                    let glass = q.p0[3] == KIND_GLASS;
+                    let grown = r.inflate(if glass { 1.0 } else { q.p0[2] * 3.0 + 1.0 });
+                    let stale = glass && (snapshot == 0 || dirty.iter().any(|d| d.intersects(&grown)));
+                    // A quad drawn after text that it overlaps must not end up under it.
+                    let over_text =
+                        cur.texts.iter().any(|t| Rect::new(t.pos.0, t.pos.1, t.size.0, t.size.1).intersects(&grown));
+                    // One picture per draw call: a different one starts a new batch.
+                    let picture = (q.p0[3] == KIND_IMAGE).then_some(q.c1[0] as usize);
+                    let id = |i: usize| list.images.get(i).map(|m| m.0.id);
+                    let other_image = matches!((picture, cur.image), (Some(a), Some(b)) if id(a) != id(b));
+                    if stale {
+                        batches.push(new_batch(true, n));
+                        dirty.clear();
+                        snapshot += 1;
+                    } else if over_text || other_image {
+                        batches.push(new_batch(false, n));
                     }
+                    let cur = batches.last_mut().unwrap();
+                    if picture.is_some() {
+                        cur.image = picture;
+                    }
+                    if glass {
+                        panes.push((quads.len(), snapshot, r));
+                    }
+                    // A pane marks only its own area: its neighbours may share the snapshot.
+                    dirty.push(if glass { r } else { grown });
                     quads.push(*q);
-                    batches.last_mut().unwrap().quads.end = n + 1;
+                    cur.quads.end = n + 1;
                 }
                 Cmd::Text(t) => {
-                    cur.only_glass = false;
+                    dirty.push(Rect::new(t.pos.0, t.pos.1, t.size.0, t.size.1));
                     cur.texts.push(t);
                 }
             }
         }
-        let has_glass = batches.iter().any(|b| b.backdrop);
+        let has_glass = snapshot > 0;
+
+        // Liquid: panes that sit very close to each other (and look at the same snapshot)
+        // are fused into one shape by the shader. Each pane learns its two nearest neighbours.
+        for a in 0..panes.len() {
+            let (qa, snap, ra) = panes[a];
+            let mut near: Vec<(f32, usize)> = panes
+                .iter()
+                .enumerate()
+                .filter(|(b, p)| *b != a && p.1 == snap)
+                .map(|(_, p)| {
+                    let dx = (ra.x - (p.2.x + p.2.w)).max(p.2.x - (ra.x + ra.w)).max(0.0);
+                    let dy = (ra.y - (p.2.y + p.2.h)).max(p.2.y - (ra.y + ra.h)).max(0.0);
+                    ((dx * dx + dy * dy).sqrt(), p.0)
+                })
+                .filter(|(gap, _)| *gap < FUSE_GAP)
+                .collect();
+            near.sort_by(|x, y| x.0.total_cmp(&y.0));
+            for (slot, (_, qb)) in near.into_iter().take(2).enumerate() {
+                let (rect, radius) = (quads[qb].rect, quads[qb].p0[0]);
+                let q = &mut quads[qa];
+                if slot == 0 {
+                    q.n0 = rect;
+                } else {
+                    q.n1 = rect;
+                }
+                q.np[slot] = radius;
+                q.np[2] = FUSE_K;
+            }
+        }
 
         // ---- 2. upload
         self.frame += 1;

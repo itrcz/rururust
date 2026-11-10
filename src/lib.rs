@@ -23,29 +23,43 @@
 //! }
 //! ```
 
+#[cfg(feature = "app")]
 mod app;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "headless", not(target_arch = "wasm32")))]
 pub mod headless;
 mod layout;
+#[cfg(feature = "renderer")]
 mod render;
 mod text;
 mod types;
 mod ui;
 mod view;
 
+#[cfg(feature = "app")]
 pub use app::App;
+#[cfg(feature = "renderer")]
 pub use render::Renderer;
 pub use text::TextSystem;
 pub use types::{Color, Rect};
-pub use ui::{DrawList, KeyInput, Ui};
+pub use ui::{after, DrawList, KeyInput, Ui, WheelPhase};
 pub use view::{
-    button, hstack, image, picker, rect, scroll, slider, spacer, tab_bar, text, text_field, toggle, vstack, zstack,
-    Align, Children, Dim, Fill, Glass, Image, Shadow, View, Weight,
+    button, hstack, icon, image, list, modal, picker, rect, scroll, sheet, slider, snackbar, spacer, tab_bar, text,
+    text_field, toggle, vstack, zstack, Align, Children, Dim, Fill, Glass, Image, Indicator, Shadow, View, Weight,
 };
+pub use view::{drawer, rich_text, Env, SizeClass, Span, ViewFn};
+#[cfg(feature = "markdown")]
+mod markdown;
+#[cfg(feature = "markdown")]
+pub use markdown::{markdown, markdown_with};
 
 pub mod prelude {
+    #[cfg(feature = "app")]
+    pub use crate::App;
     pub use crate::{
-        button, hstack, image, picker, rect, scroll, slider, spacer, tab_bar, text, text_field, toggle, vstack,
-        zstack, Align, App, Color, Fill, Glass, Image, View, Weight,
+        after, button, hstack, icon, image, list, modal, picker, rect, scroll, sheet, slider, snackbar, spacer,
+        tab_bar, text, text_field, toggle, vstack, zstack, Align, Color, Fill, Glass, Image, Indicator, View, Weight,
     };
+    #[cfg(feature = "markdown")]
+    pub use crate::{markdown, markdown_with};
+    pub use crate::{drawer, rich_text, Env, SizeClass, Span};
 }

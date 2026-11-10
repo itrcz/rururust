@@ -19,6 +19,9 @@ struct Instance {
     @location(4) border: vec4f,
     @location(5) p0: vec4f, // radius, border width, shadow sigma, kind
     @location(6) p1: vec4f, // gradient dir, clip radius, opacity
+    @location(7) n0: vec4f, // glass: neighbour pane to fuse with (x, y, w, h)
+    @location(8) n1: vec4f, // glass: second neighbour
+    @location(9) np: vec4f, // neighbour radii, fusing distance k (0 = none)
 }
 
 struct VOut {
@@ -31,6 +34,9 @@ struct VOut {
     @location(5) @interpolate(flat) border: vec4f,
     @location(6) @interpolate(flat) p0: vec4f,
     @location(7) @interpolate(flat) p1: vec4f,
+    @location(8) @interpolate(flat) n0: vec4f, // center.xy, half.xy (pixels)
+    @location(9) @interpolate(flat) n1: vec4f,
+    @location(10) @interpolate(flat) np: vec4f,
 }
 
 @vertex
@@ -38,7 +44,8 @@ fn vs(@builtin(vertex_index) vi: u32, in: Instance) -> VOut {
     let s = g.scale;
     let corner = vec2f(f32(vi & 1u), f32((vi >> 1u) & 1u));
     let r = in.rect * s;
-    let grow = 1.0 + in.p0.z * s * 3.0; // room for AA and shadow falloff
+    // Room for AA, the shadow falloff, and the liquid neck between fused panes.
+    let grow = 1.0 + in.p0.z * s * 3.0 + in.np.z * s * 0.5;
     let xy = r.xy - grow + corner * (r.zw + 2.0 * grow);
 
     var o: VOut;
@@ -52,6 +59,11 @@ fn vs(@builtin(vertex_index) vi: u32, in: Instance) -> VOut {
     o.border = in.border;
     o.p0 = vec4f(in.p0.xyz * s, in.p0.w);
     o.p1 = vec4f(in.p1.xy, in.p1.z * s, in.p1.w);
+    let a = in.n0 * s;
+    let b = in.n1 * s;
+    o.n0 = vec4f(a.xy + a.zw * 0.5, a.zw * 0.5);
+    o.n1 = vec4f(b.xy + b.zw * 0.5, b.zw * 0.5);
+    o.np = in.np * s;
     return o;
 }
 
@@ -84,6 +96,26 @@ fn sdg_shape(p: vec2f, half: vec2f, r_in: f32, soft: f32) -> vec3f {
 
 fn sd_shape(p: vec2f, half: vec2f, r_in: f32) -> f32 {
     return sdg_shape(p, half, r_in, 1.0).x;
+}
+
+// Quadratic smooth minimum (Inigo Quilez): the blended distance, and how much of `b` to
+// mix into anything carried along with it (here: the normal).
+fn smin_w(a: f32, b: f32, k: f32) -> vec2f {
+    let h = max(k - abs(a - b), 0.0);
+    let n = 0.5 * h / k;
+    return vec2f(min(a, b) - 0.25 * h * h / k, select(1.0 - n, n, a < b));
+}
+
+// Smooth union with a neighbouring pane: where two panes nearly touch, their surfaces
+// reach for each other and join with a liquid neck.
+fn fuse(dg: vec3f, xy: vec2f, pane: vec4f, r: f32, k: f32, soft: f32) -> vec3f {
+    if pane.z <= 0.0 {
+        return dg;
+    }
+    let b = sdg_shape(xy - pane.xy, pane.zw, r, soft);
+    let w = smin_w(dg.x, b.x, k);
+    let n = mix(dg.yz, b.yz, w.y);
+    return vec3f(w.x, n / max(length(n), 1e-4));
 }
 
 // Slope of a squircle-profile bevel h(t) = (1 - (1 - t)^4)^(1/4): flat in the middle of
@@ -174,7 +206,12 @@ fn fs(in: VOut) -> @location(0) vec4f {
 
     // Glass only: bevel width in px, never wider than the pane's half size.
     let depth = clamp(in.c1.y * g.scale, 1.0, max(min(half.x, half.y), 1.0));
-    let dg = sdg_shape(p, half, radius, select(1.0, depth * 0.35, kind == 2.0));
+    let soft = select(1.0, depth * 0.35, kind == 2.0);
+    var dg = sdg_shape(p, half, radius, soft);
+    if in.np.z > 0.0 {
+        dg = fuse(dg, in.xy, in.n0, in.np.x, in.np.z, soft);
+        dg = fuse(dg, in.xy, in.n1, in.np.y, in.np.z, soft);
+    }
     let d = dg.x;
     let cover = clamp(0.5 - d, 0.0, 1.0);
     let clip = clamp(0.5 - sd_round_box(in.xy - in.clip.xy, in.clip.zw, in.p1.z), 0.0, 1.0);
@@ -242,6 +279,10 @@ fn fs(in: VOut) -> @location(0) vec4f {
         let texels = (in.c0.z - in.c0.x) * f32(textureDimensions(img).x);
         let lod = max(log2(texels / max(half.x * 2.0, 1.0)), 0.0);
         col = textureSampleLevel(img, samp, uv, lod);
+        if in.c1.y > 0.5 {
+            // Template glyph: its alpha is the shape, the colour comes from the text colour.
+            col = vec4f(in.c1.zw, in.p1.x, 1.0) * (in.p1.y * col.a);
+        }
     } else {
         let dir = in.p1.xy;
         let extent = abs(dir.x) * half.x + abs(dir.y) * half.y;

@@ -2,7 +2,7 @@
 //! their own, parents place them. Every node is laid out exactly once.
 
 use crate::text::{TextSpec, TextSystem};
-use crate::view::{Align, Axis, Dim, Kind, View};
+use crate::view::{Align, Axis, Dim, Kind, OverlayMode, View};
 
 #[derive(Default)]
 pub(crate) struct LNode {
@@ -42,7 +42,15 @@ fn aligned(a: Align, space: f32, size: f32) -> f32 {
     }
 }
 
-pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), ts: &mut TextSystem) -> LNode {
+/// Identity of a child: its key if it has one, otherwise its position among siblings.
+/// Layout and paint derive the same ids, so per-node state can be shared between them.
+pub(crate) fn child_id(parent: u64, index: usize, key: Option<u64>) -> u64 {
+    // FxHash-style mix; cheap and good enough for sibling paths.
+    let v = key.unwrap_or(index as u64 ^ 0x9E37_79B9_7F4A_7C15);
+    (parent.rotate_left(5) ^ v).wrapping_mul(0x517C_C1B7_2722_0A95)
+}
+
+pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), ts: &mut TextSystem, id: u64) -> LNode {
     let st = &v.style;
     let pad = st.padding;
     let (pad_w, pad_h) = (pad[0] + pad[2], pad[1] + pad[3]);
@@ -54,12 +62,13 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), ts: &mut 
     let content: (f32, f32) = match &v.kind {
         Kind::Empty | Kind::Spacer => (0.0, 0.0),
         Kind::Text(t) => {
-            let spec = TextSpec { text: &t.content, size: t.size, weight: t.weight as u16, center: t.center };
+            let spec =
+                TextSpec { spans: &t.spans, text: &t.content, size: t.size, weight: t.weight as u16, center: t.center };
             let (key, size) = ts.measure(&spec, inner.0);
             node.text = key;
             size
         }
-        Kind::Image(img) => {
+        Kind::Image(img, _) => {
             let (nw, nh) = (img.0.width as f32, img.0.height.max(1) as f32);
             let w = match st.width {
                 Dim::Auto => inner.0.map_or(nw, |p| p.min(nw)),
@@ -73,20 +82,20 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), ts: &mut 
         }
         Kind::TextField { value, placeholder, .. } => {
             let shown = if value.is_empty() { placeholder } else { value };
-            let (key, size) = ts.measure(&TextSpec { text: shown, size: FIELD_FONT, weight: 400, center: false }, None);
+            let (key, size) = ts.measure(&TextSpec { spans: &[], text: shown, size: FIELD_FONT, weight: 400, center: false }, None);
             node.text = key;
             (inner.0.unwrap_or(220.0), size.1)
         }
         Kind::Picker { options, selected, .. } => {
             let label = options.get(*selected).map_or("", |s| s.as_str());
-            let (key, size) = ts.measure(&TextSpec { text: label, size: FIELD_FONT, weight: 400, center: false }, None);
+            let (key, size) = ts.measure(&TextSpec { spans: &[], text: label, size: FIELD_FONT, weight: 400, center: false }, None);
             node.text = key;
             (size.0 + 26.0, size.1)
         }
         Kind::Tabs { labels, .. } => {
             let mut widest = 0.0f32;
             for l in labels {
-                let m = ts.measure(&TextSpec { text: l, size: 15.0, weight: 600, center: false }, None);
+                let m = ts.measure(&TextSpec { spans: &[], text: l, size: 15.0, weight: 600, center: false }, None);
                 widest = widest.max(m.1 .0);
                 node.texts.push(m);
             }
@@ -94,8 +103,41 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), ts: &mut 
         }
         Kind::Toggle(..) => TOGGLE,
         Kind::Slider(..) => (inner.0.unwrap_or(200.0), SLIDER_H),
-        Kind::Scroll(child) => {
-            let c = layout(child, (inner.0, None), ts);
+        Kind::List { count, row_h, .. } => {
+            // Rows are built during paint (only the visible ones); here we just need the
+            // total height: measured rows as measured, the rest at the estimate.
+            let w = inner.0.unwrap_or(0.0);
+            let cache = ts.lists.entry(id).or_default();
+            if cache.width != w {
+                cache.width = w;
+                cache.heights.clear(); // rows wrap differently at another width
+            }
+            cache.heights.resize(*count, f32::NAN);
+            (w, cache.heights.iter().map(|h| if h.is_nan() { *row_h } else { *h }).sum())
+        }
+        Kind::Overlay { mode, child, .. } => {
+            let (w, h) = (inner.0.unwrap_or(400.0), inner.1.unwrap_or(600.0));
+            let max_w = match mode {
+                OverlayMode::Modal => (w - 48.0).min(440.0),
+                OverlayMode::Sheet => w.min(600.0),
+                OverlayMode::Toast => (w - 32.0).min(480.0),
+                OverlayMode::Drawer => (w - 56.0).min(320.0),
+            };
+            let cid = child_id(id, 0, child.key);
+            let full_h = (*mode == OverlayMode::Drawer).then_some(h);
+            let mut c = layout(child, (Some(max_w.max(1.0)), full_h), ts, cid);
+            if *mode == OverlayMode::Toast {
+                // A toast hugs its content.
+                let natural = layout(child, (None, None), ts, cid);
+                if natural.size.0 <= max_w {
+                    c = natural;
+                }
+            }
+            node.children.push(c);
+            (w, h)
+        }
+        Kind::Scroll { child, .. } => {
+            let c = layout(child, (inner.0, None), ts, child_id(id, 0, child.key));
             node.content_h = c.size.1;
             let s = (inner.0.unwrap_or(c.size.0), inner.1.unwrap_or(c.size.1));
             node.children.push(c);
@@ -103,8 +145,8 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), ts: &mut 
         }
         Kind::Stack { axis: Axis::Z, children, .. } => {
             let mut s = (0.0f32, 0.0f32);
-            for c in children {
-                let n = layout(c, inner, ts);
+            for (i, c) in children.iter().enumerate() {
+                let n = layout(c, inner, ts, child_id(id, i, c.key));
                 s = (s.0.max(n.size.0), s.1.max(n.size.1));
                 node.children.push(n);
             }
@@ -126,7 +168,7 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), ts: &mut 
                     flex += 1;
                     continue;
                 }
-                let n = layout(c, prop_for(main_prop.map(|m| (m - used).max(0.0))), ts);
+                let n = layout(c, prop_for(main_prop.map(|m| (m - used).max(0.0))), ts, child_id(id, i, c.key));
                 used += if h { n.size.0 } else { n.size.1 };
                 cross = cross.max(if h { n.size.1 } else { n.size.0 });
                 node.children[i] = n;
@@ -138,7 +180,7 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), ts: &mut 
                     if !fills_main(c, *axis) {
                         continue;
                     }
-                    let mut n = layout(c, prop_for(share), ts);
+                    let mut n = layout(c, prop_for(share), ts, child_id(id, i, c.key));
                     if let (Kind::Spacer, Some(sh)) = (&c.kind, share) {
                         if h {
                             n.size.0 = sh
@@ -169,7 +211,7 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), ts: &mut 
 
     // Place children now that the final size is known.
     match &v.kind {
-        Kind::Scroll(_) => node.children[0].pos = (pad[0], pad[1]),
+        Kind::Scroll { .. } => node.children[0].pos = (pad[0], pad[1]),
         Kind::Stack { axis: Axis::Z, align, children, .. } => {
             for (n, c) in node.children.iter_mut().zip(children) {
                 let (ax, ay) = c.style.place.unwrap_or((*align, *align));

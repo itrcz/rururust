@@ -5,13 +5,13 @@ use crate::ui::Ui;
 use std::path::Path;
 
 /// Renders the UI at `width`×`height` points and `scale` pixels per point into a PNG file.
-pub fn render_png<S>(ui: &mut Ui<S>, width: u32, height: u32, scale: f32, path: impl AsRef<Path>) {
+pub fn render_png<S: 'static>(ui: &mut Ui<S>, width: u32, height: u32, scale: f32, path: impl AsRef<Path>) {
     render_png_after(ui, width, height, scale, 1, |_, _| {}, path)
 }
 
 /// Like [`render_png`], but renders `frames` frames with one renderer and saves the last.
 /// `before` runs ahead of every frame (index from 0) to change state or send input.
-pub fn render_png_after<S>(
+pub fn render_png_after<S: 'static>(
     ui: &mut Ui<S>,
     width: u32,
     height: u32,

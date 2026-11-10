@@ -5,24 +5,55 @@ edition = "2021"
 description = "Tiny, fast, GPU-accelerated UI framework with glass materials. Native + Web."
 license = "MIT"
 
+# Take only what you need:
+#   default-features = false                 views, layout, input, animation, text shaping -> DrawList
+#   features = ["renderer"]                  + the wgpu renderer (embed ruru in your own wgpu app/engine)
+#   features = ["app"]                       + window and event loop (winit), native and web
+#   "decode" / "svg"                         PNG+JPEG decoding / SVG icons
+#   "markdown"                               markdown() view + embedded monospace font
+#   "headless"                               render to PNG without a window
+#   "webgl"                                  WebGL2 fallback in browsers without WebGPU (adds ~1 MB of wasm)
+[features]
+default = ["app", "decode", "svg", "markdown", "headless", "webgl"]
+renderer = ["dep:wgpu", "dep:glyphon"]
+app = ["renderer", "dep:winit", "dep:pollster", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:web-sys", "dep:console_error_panic_hook"]
+decode = ["dep:image"]
+svg = ["dep:resvg"]
+markdown = ["dep:pulldown-cmark"]
+headless = ["renderer", "dep:pollster", "dep:png"]
+webgl = ["wgpu?/webgl"]
+
 [dependencies]
-wgpu = "30"
-glyphon = "0.12"
+cosmic-text = "0.19"
 bytemuck = { version = "1", features = ["derive"] }
-winit = "0.30"
 web-time = "1"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+wgpu = { version = "30", optional = true }
+glyphon = { version = "0.12", optional = true }
+winit = { version = "0.30", optional = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
+resvg = { version = "0.49", default-features = false, optional = true }
+pulldown-cmark = { version = "0.13.6", default-features = false, optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-pollster = "1"
-png = "0.17"
+pollster = { version = "1", optional = true }
+png = { version = "0.17", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-wgpu = { version = "30", features = ["webgl"] }
-wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement", "CssStyleDeclaration", "HtmlElement"] }
-console_error_panic_hook = "0.1"
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "HtmlCanvasElement", "CssStyleDeclaration", "HtmlElement"], optional = true }
+console_error_panic_hook = { version = "0.1", optional = true }
+
+[[example]]
+name = "showcase"
+required-features = ["app", "svg", "markdown", "headless"]
+
+[[example]]
+name = "stress"
+required-features = ["headless"]
+
+[[test]]
+name = "interaction"
 
 [profile.release]
 lto = true

@@ -2,8 +2,8 @@
 
 use crate::render::Renderer;
 use crate::types::Color;
-use crate::ui::{KeyInput, Ui};
-use crate::view::View;
+use crate::ui::{KeyInput, Ui, WheelPhase};
+use crate::view::ViewFn;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -22,7 +22,7 @@ pub struct App<S> {
 
 impl<S: 'static> App<S> {
     /// `view` is called with the current state whenever the UI needs to be rebuilt.
-    pub fn new(state: S, view: impl Fn(&S) -> View<S> + 'static) -> Self {
+    pub fn new<M>(state: S, view: impl ViewFn<S, M>) -> Self {
         App { ui: Ui::new(state, view), title: "ruru".into(), size: (420.0, 760.0) }
     }
     pub fn title(mut self, t: impl Into<String>) -> Self {
@@ -244,12 +244,20 @@ impl<S: 'static> ApplicationHandler for Runner<S> {
                 ElementState::Pressed => ui.pointer_down(self.cursor, false),
                 ElementState::Released => ui.pointer_up(self.cursor),
             },
-            WindowEvent::MouseWheel { delta, .. } => {
-                let dy = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y * 48.0,
-                    MouseScrollDelta::PixelDelta(p) => p.y as f32 / scale,
+            WindowEvent::MouseWheel { delta, phase, .. } => {
+                let (dy, precise) = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => (y * 48.0, false),
+                    MouseScrollDelta::PixelDelta(p) => (p.y as f32 / scale, true),
                 };
-                ui.wheel(self.cursor, dy)
+                // Only macOS trackpads report gesture phases; everything else is treated
+                // as a plain wheel (no rubber band, since we can't tell when it is released).
+                let phase = match phase {
+                    _ if !precise || !cfg!(target_os = "macos") => WheelPhase::Line,
+                    TouchPhase::Started => WheelPhase::Started,
+                    TouchPhase::Moved => WheelPhase::Moved,
+                    TouchPhase::Ended | TouchPhase::Cancelled => WheelPhase::Ended,
+                };
+                ui.wheel(self.cursor, dy, phase)
             }
             WindowEvent::ModifiersChanged(m) => {
                 self.command = m.state().control_key() || m.state().super_key();

@@ -1,9 +1,31 @@
-//! Showcase: glass cards over a live background, springs, toggles, sliders, scrolling.
+//! Showcase: glass, springs, forms, images, a markdown chat, overlays, and a layout that
+//! rearranges itself for phone, tablet and desktop window sizes (resize the window).
 //!
 //!   cargo run --release --example showcase
-//!   cargo run --release --example showcase -- --screenshot shot.png
+//!   cargo run --release --example showcase -- --screenshot shot.png [tab] [frames] [width]
 
 use ruru::prelude::*;
+use ruru::SizeClass;
+use std::rc::Rc;
+
+#[derive(Clone)]
+struct Msg {
+    me: bool,
+    text: String,
+}
+
+struct Icons {
+    home: Image,
+    chat: Image,
+    photo: Image,
+    form: Image,
+    bell: Image,
+    bolt: Image,
+    heart: Image,
+    plus: Image,
+    send: Image,
+    menu: Image,
+}
 
 struct Demo {
     count: i32,
@@ -16,9 +38,55 @@ struct Demo {
     name: String,
     city: usize,
     photos: Vec<Image>,
+    icons: Rc<Icons>,
+    modal: bool,
+    sheet: bool,
+    drawer: bool,
+    toast: Option<String>,
+    refreshing: bool,
+    messages: Rc<Vec<Msg>>,
+    draft: String,
 }
 
+const TABS: [&str; 4] = ["Home", "Chat", "Gallery", "Forms"];
 const CITIES: [&str; 5] = ["Lisbon", "Tokyo", "Reykjavik", "Buenos Aires", "Cape Town"];
+const PALETTE: [(Color, Color); 6] = [
+    (Color::PINK, Color::ORANGE),
+    (Color::INDIGO, Color::TEAL),
+    (Color::PURPLE, Color::PINK),
+    (Color::GREEN, Color::TEAL),
+    (Color::ORANGE, Color::YELLOW),
+    (Color::BLUE, Color::PURPLE),
+];
+
+const REPLY: &str = "Here is what **ruru** renders in a chat:\n\n\
+## Markdown\n\
+Inline `code`, *emphasis*, **strong** text and [links](https://example.com) wrap together.\n\n\
+1. Ordered lists\n2. with several items\n   - and nested bullets\n\n\
+> Quotes for system notes or citations.\n\n\
+```rust\nfn main() {\n    println!(\"code blocks keep their spacing\");\n}\n```\n\n\
+![a generated picture](photo:1)\n\n\
+---\nRows are built lazily, so a very long history stays fast.";
+
+fn svg(path: &str) -> Image {
+    let src = format!(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill-rule="evenodd" d="{path}"/></svg>"#);
+    Image::from_svg(src.as_bytes(), 96).expect("icon")
+}
+
+fn icons() -> Icons {
+    Icons {
+        home: svg("M3 11 12 3l9 8v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"),
+        chat: svg("M4 4h16a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H10l-5 4v-4H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"),
+        photo: svg("M4 4h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zm0 12 5-5 4 4 3-3 4 4V6H4zM16 8a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3z"),
+        form: svg("M3 17.2V21h3.8L18 9.8 14.2 6zM20.7 7a1 1 0 0 0 0-1.4l-2.3-2.3a1 1 0 0 0-1.4 0l-1.8 1.8L19 8.8z"),
+        bell: svg("M12 22a2 2 0 0 0 2-2h-4a2 2 0 0 0 2 2zm6-6v-5a6 6 0 0 0-4.5-5.8v-.7a1.5 1.5 0 0 0-3 0v.7A6 6 0 0 0 6 11v5l-2 2v1h16v-1z"),
+        bolt: svg("M13 2 4 14h6l-1 8 9-12h-6z"),
+        heart: svg("M12 21s-8-5.3-8-11a4.5 4.5 0 0 1 8-2.8A4.5 4.5 0 0 1 20 10c0 5.7-8 11-8 11z"),
+        plus: svg("M11 5h2v6h6v2h-6v6h-2v-6H5v-2h6z"),
+        send: svg("M12 4l7 7-1.4 1.4L13 7.8V20h-2V7.8l-4.6 4.6L5 11z"),
+        menu: svg("M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"),
+    }
+}
 
 /// A generated picture, so the example needs no asset files. Real apps use
 /// `Image::decode(include_bytes!("photo.jpg"))`.
@@ -37,15 +105,12 @@ fn plasma(seed: f32) -> Image {
     Image::from_rgba(w, h, px)
 }
 
-const TABS: [&str; 3] = ["Home", "Gallery", "Forms"];
-const PALETTE: [(Color, Color); 6] = [
-    (Color::PINK, Color::ORANGE),
-    (Color::INDIGO, Color::TEAL),
-    (Color::PURPLE, Color::PINK),
-    (Color::GREEN, Color::TEAL),
-    (Color::ORANGE, Color::YELLOW),
-    (Color::BLUE, Color::PURPLE),
-];
+fn toast(s: &mut Demo, text: &str) {
+    s.toast = Some(text.to_string());
+    after(2.2, |s: &mut Demo| s.toast = None);
+}
+
+// ---------------------------------------------------------------- pieces
 
 fn blob(color: Color, d: f32, x: f32, y: f32) -> View<Demo> {
     hstack(rect().size(d, d).radius(d / 2.0).background(color))
@@ -73,27 +138,44 @@ fn card(s: &Demo, children: impl ruru::Children<Demo>) -> View<Demo> {
     vstack(children).fill_width().glass_with(glass(s)).radius(28.0).shadow(Color::BLACK.alpha(0.30), 40.0, 14.0)
 }
 
-fn row(tint: Color, title: &str, trailing: View<Demo>) -> View<Demo> {
-    hstack((rect().size(30.0, 30.0).radius(8.0).background(tint), text(title), spacer(), trailing))
-        .spacing(12.0)
-        .fill_width()
-        .padding_xy(16.0, 11.0)
+fn row(glyph: &Image, tint: Color, title: &str, trailing: View<Demo>) -> View<Demo> {
+    let badge = zstack(icon(glyph).size(18.0, 18.0)).size(30.0, 30.0).radius(8.0).background(tint);
+    hstack((badge, text(title), spacer(), trailing)).spacing(12.0).fill_width().padding_xy(16.0, 11.0)
 }
 
 fn divider() -> View<Demo> {
     rect().fill_width().height(0.5).background(Color::WHITE.alpha(0.16))
 }
 
-fn round_button(label: &str, f: impl Fn(&mut Demo) + 'static) -> View<Demo> {
-    zstack(text(label).font_size(26.0).weight(Weight::Medium))
-        .size(56.0, 56.0)
-        .radius(28.0)
-        .background(Color::WHITE.alpha(0.16))
-        .border(1.0, Color::WHITE.alpha(0.22))
-        .on_tap(f)
+fn slider_row(title: &str, value: String, control: View<Demo>) -> View<Demo> {
+    vstack((hstack((text(title), spacer(), text(value).color(Color::WHITE.alpha(0.6)))).fill_width(), control))
+        .spacing(8.0)
+        .fill_width()
+        .padding_xy(16.0, 12.0)
 }
 
-fn home(s: &Demo) -> View<Demo> {
+/// Round glass button. Put several close together and they fuse like drops.
+fn drop_button(s: &Demo, glyph: &Image, f: impl Fn(&mut Demo) + 'static) -> View<Demo> {
+    zstack(icon(glyph)).size(52.0, 52.0).radius(26.0).glass_with(glass(s)).on_tap(f)
+}
+
+fn settings(s: &Demo) -> View<Demo> {
+    card(s, (
+        row(&s.icons.bolt, Color::BLUE, "Wi-Fi", toggle(s.wifi, |s: &mut Demo, on| s.wifi = on)),
+        divider(),
+        row(&s.icons.bell, Color::INDIGO, "Focus", toggle(s.focus, |s: &mut Demo, on| s.focus = on)),
+        divider(),
+        slider_row("Drift", format!("{:.0}%", s.drift * 100.0), slider(s.drift, |s: &mut Demo, v| s.drift = v)),
+        divider(),
+        slider_row("Glass strength", format!("{:.0}%", s.glass * 200.0), slider(s.glass, |s: &mut Demo, v| s.glass = v)),
+    ))
+    .padding_xy(0.0, 4.0)
+}
+
+// ---------------------------------------------------------------- pages
+
+fn home(s: &Demo, env: &Env) -> View<Demo> {
+    let i = &s.icons;
     vstack((
         vstack((
             text("Good evening").font_size(15.0).color(Color::WHITE.alpha(0.6)),
@@ -107,42 +189,26 @@ fn home(s: &Demo) -> View<Demo> {
             text("TAPS").font_size(12.0).weight(Weight::Semibold).color(Color::WHITE.alpha(0.55)),
             text(s.count.to_string()).font_size(72.0).weight(Weight::Heavy),
             hstack((
-                round_button("−", |s: &mut Demo| s.count -= 1),
-                button("Tap me", |s: &mut Demo| s.count += 1).radius(28.0).padding_xy(34.0, 17.0),
-                round_button("+", |s: &mut Demo| s.count += 10),
+                button("−", |s: &mut Demo| s.count -= 1).background(Color::WHITE.alpha(0.16)),
+                button("Tap me", |s: &mut Demo| s.count += 1).padding_xy(34.0, 13.0),
+                button("+", |s: &mut Demo| s.count += 10).background(Color::WHITE.alpha(0.16)),
             ))
-            .spacing(14.0),
+            .spacing(10.0),
         ))
         .spacing(6.0)
         .padding(22.0),
-        card(s, (
-            row(Color::BLUE, "Wi-Fi", toggle(s.wifi, |s: &mut Demo, on| s.wifi = on)),
-            divider(),
-            row(Color::INDIGO, "Focus", toggle(s.focus, |s: &mut Demo, on| s.focus = on)),
-            divider(),
-            vstack((
-                hstack((text("Drift"), spacer(), text(format!("{:.0}%", s.drift * 100.0)).color(Color::WHITE.alpha(0.6))))
-                    .fill_width(),
-                slider(s.drift, |s: &mut Demo, v| s.drift = v),
-            ))
-            .spacing(8.0)
-            .fill_width()
-            .padding_xy(16.0, 12.0),
-            divider(),
-            vstack((
-                hstack((
-                    text("Glass strength"),
-                    spacer(),
-                    text(format!("{:.0}%", s.glass * 200.0)).color(Color::WHITE.alpha(0.6)),
-                ))
-                .fill_width(),
-                slider(s.glass, |s: &mut Demo, v| s.glass = v),
-            ))
-            .spacing(8.0)
-            .fill_width()
-            .padding_xy(16.0, 12.0),
+        // Glass that sits close together fuses into one liquid shape.
+        hstack((
+            drop_button(s, &i.heart, |s: &mut Demo| toast(s, "Liked")),
+            drop_button(s, &i.bell, |s: &mut Demo| s.sheet = true),
+            drop_button(s, &i.plus, |s: &mut Demo| s.modal = true),
+            spacer(),
+            drop_button(s, &i.bolt, |s: &mut Demo| toast(s, "Glass fuses when panes nearly touch")),
         ))
-        .padding_xy(0.0, 4.0),
+        .spacing(7.0)
+        .fill_width(),
+        // On a desktop the settings live in the right-hand panel instead.
+        if env.class() == SizeClass::Desktop { rect() } else { settings(s) },
         vstack(
             PALETTE
                 .iter()
@@ -151,7 +217,7 @@ fn home(s: &Demo) -> View<Demo> {
                     hstack((
                         vstack((
                             text(format!("Card {}", i + 1)).weight(Weight::Semibold).font_size(20.0),
-                            text("Scrolls under the glass tab bar").font_size(14.0).color(Color::WHITE.alpha(0.8)),
+                            text("Scrolls under the glass").font_size(14.0).color(Color::WHITE.alpha(0.8)),
                         ))
                         .align(Align::Start)
                         .spacing(2.0),
@@ -168,6 +234,66 @@ fn home(s: &Demo) -> View<Demo> {
         .fill_width(),
     ))
     .spacing(18.0)
+}
+
+fn bubble(material: Glass, m: &Msg, photos: &[Image]) -> View<Demo> {
+    if m.me {
+        let body = text(m.text.as_str()).padding_xy(14.0, 10.0).background(Color::BLUE).radius(18.0);
+        hstack((spacer(), body)).fill_width().padding_ltrb(60.0, 5.0, 0.0, 5.0)
+    } else {
+        let md = markdown_with(&m.text, |url| {
+            url.strip_prefix("photo:").and_then(|n| n.parse::<usize>().ok()).and_then(|n| photos.get(n).cloned())
+        });
+        vstack(vstack(md).fill_width().padding(16.0).glass_with(material).radius(22.0)).fill_width().padding_xy(0.0, 5.0)
+    }
+}
+
+fn chat(s: &Demo) -> View<Demo> {
+    let header = hstack((
+        text("Assistant").weight(Weight::Semibold),
+        spacer(),
+        text(format!("{} messages", s.messages.len())).font_size(13.0).color(Color::WHITE.alpha(0.6)),
+    ))
+    .fill_width()
+    .padding_xy(16.0, 12.0)
+    .glass_with(Glass::frosted())
+    .radius(18.0)
+    .sticky();
+    // The list builds only the rows on screen; each row is ordinary views (markdown,
+    // pictures, cards), so system blocks can sit in the flow between messages.
+    let (messages, photos, material) = (s.messages.clone(), s.photos.clone(), glass(s));
+    let rows = list(s.messages.len(), 120.0, move |i| bubble(material, &messages[i], &photos));
+    let input = hstack((
+        text_field(s.draft.as_str(), "Message", |s: &mut Demo, v| s.draft = v),
+        zstack(icon(&s.icons.send)).size(46.0, 46.0).radius(23.0).background(Color::BLUE).on_tap(send),
+    ))
+    .spacing(10.0)
+    .fill_width();
+    vstack((
+        scroll(vstack((header, rows)).spacing(8.0).fill_width().padding_ltrb(18.0, 0.0, 18.0, 12.0))
+            .padding_ltrb(0.0, 58.0, 0.0, 0.0)
+            .stick_to_bottom()
+            .on_refresh(s.refreshing, |s: &mut Demo| {
+                s.refreshing = true;
+                after(1.2, |s: &mut Demo| {
+                    s.refreshing = false;
+                    let mut all = vec![Msg { me: false, text: "*Earlier messages loaded.*".into() }];
+                    all.extend(Rc::make_mut(&mut s.messages).drain(..));
+                    *Rc::make_mut(&mut s.messages) = all;
+                });
+            }),
+        input.padding_ltrb(18.0, 6.0, 18.0, 0.0),
+    ))
+    .fill()
+}
+
+fn send(s: &mut Demo) {
+    let text = std::mem::take(&mut s.draft);
+    if text.trim().is_empty() {
+        return;
+    }
+    Rc::make_mut(&mut s.messages).push(Msg { me: true, text });
+    after(0.7, |s: &mut Demo| Rc::make_mut(&mut s.messages).push(Msg { me: false, text: REPLY.into() }));
 }
 
 fn gallery(s: &Demo) -> View<Demo> {
@@ -210,61 +336,175 @@ fn forms(s: &Demo) -> View<Demo> {
     .spacing(18.0)
 }
 
-fn tabs(s: &Demo) -> View<Demo> {
-    hstack(tab_bar(&TABS, s.tab, |s: &mut Demo, i| s.tab = i).glass_with(glass(s)))
-        .padding_ltrb(0.0, 0.0, 0.0, 22.0)
-        .place(Align::Center, Align::End)
-}
+// ---------------------------------------------------------------- shell
 
-fn view(s: &Demo) -> View<Demo> {
-    let page = match s.tab {
-        0 => home(s),
-        1 => gallery(s),
-        _ => forms(s),
-    };
-    zstack((
-        backdrop(s),
-        scroll(page.fill_width().padding_ltrb(18.0, 56.0, 18.0, 110.0)).key(s.tab),
-        tabs(s),
+fn nav(s: &Demo) -> View<Demo> {
+    let glyphs = [&s.icons.home, &s.icons.chat, &s.icons.photo, &s.icons.form];
+    let items: Vec<_> = TABS
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let on = s.tab == i;
+            hstack((icon(glyphs[i]).size(20.0, 20.0), text(*name).weight(Weight::Medium), spacer()))
+                .spacing(12.0)
+                .fill_width()
+                .padding_xy(14.0, 11.0)
+                .radius(12.0)
+                .background(Color::WHITE.alpha(if on { 0.18 } else { 0.0 }))
+                .color(Color::WHITE.alpha(if on { 1.0 } else { 0.7 }))
+                .on_tap(move |s: &mut Demo| {
+                    s.tab = i;
+                    s.drawer = false;
+                })
+        })
+        .collect();
+    vstack((
+        text("ruru").font_size(24.0).weight(Weight::Bold).fill_width().padding_ltrb(14.0, 8.0, 0.0, 12.0),
+        vstack(items).spacing(4.0).fill_width(),
+        spacer(),
     ))
+    .padding(14.0)
     .fill()
 }
 
-fn main() {
-    let state = Demo {
-        count: 0,
-        wifi: true,
-        focus: false,
-        drift: 0.35,
-        glass: 0.5,
-        tab: 0,
-        name: String::new(),
-        city: 0,
-        photos: (0..7).map(|i| plasma(i as f32 * 1.3 + 0.4)).collect(),
+fn overlays(s: &Demo) -> Vec<View<Demo>> {
+    let panel = |title: &str, body: &str, close: fn(&mut Demo)| {
+        vstack((
+            text(title).font_size(22.0).weight(Weight::Bold),
+            text(body).font_size(15.0).centered().color(Color::WHITE.alpha(0.75)),
+            button("Done", close).fill_width(),
+        ))
+        .spacing(14.0)
+        .padding(24.0)
+        .fill_width()
+        .glass_with(Glass::frosted())
+        .radius(30.0)
     };
+    vec![
+        drawer(s.drawer, |s: &mut Demo| s.drawer = false, nav(s).glass_with(Glass::frosted())),
+        sheet(
+            s.sheet,
+            |s: &mut Demo| s.sheet = false,
+            panel("Sheet", "Slides up from the bottom edge. Tap outside to dismiss.", |s| s.sheet = false).padding(10.0),
+        ),
+        modal(
+            s.modal,
+            |s: &mut Demo| s.modal = false,
+            panel("Modal", "Blocks everything underneath until it is closed.", |s| s.modal = false),
+        ),
+        snackbar(
+            s.toast.is_some(),
+            hstack((icon(&s.icons.bell).size(18.0, 18.0), text(s.toast.clone().unwrap_or_default()).font_size(15.0)))
+                .spacing(10.0)
+                .padding_xy(18.0, 12.0)
+                .glass_with(Glass::frosted())
+                .radius(24.0)
+                .shadow(Color::BLACK.alpha(0.35), 24.0, 8.0),
+        ),
+    ]
+}
+
+fn view(s: &Demo, env: &Env) -> View<Demo> {
+    let class = env.class();
+    let page = match s.tab {
+        0 => home(s, env),
+        2 => gallery(s),
+        3 => forms(s),
+        _ => rect(),
+    };
+    let bottom = if class == SizeClass::Phone { 110.0 } else { 24.0 };
+    let content = if s.tab == 1 {
+        chat(s).padding_ltrb(0.0, 0.0, 0.0, bottom - 14.0)
+    } else {
+        // Keep text lines readable on wide windows.
+        let column = vstack(page.width(env.width.min(620.0) - 36.0)).fill_width();
+        scroll(column.padding_ltrb(18.0, 56.0, 18.0, bottom)).key(s.tab)
+    };
+
+    let mut layers: Vec<View<Demo>> = vec![backdrop(s)];
+    match class {
+        // Phone: one column, floating tab bar, the menu button opens a drawer.
+        SizeClass::Phone => {
+            layers.push(content);
+            layers.push(
+                zstack(icon(&s.icons.menu).size(20.0, 20.0))
+                    .size(40.0, 40.0)
+                    .radius(20.0)
+                    .glass_with(glass(s))
+                    .on_tap(|s: &mut Demo| s.drawer = true)
+                    .place(Align::Start, Align::Start),
+            );
+            layers.push(
+                hstack(tab_bar(&TABS, s.tab, |s: &mut Demo, i| s.tab = i).glass_with(glass(s)))
+                    .padding_ltrb(0.0, 0.0, 0.0, 22.0)
+                    .place(Align::Center, Align::End),
+            );
+        }
+        // Tablet and desktop: a sidebar, and on a desktop a settings panel as well.
+        _ => {
+            let sidebar = nav(s).width(230.0).glass_with(glass(s)).radius(26.0);
+            let mut columns = vec![sidebar, content];
+            if class == SizeClass::Desktop {
+                columns.push(
+                    vstack((text("Inspector").weight(Weight::Semibold).fill_width().padding(6.0), settings(s), spacer()))
+                        .spacing(10.0)
+                        .width(300.0)
+                        .fill_height(),
+                );
+            }
+            layers.push(hstack(columns).spacing(14.0).padding(14.0).fill());
+        }
+    }
+    layers.extend(overlays(s));
+    let menu_inset = if class == SizeClass::Phone { 12.0 } else { 0.0 };
+    zstack(layers).fill().padding_ltrb(menu_inset, menu_inset, 0.0, 0.0).padding(0.0)
+}
+
+impl Demo {
+    fn new() -> Demo {
+        Demo {
+            count: 0,
+            wifi: true,
+            focus: false,
+            drift: 0.35,
+            glass: 0.5,
+            tab: 0,
+            name: String::new(),
+            city: 0,
+            photos: (0..7).map(|i| plasma(i as f32 * 1.3 + 0.4)).collect(),
+            icons: Rc::new(icons()),
+            modal: false,
+            sheet: false,
+            drawer: false,
+            toast: None,
+            refreshing: false,
+            messages: Rc::new(vec![
+                Msg { me: true, text: "What can you render?".into() },
+                Msg { me: false, text: REPLY.into() },
+            ]),
+            draft: String::new(),
+        }
+    }
+}
+
+fn main() {
+    let state = Demo::new();
     #[cfg(not(target_arch = "wasm32"))]
     {
         let args: Vec<String> = std::env::args().collect();
         if let Some(i) = args.iter().position(|a| a == "--screenshot") {
             let mut state = state;
-            state.tab = args.get(i + 2).and_then(|t| t.parse().ok()).unwrap_or(0);
+            let num = |k: usize, d: u32| args.get(i + k).and_then(|t| t.parse().ok()).unwrap_or(d);
+            state.tab = num(2, 0) as usize;
+            let (frames, width) = (num(3, 1), num(4, 420));
             let mut ui = ruru::Ui::new(state, view);
             ui.show_fps = true;
-            // Optional 3rd value: number of frames to run (90 ms apart) before saving.
-            let frames = args.get(i + 3).and_then(|t| t.parse().ok()).unwrap_or(1);
-            // Optional 4th value "drag": press the tab bar and drag the drop along it.
-            let drag = args.get(i + 4).is_some_and(|a| a == "drag");
-            let wait = move |ui: &mut ruru::Ui<Demo>, n: u32| {
+            let wait = |_: &mut ruru::Ui<Demo>, n: u32| {
                 if n > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(if drag { 16 } else { 90 }));
-                }
-                if drag && n == 2 {
-                    ui.pointer_down((130.0, 770.0), false);
-                } else if drag && n > 2 {
-                    ui.pointer_move((130.0 + (n as f32 * 4.0).min(110.0), 770.0));
+                    std::thread::sleep(std::time::Duration::from_millis(16));
                 }
             };
-            ruru::headless::render_png_after(&mut ui, 420, 820, 2.0, frames, wait, &args[i + 1]);
+            ruru::headless::render_png_after(&mut ui, width, 820, 2.0, frames, wait, &args[i + 1]);
             return;
         }
     }

@@ -1,10 +1,12 @@
 //! Platform-independent core: owns the app state, rebuilds the view tree,
 //! lays it out, paints it into a `DrawList`, and routes pointer input.
 
-use crate::layout::{layout, LNode, FIELD_FONT, SLIDER_H, TABS_PAD};
+use crate::layout::{child_id, layout, LNode, FIELD_FONT, SLIDER_H, TABS_PAD};
 use crate::text::{TextSpec, TextSystem};
 use crate::types::{Color, Rect};
-use crate::view::{Fill, Glass, Image, Kind, Shadow, View};
+use crate::view::{Axis, Env, Fill, Glass, Image, Indicator, Kind, OverlayMode, Shadow, View, ViewFn};
+use std::any::Any;
+use std::cell::RefCell;
 use std::rc::Rc;
 use bytemuck::{Pod, Zeroable};
 use std::collections::HashMap;
@@ -30,6 +32,11 @@ pub struct Quad {
     pub p0: [f32; 4],
     /// gradient dir x, gradient dir y, clip radius, opacity
     pub p1: [f32; 4],
+    /// Glass only: up to two neighbouring panes this one fuses with (x, y, w, h)…
+    pub n0: [f32; 4],
+    pub n1: [f32; 4],
+    /// …their corner radii, and the fusing distance (0 = stands alone).
+    pub np: [f32; 4],
 }
 
 pub struct TextCmd {
@@ -61,17 +68,26 @@ struct Spring {
     v: f32,
     target: f32,
     used: u64,
+    /// Stiffness and damping.
+    k: f32,
+    c: f32,
 }
 
 impl Spring {
-    const K: f32 = 380.0; // stiffness
-    const C: f32 = 26.0; // damping (slightly under-damped: a hint of bounce)
+    /// Default: lively, with a hint of bounce (toggles, the tab drop, menus).
+    const BOUNCY: (f32, f32) = (380.0, 28.0);
+    /// Quick and critically damped, no overshoot (press feedback, fades).
+    const CRISP: (f32, f32) = (900.0, 60.0);
+
+    fn new(x: f32, target: f32, (k, c): (f32, f32)) -> Self {
+        Spring { x, v: 0.0, target, used: 0, k, c }
+    }
 
     fn step(&mut self, dt: f32) {
         let n = (dt / (1.0 / 240.0)).ceil().max(1.0);
         let h = dt / n;
         for _ in 0..n as usize {
-            let a = -Self::K * (self.x - self.target) - Self::C * self.v;
+            let a = -self.k * (self.x - self.target) - self.c * self.v;
             self.v += a * h;
             self.x += self.v * h;
         }
@@ -92,7 +108,70 @@ impl Spring {
 struct ScrollState {
     offset: f32,
     vel: f32,
+    max: f32,
     used: u64,
+    /// Extra room kept open above the content while a refresh is running.
+    hold: f32,
+    refreshing: bool,
+    /// Pulled past the refresh threshold and not released yet.
+    armed: bool,
+    /// Last time the offset changed (drives the auto-hiding scroll bar).
+    active_at: Option<Instant>,
+    /// Last trackpad delta: the rubber band holds its stretch while fingers are down.
+    wheel_at: Option<Instant>,
+    ended_at: Option<Instant>,
+    /// The current wheel deltas are OS momentum after the fingers lifted.
+    momentum: bool,
+}
+
+/// Pull distance that triggers a refresh, and the gap kept open while it runs.
+const REFRESH_AT: f32 = 72.0;
+const REFRESH_HOLD: f32 = 56.0;
+
+impl ScrollState {
+    /// Resting range of the offset.
+    fn bounds(&self) -> (f32, f32) {
+        let lo = -self.hold;
+        (lo, self.max.max(lo))
+    }
+    /// How far past the resting range the content is stretched.
+    fn over(&self) -> f32 {
+        let (lo, hi) = self.bounds();
+        (lo - self.offset).max(self.offset - hi).max(0.0)
+    }
+    /// The further it is stretched, the less it follows the finger.
+    fn rubber(&self, delta: f32) -> f32 {
+        let (lo, hi) = self.bounds();
+        let outward = (self.offset <= lo && delta < 0.0) || (self.offset >= hi && delta > 0.0);
+        if outward {
+            delta / (1.0 + self.over() * 0.03).powi(2)
+        } else {
+            delta
+        }
+    }
+}
+
+/// How a wheel / trackpad delta should be treated.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WheelPhase {
+    /// A classic mouse wheel: no rubber band, stops at the ends.
+    Line,
+    /// Trackpad gesture phases (fingers down / moving / lifted, then OS momentum).
+    Started,
+    Moved,
+    Ended,
+}
+
+thread_local! {
+    static PENDING: RefCell<Vec<(f32, Box<dyn Any>)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Runs `f` on the app state after `seconds`, then redraws. Call it from any event
+/// handler, e.g. to hide a snackbar or finish a refresh:
+/// `ruru::after(2.0, |s: &mut App| s.toast = false)`.
+pub fn after<S: 'static>(seconds: f32, f: impl FnOnce(&mut S) + 'static) {
+    let f: Box<dyn FnOnce(&mut S)> = Box::new(f);
+    PENDING.with(|p| p.borrow_mut().push((seconds.max(0.0), Box::new(f))));
 }
 
 // ---------------------------------------------------------------- input
@@ -102,7 +181,11 @@ enum Action<S> {
     Toggle(bool, Box<dyn Fn(&mut S, bool)>),
     /// x of value 0, width of the value range (screen space)
     Slider(f32, f32, Box<dyn Fn(&mut S, f32)>),
-    Scroll { max: f32 },
+    Scroll { refresh: Option<Box<dyn Fn(&mut S)>> },
+    /// Covers everything below an overlay; a tap on it dismisses the overlay.
+    Block(Option<Box<dyn Fn(&mut S)>>),
+    /// The body of an overlay: taps on it do nothing (and don't dismiss).
+    Swallow,
     /// Text field: shaped-text key (0 when empty), screen x of the text origin, scale.
     Field { key: u64, x0: f32, scale: f32, value: String, on_change: Box<dyn Fn(&mut S, String)> },
     /// Tab bar: screen x of the first tab, width of one tab, number of tabs.
@@ -185,12 +268,6 @@ impl Xf {
     }
 }
 
-fn child_id(parent: u64, index: usize, key: Option<u64>) -> u64 {
-    // FxHash-style mix; cheap and good enough for sibling paths.
-    let v = key.unwrap_or(index as u64 ^ 0x9E37_79B9_7F4A_7C15);
-    (parent.rotate_left(5) ^ v).wrapping_mul(0x517C_C1B7_2722_0A95)
-}
-
 struct Painter<'a, S> {
     list: &'a mut DrawList,
     hits: &'a mut Vec<Hit<S>>,
@@ -205,6 +282,17 @@ struct Painter<'a, S> {
     open_menu: Option<u64>,
     menu: Option<Menu<S>>,
     pointer_x: f32,
+    /// Set by a scroll view for its content stack: local y where sticky children pin.
+    sticky: Option<f32>,
+    /// Earliest moment (seconds from now) something needs a frame without input.
+    wake: Option<f32>,
+    now: Instant,
+    /// Seconds since the UI started, for looping animations.
+    time: f32,
+    /// A looping animation (spinner) is on screen.
+    spin: bool,
+    /// Sizes changed during paint (lazy rows were measured): lay out again next frame.
+    relayout: bool,
 }
 
 impl<S> Painter<'_, S> {
@@ -219,12 +307,39 @@ impl<S> Painter<'_, S> {
         }));
     }
 
+    /// Spring that starts from `initial` the first time it is seen (appear animations).
+    fn spring_from(&mut self, id: u64, slot: u8, initial: f32, target: f32) -> f32 {
+        let s = self.springs.entry((id, slot)).or_insert(Spring::new(initial, target, Spring::BOUNCY));
+        s.target = target;
+        s.used = self.frame;
+        s.x
+    }
+
+    /// iOS-style activity indicator; `progress` < 1 shows it filling up while pulling.
+    fn spinner(&mut self, xf: &Xf, center: (f32, f32), progress: f32, spinning: bool) {
+        const DOTS: usize = 8;
+        let step = (self.time * 10.0) as usize;
+        for i in 0..DOTS {
+            let alpha = if spinning {
+                0.2 + 0.8 * ((i + DOTS - step % DOTS) % DOTS) as f32 / (DOTS - 1) as f32
+            } else if (i as f32) < progress * DOTS as f32 {
+                0.75
+            } else {
+                continue;
+            };
+            let a = i as f32 / DOTS as f32 * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+            let dot = Rect::new(center.0 + a.cos() * 9.0 - 2.0, center.1 + a.sin() * 9.0 - 2.0, 4.0, 4.0);
+            self.fill(xf, dot, 2.0, Fill::Solid(xf.fg.alpha(xf.fg.a * alpha)), None);
+        }
+        self.spin |= spinning;
+    }
+
     fn paint_menu(&mut self, m: Menu<S>, size: (f32, f32)) {
         const ROW: f32 = 44.0;
         let screen = Rect::new(0.0, 0.0, size.0, size.1);
         // Anything outside the menu closes it.
         self.hits.push(Hit { id: m.id ^ 0xD15, rect: screen, action: Action::Dismiss });
-        let spec = |text| TextSpec { text, size: FIELD_FONT, weight: 400, center: false };
+        let spec = |text| TextSpec { spans: &[], text, size: FIELD_FONT, weight: 400, center: false };
         let rows: Vec<(u64, (f32, f32))> = m.options.iter().map(|o| self.text.measure(&spec(o), None)).collect();
         let (check, check_size) = self.text.measure(&TextSpec { weight: 600, ..spec("✓") }, None);
         let widest = rows.iter().map(|r| r.1 .0).fold(0.0, f32::max);
@@ -236,7 +351,7 @@ impl<S> Painter<'_, S> {
 
         // The menu grows out of the control it belongs to.
         let frame = self.frame;
-        let s = self.springs.entry((m.id, 4)).or_insert(Spring { x: 0.0, v: 0.0, target: 1.0, used: 0 });
+        let s = self.springs.entry((m.id, 4)).or_insert(Spring::new(0.0, 1.0, Spring::BOUNCY));
         s.used = frame;
         let t = s.x;
         let k = 0.8 + 0.2 * t;
@@ -269,7 +384,15 @@ impl<S> Painter<'_, S> {
     }
 
     fn spring(&mut self, id: u64, slot: u8, target: f32) -> f32 {
-        let s = self.springs.entry((id, slot)).or_insert(Spring { x: target, v: 0.0, target, used: 0 });
+        let s = self.springs.entry((id, slot)).or_insert(Spring::new(target, target, Spring::BOUNCY));
+        s.target = target;
+        s.used = self.frame;
+        s.x
+    }
+
+    /// A spring without overshoot, for press feedback.
+    fn crisp(&mut self, id: u64, slot: u8, target: f32) -> f32 {
+        let s = self.springs.entry((id, slot)).or_insert(Spring::new(target, target, Spring::CRISP));
         s.target = target;
         s.used = self.frame;
         s.x
@@ -290,6 +413,7 @@ impl<S> Painter<'_, S> {
             border: [0.0; 4],
             p0: [radius * xf.s, 0.0, 0.0, kind],
             p1: [0.0, 1.0, xf.clip_r, xf.opacity],
+            ..Zeroable::zeroed()
         }
     }
 
@@ -338,6 +462,7 @@ impl<S> Painter<'_, S> {
     }
 
     fn paint(&mut self, v: View<S>, ln: &LNode, origin: (f32, f32), mut xf: Xf, id: u64) {
+        let pin = self.sticky.take();
         let st = v.style;
         let r = Rect::new(origin.0 + ln.pos.0, origin.1 + ln.pos.1, ln.size.0, ln.size.1);
         xf.opacity *= st.opacity;
@@ -345,15 +470,15 @@ impl<S> Painter<'_, S> {
             xf.fg = fg;
         }
 
-        // Springy press feedback: scale around the center.
+        // Press feedback: a quick, quiet dim with a barely-there squeeze. No bounce.
         if v.on_tap.is_some() {
-            let p = self.spring(id, 0, if self.pressed == Some(id) { 1.0 } else { 0.0 });
-            let k = 1.0 - 0.06 * p;
+            let p = self.crisp(id, 0, if self.pressed == Some(id) { 1.0 } else { 0.0 });
+            let k = 1.0 - 0.02 * p;
             let (cx, cy) = (r.x + r.w * 0.5, r.y + r.h * 0.5);
             xf.tx += cx * (1.0 - k) * xf.s;
             xf.ty += cy * (1.0 - k) * xf.s;
             xf.s *= k;
-            xf.opacity *= 1.0 - 0.12 * p;
+            xf.opacity *= 1.0 - 0.3 * p;
         }
 
         let sr = xf.rect(r);
@@ -383,8 +508,83 @@ impl<S> Painter<'_, S> {
         let pad = st.padding;
         match v.kind {
             Kind::Empty | Kind::Spacer => {}
-            Kind::Image(img) => {
+            Kind::List { count, row_h, row } => {
+                // Only the rows inside the clip are built, laid out and painted. Their real
+                // heights are remembered so the scroll range converges on the truth.
+                let top = (xf.clip.y - xf.ty) / xf.s;
+                let bottom = top + xf.clip.h / xf.s;
+                let mut y = r.y;
+                for i in 0..count {
+                    let known = self.text.lists.get(&id).and_then(|c| c.heights.get(i)).copied().unwrap_or(f32::NAN);
+                    let h = if known.is_nan() { row_h } else { known };
+                    if y + h <= top {
+                        y += h;
+                        continue;
+                    }
+                    if y >= bottom {
+                        break;
+                    }
+                    let rv = row(i);
+                    let cid = child_id(id, i, rv.key);
+                    let n = layout(&rv, (Some(r.w), None), self.text, cid);
+                    if known.is_nan() || (n.size.1 - known).abs() > 0.5 {
+                        if let Some(slot) = self.text.lists.get_mut(&id).and_then(|c| c.heights.get_mut(i)) {
+                            *slot = n.size.1;
+                            self.relayout = true;
+                        }
+                    }
+                    let h = n.size.1;
+                    self.paint(rv, &n, (r.x, y), xf, cid);
+                    y += h;
+                }
+            }
+            Kind::Overlay { open, mode, child, on_dismiss } => {
+                let t = self.spring_from(id, 7, 0.0, if open { 1.0 } else { 0.0 });
+                if t <= 0.004 && !open {
+                    return;
+                }
+                let tc = t.clamp(0.0, 1.0);
+                let cn = &ln.children[0];
+                let (w, h) = cn.size;
+                let cx = r.x + (r.w - w) * 0.5;
+                let mut cxf = xf;
+                let pos = match mode {
+                    OverlayMode::Modal => {
+                        // Pops out of the center.
+                        let k = 0.88 + 0.12 * t;
+                        let (mx, my) = (r.x + r.w * 0.5, r.y + r.h * 0.5);
+                        cxf.tx += mx * (1.0 - k) * xf.s;
+                        cxf.ty += my * (1.0 - k) * xf.s;
+                        cxf.s *= k;
+                        cxf.opacity *= tc;
+                        (cx, r.y + (r.h - h) * 0.5)
+                    }
+                    OverlayMode::Sheet => (cx, r.y + r.h - h + (1.0 - t) * (h + 24.0)),
+                    OverlayMode::Drawer => (r.x - (1.0 - t) * (w + 24.0), r.y),
+                    OverlayMode::Toast => {
+                        cxf.opacity *= tc;
+                        (cx, r.y + r.h - h - 100.0 + (1.0 - t) * 40.0)
+                    }
+                };
+                if mode != OverlayMode::Toast {
+                    self.fill(&xf, r, 0.0, Fill::Solid(Color::BLACK.alpha(0.45 * tc)), None);
+                    self.hits.push(Hit { id, rect: sr.intersect(&xf.clip), action: Action::Block(on_dismiss) });
+                }
+                let body = cxf.rect(Rect::new(pos.0, pos.1, w, h));
+                self.hits.push(Hit { id: child_id(id, 1, None), rect: body, action: Action::Swallow });
+                let cid = child_id(id, 0, child.key);
+                self.paint(*child, cn, pos, cxf, cid);
+            }
+            Kind::Image(img, template) => {
                 let mut q = self.quad(&xf, r, st.radius, KIND_IMAGE);
+                if template {
+                    // A glyph: keep only the shape, paint it in the text color.
+                    q.c1[1] = 1.0;
+                    q.c1[2] = xf.fg.r;
+                    q.c1[3] = xf.fg.g;
+                    q.p1[0] = xf.fg.b;
+                    q.p1[1] = xf.fg.a;
+                }
                 // Fill the box and crop the overflow, keeping the picture's aspect ratio.
                 let (iw, ih) = (img.0.width.max(1) as f32, img.0.height.max(1) as f32);
                 let k = (r.w / iw).max(r.h / ih).max(1e-6);
@@ -481,7 +681,7 @@ impl<S> Painter<'_, S> {
             Kind::Picker { options, selected, on_select } => {
                 let inner = Rect::new(r.x + pad[0], r.y + pad[1], r.w - pad[0] - pad[2], r.h - pad[1] - pad[3]);
                 self.label(&xf, ln.text, (inner.x, inner.y), (inner.w - 26.0, inner.h), xf.fg);
-                let spec = TextSpec { text: "⌄", size: 15.0, weight: 700, center: false };
+                let spec = TextSpec { spans: &[], text: "⌄", size: 15.0, weight: 700, center: false };
                 let (chev, cs) = self.text.measure(&spec, None);
                 let at = (inner.x + inner.w - cs.0 - 2.0, inner.y + (inner.h - cs.1) * 0.5 - 3.0);
                 self.label(&xf, chev, at, cs, xf.fg.alpha(xf.fg.a * 0.6));
@@ -501,28 +701,86 @@ impl<S> Painter<'_, S> {
                     clip: xf.clip,
                 }));
             }
-            Kind::Stack { children, .. } => {
+            Kind::Stack { children, axis, .. } => {
+                let pin = pin.filter(|_| axis == Axis::V && children.iter().any(|c| c.style.sticky));
+                let mut stuck = Vec::new();
                 for (i, (c, n)) in children.into_iter().zip(&ln.children).enumerate() {
+                    if pin.is_some() && c.style.sticky {
+                        stuck.push((i, c)); // painted last, above the rows that slide under it
+                        continue;
+                    }
                     let cid = child_id(id, i, c.key);
                     self.paint(c, n, (r.x, r.y), xf, cid);
                 }
-            }
-            Kind::Scroll(child) => {
-                let max = (ln.content_h + pad[1] + pad[3] - r.h).max(0.0);
-                let frame = self.frame;
-                let s = self.scrolls.entry(id).or_default();
-                s.offset = s.offset.clamp(0.0, max);
-                if s.offset <= 0.0 || s.offset >= max {
-                    s.vel = 0.0;
+                let tops: Vec<f32> = stuck.iter().map(|(i, _)| r.y + ln.children[*i].pos.1).collect();
+                for (k, (i, c)) in stuck.into_iter().enumerate() {
+                    let n = &ln.children[i];
+                    // Pinned to the top of the viewport, pushed out by the next sticky one.
+                    let mut y = tops[k].max(pin.unwrap_or(tops[k]));
+                    if let Some(next) = tops.get(k + 1) {
+                        y = y.min(next - n.size.1);
+                    }
+                    let cid = child_id(id, i, c.key);
+                    self.paint(c, n, (r.x, r.y + y - tops[k]), xf, cid);
                 }
+            }
+            Kind::Scroll { child, refresh, indicator, stick } => {
+                let content = ln.content_h + pad[1] + pad[3];
+                let (frame, now) = (self.frame, self.now);
+                let s = self.scrolls.entry(id).or_default();
+                let max = (content - r.h).max(0.0);
+                // Chat-style: start at the end and follow new content while parked there.
+                if stick && (s.used == 0 || (s.offset >= s.max - 1.0 && s.vel == 0.0 && max > s.max)) {
+                    s.offset = max;
+                }
+                s.max = max;
                 s.used = frame;
-                let offset = s.offset;
-                self.hits.push(Hit { id, rect: sr.intersect(&xf.clip), action: Action::Scroll { max } });
+                s.refreshing = refresh.as_ref().is_some_and(|r| r.0);
+                let (offset, over, refreshing, active_at) = (s.offset, s.over(), s.refreshing, s.active_at);
+                let (lo, hi) = s.bounds();
+                let has_refresh = refresh.is_some();
+                self.hits.push(Hit {
+                    id,
+                    rect: sr.intersect(&xf.clip),
+                    action: Action::Scroll { refresh: refresh.map(|r| r.1) },
+                });
                 let mut cxf = xf;
                 cxf.clip = xf.clip.intersect(&sr);
                 cxf.clip_r = st.radius * xf.s;
                 let cid = child_id(id, 0, child.key);
+                self.sticky = Some(r.y + pad[1]);
                 self.paint(*child, &ln.children[0], (r.x, r.y - offset), cxf, cid);
+                self.sticky = None;
+
+                // Pull-to-refresh: the indicator lives in the gap the pull opens.
+                let pull = -offset;
+                if has_refresh && pull > 8.0 {
+                    let progress = ((pull - 8.0) / (REFRESH_AT - 8.0)).min(1.0);
+                    self.spinner(&cxf, (r.x + r.w * 0.5, r.y + pad[1] + pull * 0.5), progress, refreshing);
+                }
+
+                // Overlay scroll bar: shows while scrolling, fades out when idle.
+                let idle = active_at.map_or(f32::MAX, |t| (now - t).as_secs_f32());
+                let show = hi > lo && match indicator {
+                    Indicator::Never => false,
+                    Indicator::Always => true,
+                    Indicator::Auto => idle < 1.2,
+                };
+                if show && indicator == Indicator::Auto {
+                    self.wake = Some(self.wake.map_or(1.22 - idle, |w| w.min(1.22 - idle)));
+                }
+                let a = self.spring(id, 8, if show { 1.0 } else { 0.0 }).clamp(0.0, 1.0);
+                if a > 0.01 {
+                    let track = r.h - 8.0;
+                    // Its length mirrors how much of the content is visible; it squashes
+                    // against the end while the content is stretched.
+                    let len = ((track * r.h / content.max(1.0)).max(34.0) - over).clamp(10.0, track.max(10.0));
+                    let at = ((offset - lo) / (hi - lo).max(1.0)).clamp(0.0, 1.0);
+                    let bar = Rect::new(r.x + r.w - 7.0, r.y + 4.0 + (track - len) * at, 4.0, len);
+                    let mut bxf = cxf;
+                    bxf.clip_r = 0.0;
+                    self.fill(&bxf, bar, 2.0, Fill::Solid(xf.fg.alpha(0.45 * a)), None);
+                }
             }
             Kind::Toggle(on, f) => {
                 let t = self.spring(id, 1, if on { 1.0 } else { 0.0 });
@@ -567,7 +825,7 @@ impl<S> Painter<'_, S> {
 
 pub struct Ui<S> {
     pub state: S,
-    view_fn: Box<dyn Fn(&S) -> View<S>>,
+    view_fn: Box<dyn Fn(&S, &Env) -> View<S>>,
     pub text: TextSystem,
     pub list: DrawList,
     pub background: Color,
@@ -583,6 +841,8 @@ pub struct Ui<S> {
     caret: usize,
     caret_at: Option<Instant>,
     open_menu: Option<u64>,
+    started: Instant,
+    timers: Vec<(Instant, Box<dyn FnOnce(&mut S)>)>,
     /// Seconds until the UI wants another frame even without input (caret blink).
     pub wake_in: Option<f32>,
     /// Draw a frames-per-second counter in the top-right corner. While it is on the UI
@@ -596,11 +856,12 @@ pub struct Ui<S> {
     fps_label_at: Option<Instant>,
 }
 
-impl<S> Ui<S> {
-    pub fn new(state: S, view_fn: impl Fn(&S) -> View<S> + 'static) -> Self {
+impl<S: 'static> Ui<S> {
+    /// `view` is `Fn(&S) -> View<S>`, or `Fn(&S, &Env) -> View<S>` to adapt to the screen size.
+    pub fn new<M>(state: S, view: impl ViewFn<S, M>) -> Self {
         Ui {
             state,
-            view_fn: Box::new(view_fn),
+            view_fn: Box::new(move |s, env| view.build(s, env)),
             text: TextSystem::new(),
             list: DrawList::default(),
             background: Color::BLACK,
@@ -615,6 +876,8 @@ impl<S> Ui<S> {
             caret: 0,
             caret_at: None,
             open_menu: None,
+            started: Instant::now(),
+            timers: Vec::new(),
             wake_in: None,
             show_fps: false,
             frame_ms: 0.0,
@@ -628,7 +891,7 @@ impl<S> Ui<S> {
     pub fn frame(&mut self, size: (f32, f32)) {
         let now = Instant::now();
         let dt = match self.last_frame {
-            Some(t) if self.animating => (now - t).as_secs_f32().min(1.0 / 20.0),
+            Some(t) if self.animating || self.wake_in.is_some() => (now - t).as_secs_f32().min(1.0 / 20.0),
             _ => 1.0 / 120.0,
         };
         if let Some(t) = self.last_frame {
@@ -644,19 +907,74 @@ impl<S> Ui<S> {
         for s in self.springs.values_mut() {
             s.step(dt);
         }
-        let dragging = self.ptr.dragging;
-        for s in self.scrolls.values_mut() {
-            if !dragging && s.vel != 0.0 {
+        // Timers queued with `after()`.
+        PENDING.with(|p| {
+            for (delay, f) in p.borrow_mut().drain(..) {
+                if let Ok(f) = f.downcast::<Box<dyn FnOnce(&mut S)>>() {
+                    self.timers.push((now + std::time::Duration::from_secs_f32(delay), *f));
+                }
+            }
+        });
+        let mut i = 0;
+        while i < self.timers.len() {
+            if self.timers[i].0 <= now {
+                (self.timers.swap_remove(i).1)(&mut self.state);
+            } else {
+                i += 1;
+            }
+        }
+
+        // Scroll physics: inertia inside the content, a spring back from beyond its ends.
+        let drag = self.ptr.drag_scroll.filter(|_| self.ptr.dragging);
+        let mut refresh = Vec::new();
+        let mut scroll_wake: Option<f32> = None;
+        for (id, s) in self.scrolls.iter_mut() {
+            let hold = if s.refreshing { REFRESH_HOLD } else { 0.0 };
+            s.hold = if (s.hold - hold).abs() > 0.2 { s.hold + (hold - s.hold) * (1.0 - (-dt * 10.0).exp()) } else { hold };
+            let since_wheel = s.wheel_at.map_or(f32::MAX, |t| (now - t).as_secs_f32());
+            let held = drag == Some(*id) || since_wheel < 0.08;
+            if held {
+                s.armed = !s.refreshing && s.offset < -REFRESH_AT;
+                if since_wheel < 0.08 {
+                    scroll_wake = Some(0.09 - since_wheel); // notice when the fingers lift
+                }
+                continue;
+            }
+            if std::mem::take(&mut s.armed) {
+                refresh.push(*id);
+            }
+            let (lo, hi) = s.bounds();
+            let before = s.offset;
+            if s.offset < lo || s.offset > hi {
+                let end = if s.offset < lo { lo } else { hi };
+                for _ in 0..4 {
+                    let h = dt / 4.0;
+                    s.vel += (-220.0 * (s.offset - end) - 30.0 * s.vel) * h;
+                    s.offset += s.vel * h;
+                }
+                if (s.offset - end).abs() < 0.25 && s.vel.abs() < 6.0 {
+                    s.offset = end;
+                    s.vel = 0.0;
+                }
+            } else if s.vel != 0.0 {
                 s.offset += s.vel * dt;
                 s.vel *= (-dt * 2.2).exp(); // iOS-like deceleration
                 if s.vel.abs() < 4.0 {
                     s.vel = 0.0;
                 }
             }
+            if s.offset != before {
+                s.active_at = Some(now);
+            }
+        }
+        for id in refresh {
+            if let Some(Action::Scroll { refresh: Some(f) }) = self.hits.iter().find(|h| h.id == id).map(|h| &h.action) {
+                f(&mut self.state);
+            }
         }
 
-        let view = (self.view_fn)(&self.state);
-        let root = layout(&view, (Some(size.0), Some(size.1)), &mut self.text);
+        let view = (self.view_fn)(&self.state, &Env { width: size.0, height: size.1 });
+        let root = layout(&view, (Some(size.0), Some(size.1)), &mut self.text, 1);
         self.list.cmds.clear();
         self.list.images.clear();
         self.hits.clear();
@@ -686,18 +1004,30 @@ impl<S> Ui<S> {
             open_menu: self.open_menu,
             menu: None,
             pointer_x: self.ptr.last.0,
+            sticky: None,
+            wake: None,
+            now,
+            time: (now - self.started).as_secs_f32(),
+            spin: false,
+            relayout: false,
         };
         p.paint(view, &root, (0.0, 0.0), xf, 1);
         match p.menu.take() {
             Some(menu) => p.paint_menu(menu, size),
             None => self.open_menu = None, // its picker is gone
         }
+        let (paint_wake, spin, relayout) = (p.wake, p.spin, p.relayout);
         if let Some(id) = self.focus {
             if !self.hits.iter().any(|h| h.id == id) {
                 self.focus = None;
             }
         }
-        self.wake_in = self.focus.map(|_| 0.5 - blink % 0.5 + 0.01);
+        let timer_wake = self.timers.iter().map(|t| t.0.saturating_duration_since(now).as_secs_f32()).reduce(f32::min);
+        self.wake_in = [self.focus.map(|_| 0.5 - blink % 0.5), paint_wake, scroll_wake, timer_wake]
+            .into_iter()
+            .flatten()
+            .reduce(f32::min)
+            .map(|w| w.max(0.0) + 0.01);
 
         if self.show_fps {
             self.paint_fps(now, size);
@@ -707,8 +1037,14 @@ impl<S> Ui<S> {
         self.scrolls.retain(|_, s| s.used == frame);
         self.text.end_frame();
         self.animating = self.show_fps
+            || spin
+            || relayout
             || self.springs.values().any(Spring::moving)
-            || (!dragging && self.scrolls.values().any(|s| s.vel != 0.0));
+            || self.scrolls.iter().any(|(id, s)| {
+                let resting = s.hold == if s.refreshing { REFRESH_HOLD } else { 0.0 };
+                drag != Some(*id) && s.wheel_at.is_none_or(|t| (now - t).as_secs_f32() >= 0.08)
+                    && (s.vel != 0.0 || s.over() > 0.0 || !resting)
+            });
     }
 
     fn paint_fps(&mut self, now: Instant, size: (f32, f32)) {
@@ -717,7 +1053,7 @@ impl<S> Ui<S> {
             self.fps_label = format!("{:.0} fps  {:.1} ms", self.fps, self.frame_ms);
             self.fps_label_at = Some(now);
         }
-        let spec = TextSpec { text: &self.fps_label, size: 12.0, weight: 600, center: false };
+        let spec = TextSpec { spans: &[], text: &self.fps_label, size: 12.0, weight: 600, center: false };
         let (key, ts) = self.text.measure(&spec, None);
         let clip = Rect::new(0.0, 0.0, size.0, size.1);
         let (w, h) = (ts.0 + 16.0, ts.1 + 8.0);
@@ -731,6 +1067,7 @@ impl<S> Ui<S> {
             border: [0.0; 4],
             p0: [h * 0.5, 0.0, 0.0, KIND_FILL],
             p1: [0.0, 1.0, 0.0, 1.0],
+            ..Zeroable::zeroed()
         }));
         self.list.cmds.push(Cmd::Text(TextCmd {
             key,
@@ -803,8 +1140,9 @@ impl<S> Ui<S> {
                 let dt = self.ptr.last_move.map_or(0.016, |t| (now - t).as_secs_f32()).max(0.001);
                 self.ptr.last_move = Some(now);
                 if let Some(s) = self.scrolls.get_mut(&sid) {
-                    s.offset -= dy;
+                    s.offset += s.rubber(-dy);
                     s.vel = s.vel * 0.4 + (-dy / dt) * 0.6;
+                    s.active_at = Some(now);
                 }
                 return true;
             }
@@ -848,6 +1186,7 @@ impl<S> Ui<S> {
                         self.open_menu = Some(id);
                     }
                     Action::Dismiss => self.open_menu = None,
+                    Action::Block(Some(f)) => f(&mut self.state),
                     Action::Pick(index, f) => {
                         f(&mut self.state, *index);
                         self.open_menu = None;
@@ -916,20 +1255,55 @@ impl<S> Ui<S> {
         }
     }
 
-    /// Mouse wheel / trackpad scroll, delta in points.
-    pub fn wheel(&mut self, pos: (f32, f32), dy: f32) -> bool {
-        // Topmost scroll view under the cursor that can still move in that direction.
+    /// Mouse wheel / trackpad scroll; `dy` in points, positive = content moves down.
+    pub fn wheel(&mut self, pos: (f32, f32), dy: f32, phase: WheelPhase) -> bool {
+        let now = Instant::now();
+        // Topmost scroll view under the cursor; an overlay's backdrop stops the search.
         for h in self.hits.iter().rev() {
-            if let (Action::Scroll { max }, true) = (&h.action, h.rect.contains(pos.0, pos.1)) {
-                if let Some(s) = self.scrolls.get_mut(&h.id) {
-                    let next = (s.offset - dy).clamp(0.0, *max);
-                    if next != s.offset {
-                        s.offset = next;
-                        s.vel = 0.0;
-                        return true;
-                    }
-                }
+            if !h.rect.contains(pos.0, pos.1) {
+                continue;
             }
+            match &h.action {
+                Action::Block(_) => return false,
+                Action::Scroll { .. } => {}
+                _ => continue,
+            }
+            let Some(s) = self.scrolls.get_mut(&h.id) else { continue };
+            let (lo, hi) = s.bounds();
+            if phase == WheelPhase::Line {
+                // Mouse wheel: stops dead at the ends, and lets an outer scroll view take over.
+                let next = (s.offset - dy).clamp(lo.min(s.offset), hi.max(s.offset));
+                if next != s.offset {
+                    s.offset = next;
+                    s.vel = 0.0;
+                    s.active_at = Some(now);
+                    return true;
+                }
+                continue;
+            }
+            match phase {
+                // The OS starts its momentum right after the fingers lift.
+                WheelPhase::Started => s.momentum = s.ended_at.is_some_and(|t| (now - t).as_secs_f32() < 0.1),
+                WheelPhase::Ended => {
+                    s.ended_at = Some(now);
+                    s.wheel_at = None; // released: the rubber band may snap back
+                    return true;
+                }
+                _ => {}
+            }
+            if s.momentum && s.over() > 0.0 {
+                return true; // coasted past the end: ignore the rest, the spring takes over
+            }
+            s.offset += s.rubber(-dy);
+            s.active_at = Some(now);
+            if s.momentum && s.over() > 0.0 {
+                s.vel = (-dy * 60.0).clamp(-3000.0, 3000.0); // carry the speed into the bounce
+                s.wheel_at = None;
+            } else {
+                s.vel = 0.0;
+                s.wheel_at = Some(now);
+            }
+            return true;
         }
         false
     }
