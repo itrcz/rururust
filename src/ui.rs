@@ -134,11 +134,40 @@ struct ScrollState {
     armed: bool,
     /// Last time the offset changed (drives the auto-hiding scroll bar).
     active_at: Option<Instant>,
-    /// Last trackpad delta: the rubber band holds its stretch while fingers are down.
+    /// Last trackpad delta.
     wheel_at: Option<Instant>,
-    ended_at: Option<Instant>,
-    /// The current wheel deltas are OS momentum after the fingers lifted.
-    momentum: bool,
+    /// Where the trackpad gesture is: fingers, lift, OS momentum.
+    pad: Pad,
+    /// Speed of the trackpad deltas (pt/s), carried into the bounce when momentum meets an end.
+    pad_v: f32,
+}
+
+/// A trackpad gesture as macOS reports it: fingers move (`Started`…`Ended`), then the OS may
+/// send its own momentum as a second `Started`…`Ended` run right after the lift.
+#[derive(Clone, Copy, Default, PartialEq)]
+enum Pad {
+    #[default]
+    Idle,
+    /// Fingers on the pad: the rubber band holds its stretch even while they rest.
+    Fingers,
+    /// Fingers just lifted; a `Started` now is the OS momentum.
+    Lifted(Instant),
+    Momentum,
+    /// Momentum that reached an end: the bounce owns the offset, the rest of the run is
+    /// ignored (NSScrollView does the same). Feeding it back in restarts the bounce on every
+    /// tail event, which is the stutter of repeated hits at the edge.
+    Spent,
+}
+
+/// Rubber band: finger travel `r` past the end → stretch. The slope is 1 / (1 + A·stretch)²,
+/// so it follows the finger at first and stiffens; [`unstretch`] is its exact inverse, which
+/// makes pulling out and pushing back retrace the same path.
+const RUBBER_A: f32 = 0.03;
+fn stretch(r: f32) -> f32 {
+    ((1.0 + 3.0 * RUBBER_A * r).cbrt() - 1.0) / RUBBER_A
+}
+fn unstretch(o: f32) -> f32 {
+    ((1.0 + RUBBER_A * o).powi(3) - 1.0) / (3.0 * RUBBER_A)
 }
 
 /// Pull distance that triggers a refresh, and the gap kept open while it runs.
@@ -156,15 +185,31 @@ impl ScrollState {
         let (lo, hi) = self.bounds();
         (lo - self.offset).max(self.offset - hi).max(0.0)
     }
-    /// The further it is stretched, the less it follows the finger.
-    fn rubber(&self, delta: f32) -> f32 {
+    /// How long after the last trackpad delta the offset stays where the fingers put it.
+    /// Fingers resting on the pad send nothing, so they hold it until the lift; the time
+    /// limit only guards against a lost `Ended`.
+    fn wheel_hold(&self) -> f32 {
+        if self.pad == Pad::Fingers { 1.0 } else { 0.08 }
+    }
+    /// Moves the offset by a finger delta; past the ends it stretches like a rubber band.
+    fn pull(&mut self, delta: f32) {
         let (lo, hi) = self.bounds();
-        let outward = (self.offset <= lo && delta < 0.0) || (self.offset >= hi && delta > 0.0);
-        if outward {
-            delta / (1.0 + self.over() * 0.03).powi(2)
+        // Work in finger travel, where the motion is linear, and map back.
+        let at = if self.offset > hi {
+            hi + unstretch(self.offset - hi)
+        } else if self.offset < lo {
+            lo - unstretch(lo - self.offset)
         } else {
-            delta
-        }
+            self.offset
+        };
+        let t = at + delta;
+        self.offset = if t > hi {
+            hi + stretch(t - hi)
+        } else if t < lo {
+            lo - stretch(lo - t)
+        } else {
+            t
+        };
     }
 }
 
@@ -1211,11 +1256,12 @@ impl<S: 'static> Ui<S> {
             let hold = if s.refreshing { REFRESH_HOLD } else { 0.0 };
             s.hold = if (s.hold - hold).abs() > 0.2 { s.hold + (hold - s.hold) * (1.0 - (-dt * 10.0).exp()) } else { hold };
             let since_wheel = s.wheel_at.map_or(f32::MAX, |t| (now - t).as_secs_f32());
-            let held = drag == Some(*id) || since_wheel < 0.08;
+            let hold_for = s.wheel_hold();
+            let held = drag == Some(*id) || since_wheel < hold_for;
             if held {
                 s.armed = !s.refreshing && s.offset < -REFRESH_AT;
-                if since_wheel < 0.08 {
-                    scroll_wake = Some(0.09 - since_wheel); // notice when the fingers lift
+                if since_wheel < hold_for {
+                    scroll_wake = Some(hold_for + 0.01 - since_wheel); // notice when the fingers lift
                 }
                 continue;
             }
@@ -1379,7 +1425,7 @@ impl<S: 'static> Ui<S> {
             || self.springs.values().any(Spring::moving)
             || self.scrolls.iter().any(|(id, s)| {
                 let resting = s.hold == if s.refreshing { REFRESH_HOLD } else { 0.0 };
-                drag != Some(*id) && s.wheel_at.is_none_or(|t| (now - t).as_secs_f32() >= 0.08)
+                drag != Some(*id) && s.wheel_at.is_none_or(|t| (now - t).as_secs_f32() >= s.wheel_hold())
                     && (s.vel != 0.0 || s.over() > 0.0 || !resting)
             });
     }
@@ -1550,7 +1596,7 @@ impl<S: 'static> Ui<S> {
                 let dt = self.ptr.last_move.map_or(0.016, |t| (now - t).as_secs_f32()).max(0.001);
                 self.ptr.last_move = Some(now);
                 if let Some(s) = self.scrolls.get_mut(&sid) {
-                    s.offset += s.rubber(-dy);
+                    s.pull(-dy);
                     s.vel = s.vel * 0.4 + (-dy / dt) * 0.6;
                     s.active_at = Some(now);
                 }
@@ -1705,28 +1751,52 @@ impl<S: 'static> Ui<S> {
                 }
                 continue;
             }
+            // Speed of the deltas, for the bounce when momentum meets an end.
+            let gap = s.wheel_at.map_or(1.0 / 60.0, |t| (now - t).as_secs_f32()).clamp(1.0 / 240.0, 1.0 / 30.0);
             match phase {
-                // The OS starts its momentum right after the fingers lift.
-                WheelPhase::Started => s.momentum = s.ended_at.is_some_and(|t| (now - t).as_secs_f32() < 0.1),
+                WheelPhase::Started => {
+                    // The OS starts its momentum right after the fingers lift; any other
+                    // start is fingers (touching the pad also stops a running momentum).
+                    let lifted = matches!(s.pad, Pad::Lifted(t) if (now - t).as_secs_f32() < 0.1);
+                    s.pad = if lifted { Pad::Momentum } else { Pad::Fingers };
+                    s.pad_v = 0.0;
+                    if lifted && s.over() > 0.0 {
+                        s.pad = Pad::Spent; // flung while stretched: the spring brings it back
+                    }
+                }
                 WheelPhase::Ended => {
-                    s.ended_at = Some(now);
+                    s.pad = if s.pad == Pad::Fingers { Pad::Lifted(now) } else { Pad::Idle };
                     s.wheel_at = None; // released: the rubber band may snap back
                     return true;
                 }
                 _ => {}
             }
-            if s.momentum && s.over() > 0.0 {
-                return true; // coasted past the end: ignore the rest, the spring takes over
+            match s.pad {
+                Pad::Spent => return true,
+                Pad::Momentum => {
+                    s.pad_v = s.pad_v * 0.5 + (-dy / gap) * 0.5;
+                    let (lo, hi) = s.bounds();
+                    let next = s.offset - dy;
+                    if next < lo || next > hi {
+                        // Coasted into an end: stop on it and let the spring turn the speed
+                        // into one bounce.
+                        s.offset = next.clamp(lo, hi);
+                        s.vel = s.pad_v.clamp(-3000.0, 3000.0);
+                        s.pad = Pad::Spent;
+                        s.wheel_at = None;
+                    } else {
+                        s.offset = next;
+                        s.vel = 0.0;
+                        s.wheel_at = Some(now);
+                    }
+                }
+                _ => {
+                    s.pull(-dy);
+                    s.vel = 0.0;
+                    s.wheel_at = Some(now);
+                }
             }
-            s.offset += s.rubber(-dy);
             s.active_at = Some(now);
-            if s.momentum && s.over() > 0.0 {
-                s.vel = (-dy * 60.0).clamp(-3000.0, 3000.0); // carry the speed into the bounce
-                s.wheel_at = None;
-            } else {
-                s.vel = 0.0;
-                s.wheel_at = Some(now);
-            }
             return true;
         }
         false

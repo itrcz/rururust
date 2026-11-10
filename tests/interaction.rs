@@ -1744,3 +1744,97 @@ fn secondary_click_opens_the_context_menu_at_the_pointer() {
     assert_eq!(ui.state.under, 0);
     assert_eq!(ui.state.sec, 1);
 }
+
+// ---------------------------------------------------------------- trackpad at the edge
+
+/// Content top (screen y of the tall red rect) in a 400 pt scroll view.
+fn top_y(ui: &Ui<()>) -> f32 {
+    quads(ui, Color::RED)[0][1]
+}
+
+fn edge_ui() -> Ui<()> {
+    let mut ui = Ui::new((), |_: &()| scroll(rect().height(2000.0).fill_width().background(Color::RED)));
+    ui.frame((300.0, 400.0));
+    ui
+}
+
+/// One trackpad event as macOS sends it, ~8 ms apart, with a frame after each.
+fn pad(ui: &mut Ui<()>, dy: f32, phase: ruru::WheelPhase, ys: &mut Vec<f32>) {
+    ui.wheel((150.0, 200.0), dy, phase);
+    std::thread::sleep(std::time::Duration::from_millis(8));
+    ui.frame((300.0, 400.0));
+    ys.push(top_y(ui));
+}
+
+#[test]
+fn trackpad_momentum_into_the_edge_bounces_once_and_returns_monotonically() {
+    use ruru::WheelPhase::*;
+    let mut ui = edge_ui();
+    let mut ys = Vec::new();
+    // A flick towards the top: fingers, lift, then OS momentum with decaying deltas that keeps
+    // coming long after the content met the edge.
+    pad(&mut ui, 0.0, Started, &mut ys);
+    for _ in 0..4 {
+        pad(&mut ui, 12.0, Moved, &mut ys);
+    }
+    pad(&mut ui, 0.0, Ended, &mut ys);
+    let mut d = 30.0;
+    pad(&mut ui, d, Started, &mut ys);
+    for _ in 0..60 {
+        d *= 0.93;
+        pad(&mut ui, d, Moved, &mut ys);
+    }
+    pad(&mut ui, 0.0, Ended, &mut ys);
+    for _ in 0..80 {
+        std::thread::sleep(std::time::Duration::from_millis(8));
+        ui.frame((300.0, 400.0));
+        ys.push(top_y(&ui));
+    }
+    // Once it starts coming back it never goes out again: one bounce, no stutter.
+    let peak = ys.iter().cloned().enumerate().fold((0, f32::MIN), |m, (i, y)| if y > m.1 { (i, y) } else { m }).0;
+    for w in ys[peak..].windows(2) {
+        assert!(w[1] <= w[0] + 0.01, "the return stutters: {ys:?}");
+    }
+    assert!(ys[peak] > 5.0, "the momentum should carry past the edge: {ys:?}");
+    assert_eq!(*ys.last().unwrap(), 0.0, "settles on the edge");
+}
+
+#[test]
+fn trackpad_new_gesture_during_the_bounce_follows_the_fingers() {
+    use ruru::WheelPhase::*;
+    let mut ui = edge_ui();
+    let mut ys = Vec::new();
+    // Pull past the top, let go, momentum runs out against the edge…
+    pad(&mut ui, 0.0, Started, &mut ys);
+    for _ in 0..4 {
+        pad(&mut ui, 15.0, Moved, &mut ys);
+    }
+    pad(&mut ui, 0.0, Ended, &mut ys);
+    pad(&mut ui, 10.0, Started, &mut ys);
+    pad(&mut ui, 5.0, Moved, &mut ys);
+    pad(&mut ui, 0.0, Ended, &mut ys);
+    // …and the fingers come down again at once, pulling the same way.
+    pad(&mut ui, 0.0, Started, &mut ys);
+    let caught = *ys.last().unwrap();
+    assert!(caught > 0.0, "still stretched when the fingers land");
+    // Fingers resting on the pad hold the stretch, like NSScrollView.
+    for _ in 0..20 {
+        std::thread::sleep(std::time::Duration::from_millis(8));
+        ui.frame((300.0, 400.0));
+    }
+    let held = top_y(&ui);
+    assert!((held - caught).abs() < 0.5, "resting fingers let go: {caught} → {held}");
+    let mut last = held;
+    for _ in 0..4 {
+        pad(&mut ui, 10.0, Moved, &mut ys);
+        let y = *ys.last().unwrap();
+        assert!(y > last && y - last <= 10.0, "the new gesture must move the content: {last} → {y}");
+        last = y;
+    }
+    // Pushing back by the same amount retraces the stretch.
+    for _ in 0..4 {
+        pad(&mut ui, -10.0, Moved, &mut ys);
+    }
+    assert!((top_y(&ui) - held).abs() < 0.5, "back and forth is not reversible: {held} → {}", top_y(&ui));
+    pad(&mut ui, 0.0, Ended, &mut ys);
+}
