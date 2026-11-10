@@ -55,7 +55,7 @@ pub use view::{drawer, rich_text, Env, Mods, SizeClass, Span, ViewFn};
 #[cfg(feature = "markdown")]
 mod markdown;
 #[cfg(feature = "markdown")]
-pub use markdown::{markdown, markdown_with};
+pub use markdown::{markdown, markdown_styled, markdown_styled_with, markdown_with, CodeBlockStyle, MarkdownStyle, QuoteStyle, TableStyle};
 
 pub mod prelude {
     #[cfg(feature = "app")]
@@ -66,7 +66,7 @@ pub mod prelude {
         View, Weight,
     };
     #[cfg(feature = "markdown")]
-    pub use crate::{markdown, markdown_with};
+    pub use crate::{markdown, markdown_styled, markdown_with, MarkdownStyle};
     pub use crate::{drawer, rich_text, Env, SizeClass, Span};
     pub use crate::{link, spawn, Link, Task};
     #[cfg(any(not(target_arch = "wasm32"), feature = "app"))]

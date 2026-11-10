@@ -48,14 +48,17 @@ cargo install wasm-bindgen-cli --version 0.2.130 --locked   # версия ка�
 | Область | API |
 | --- | --- |
 | Раскладка | `vstack` `hstack` `zstack` `spacer` `rect`, `.padding()` `.padding_h()` / `.padding_v()` (складываются) `.size()` `.fill_width()` `.place()` |
+| Доли ширины | `.flex(k)` — ребёнок `hstack`/`vstack` берёт долю свободного места по весу (`.fill_*()` = 1): `hstack((a.flex(1.0), b.flex(1.5), c.flex(1.5)))` — колонки при любой ширине |
 | Пределы размера | `.max_width(w)` `.min_width(w)` `.max_height(h)` `.min_height(h)` — `.fill_width().max_width(720.0)`: колонка чтения, не шире 720 |
 | Обрезка | `.clip()` — дети режутся по скруглённой форме узла (`.radius()`), вложенные клипы пересекаются; текст режется прямоугольником |
 | Анимация размера | `.animate()` — новый размер узла доезжает пружиной, содержимое режется краем, а не сжимается: `sidebar.width(if open { 280.0 } else { 0.0 }).animate()`. Пример: `examples/panels.rs` |
 | Наведение и курсор | `.hover(цвет)` — подсветка поверх фона, проявляется ~0.1 с; `.cursor(Cursor::Pointer / Text / ResizeH / …)`; по умолчанию «рука» у нажимаемого, I-beam у поля; `ui.cursor` |
-| Текст | `text`, `rich_text(Vec<Span>)` (жирный, курсив, код, цвет), `markdown(src)` / `markdown_with(src, images)`; `.lines(n)` — не больше n строк с «…», `.truncate(Truncate::Fade)` — затухание к краю (одна строка, если `.lines` не задан) |
+| Текст | `text`, `rich_text(Vec<Span>)`; `.lines(n)` — не больше n строк с «…», `.truncate(Truncate::Fade)` — затухание к краю (одна строка, если `.lines` не задан); `.line_height(1.6)` — межстрочный в долях кегля (по умолчанию 1.3); `.letter_spacing(0.01)` — разрядка в em |
+| Фрагменты (`Span`) | `.bold()` `.italic()` `.code()` `.color(c)`, `.weight(Weight::Semibold)`, `.size(pt)` (строка подрастает), `.background(c)` — скруглённая плашка под фрагментом с полями по бокам, режется по строкам при переносе и не меняет высоту строки; `Span::icon(&img)` — значок в строке размером 1 em, красится цветом фрагмента |
+| Markdown | `markdown(src)` / `markdown_with(src, images)`; `markdown_styled(src, &MarkdownStyle { size: 14.0, line_height: 1.625, strong: Weight::Semibold, code_background: Some(c), ..Default::default() })` — кегль, межстрочный, отступ между блоками, цвет и иконки ссылок (`link_icons`: по префиксу URL), заголовки, inline-код, `code_block`, `table` (`TableStyle`: кегль, поля ячеек, линии между строками, вес шапки, `columns` — доли ширины), `quote`; `Default` = вид `markdown()`; таблицы — колонками |
 | Картинки и иконки | `image(&Image)`, `icon(&Image)` — глиф, красится цветом текста; `Image::decode` (PNG/JPEG), `Image::from_svg` |
 | Контролы | `button` `toggle` `slider` `text_field` `picker` `tab_bar` |
-| Ввод текста | `text_field(value, placeholder, on_change)`: `.multiline()` / `.max_lines(n)` — растёт от 1 строки до `n`, дальше скролл; `.on_submit(f)` — Enter отправляет, Shift/Alt+Enter — перенос; `.plain()` — без своего фона, отступов и кольца фокуса (контейнер рисует приложение); `.font_size()`. Выделение мышью / Shift+стрелки / двойной и тройной клик / Cmd+A, слова — Alt/Ctrl+←→, Cmd+←→ — края строки, буфер обмена Cmd/Ctrl+C/X/V, undo/redo Cmd+Z / Shift+Cmd+Z, IME (preedit подчёркнут) |
+| Ввод текста | `text_field(value, placeholder, on_change)`: `.multiline()` / `.max_lines(n)` — растёт от 1 строки до `n`, дальше скролл; `.on_submit(f)` — Enter отправляет, Shift/Alt+Enter — перенос; `.plain()` — без своего фона, отступов и кольца фокуса (контейнер рисует приложение); `.font_size()`, `.placeholder_color(c)`. Выделение мышью / Shift+стрелки / двойной и тройной клик / Cmd+A, слова — Alt/Ctrl+←→, Cmd+←→ — края строки, буфер обмена Cmd/Ctrl+C/X/V, undo/redo Cmd+Z / Shift+Cmd+Z, IME (preedit подчёркнут) |
 | Скролл | `scroll(...)`: резинка на концах, инерция, `.on_refresh(refreshing, f)`, `.indicator(Auto/Always/Never)`, `.stick_to_bottom()`; `.sticky()` у детей |
 | Длинные списки | `list(count, estimated_height, |i| row)` — строятся только видимые строки, высота строк любая |
 | Оверлеи | `modal` `sheet` `drawer` `snackbar` — последними в корневом `zstack` |
@@ -127,7 +130,7 @@ ruru = { version = "0.1", default-features = false, features = ["app"] }        
   через события `copy`/`cut`/`paste` (Chromium; Safari может их не присылать без DOM-выделения).
   На Linux системный буфер — только X11 (под Wayland через XWayland). Нет тач-выделения (ручек),
   контекстного меню, двунаправленного текста сверх того, что даёт cosmic-text; I-beam курсора нет.
-- Текст нельзя выделить и скопировать (важно для чата); ссылки в markdown не кликаются; таблицы — упрощённо.
+- Текст нельзя выделить и скопировать (важно для чата); ссылки в markdown не кликаются; у таблиц нет выравнивания колонок (`:---:`) и ширины по содержимому — только доли.
 - Резинка и pull-to-refresh от трекпада работают только на macOS (нужны фазы жеста); в браузере и
   с мышью скролл останавливается на краях. Тач-перетаскивание работает везде.
 - Нет accessibility, тем, горизонтального скролла, диффинга дерева.

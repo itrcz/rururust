@@ -1128,3 +1128,65 @@ fn flex_shares_the_free_space_by_weight() {
     assert_eq!(quads(&ui, Color::RED)[0][3], 100.0);
     assert_eq!(quads(&ui, Color::GREEN)[0][3], 200.0);
 }
+
+const MD: &str = "Use `wgpu` and **bold**.\n\n| Name | Kind | Note |\n| --- | --- | --- |\n| a | b | c |\n| d | e | f |\n";
+
+fn md_ui(style: MarkdownStyle) -> Ui<()> {
+    let mut ui = Ui::new((), move |_: &()| vstack(markdown_styled(MD, &style)).width(400.0).place(Align::Start, Align::Start));
+    ui.frame((600.0, 600.0));
+    ui
+}
+
+#[test]
+fn markdown_style_sets_type_gaps_tables_and_code_plates() {
+    let plate = Color::hex(0x303030);
+    let rule = Color::hex(0x222222);
+    let style = MarkdownStyle {
+        size: 14.0,
+        line_height: 1.625,
+        gap: 13.0,
+        code_background: Some(plate),
+        table: ruru::TableStyle {
+            size: Some(12.0),
+            line_height: Some(1.875),
+            cell_padding: (8.0, 9.0),
+            rule: Some((1.0, rule)),
+            columns: vec![0.25, 0.375, 0.375],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let ui = md_ui(style);
+    let t = texts(&ui);
+    // A paragraph, then 3 header cells and 2 rows of 3.
+    assert_eq!(t.len(), 1 + 9);
+    assert_eq!(t[0].size.1, 23.0);
+    // Columns at 0, 25 % and 62.5 % of 400 in every row; cells are 22.5 → 23 pt rows padded by 9.
+    let xs: Vec<f32> = t[1..4].iter().map(|c| c.pos.0).collect();
+    assert_eq!(xs, vec![0.0, 100.0, 250.0]);
+    assert_eq!(t[4].pos.0, 0.0);
+    assert_eq!(t[9].pos.0, 250.0);
+    assert_eq!(t[1].pos.1, 23.0 + 13.0 + 9.0);
+    assert_eq!(t[1].size.1, 23.0);
+    // A rule between rows (2), none outside; one plate under `wgpu`.
+    let rules = quads(&ui, rule);
+    assert_eq!(rules.len(), 2);
+    assert_eq!(rules[0][1], t[1].pos.1 + 23.0 + 9.0);
+    assert_eq!(quads(&ui, plate).len(), 1);
+    // The default style keeps the old look: no plates, 17 pt text at 1.3.
+    let ui = md_ui(MarkdownStyle::default());
+    assert_eq!(texts(&ui)[0].size.1, 22.0);
+    assert!(quads(&ui, plate).is_empty());
+}
+
+#[test]
+fn placeholder_takes_its_own_color() {
+    let gray = Color::hex(0x686868);
+    let mut ui = Ui::new((), move |_: &()| {
+        vstack(text_field("", "Ask anything", |_: &mut (), _| {}).font_size(14.0).placeholder_color(gray))
+            .width(300.0)
+            .place(Align::Start, Align::Start)
+    });
+    ui.frame((400.0, 400.0));
+    assert_eq!(texts(&ui)[0].color, gray);
+}
