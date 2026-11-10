@@ -57,6 +57,9 @@ pub(crate) struct LNode {
     pub fade: bool,
     /// Children are bigger than the node right now (`.animate()` in motion): cut them.
     pub clip: bool,
+    /// Number of text views in the subtree, rows of a lazy list not counted. Text selection
+    /// numbers them in tree order, which paint (with sticky children last) cannot see.
+    pub tn: u32,
 }
 
 pub(crate) const TOGGLE: (f32, f32) = (51.0, 31.0);
@@ -318,6 +321,12 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
         node.clip = (node.size.0 - laid.0).abs() > 0.25 || (node.size.1 - laid.1).abs() > 0.25;
     }
     let (iw, ih) = ((laid.0 - pad_w).max(0.0), (laid.1 - pad_h).max(0.0));
+
+    node.tn = match &v.kind {
+        Kind::Text(_) => 1,
+        Kind::List { .. } => 0,
+        _ => node.children.iter().map(|c| c.tn).sum(),
+    };
 
     // Place children now that the final size is known.
     match &v.kind {

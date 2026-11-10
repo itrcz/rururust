@@ -14,6 +14,8 @@ use web_time::Instant;
 
 #[path = "edit.rs"]
 pub(crate) mod edit;
+#[path = "select.rs"]
+pub(crate) mod select;
 
 // ---------------------------------------------------------------- draw list
 
@@ -206,6 +208,10 @@ enum Action<S> {
     Pick(usize, Rc<dyn Fn(&mut S, usize)>),
     /// `.window_drag()` area: a press moves the window.
     DragWindow,
+    /// A `.selectable()` area, under the views inside it: a press starts a selection.
+    Select { area: u64 },
+    /// A link in rich text (`Span::link`).
+    Link(Box<select::LinkHit<S>>),
 }
 
 /// Something the UI asks of the window it lives in. The core knows nothing about windows:
@@ -217,8 +223,10 @@ pub enum WindowRequest {
     DragWindow,
     /// Zoom / maximize or restore the window (a double click on `.window_drag()`).
     Zoom,
-    /// Put this text on the system clipboard (copy / cut in a text field).
+    /// Put this text on the system clipboard (copy / cut in a text field, copy of selected text).
     SetClipboard(String),
+    /// Open this http(s) or mailto URL in the browser (a click on a link without `.on_link()`).
+    OpenUrl(String),
 }
 
 /// Keys the UI understands besides typed text.
@@ -393,6 +401,16 @@ struct Painter<'a, S> {
     spin: bool,
     /// Sizes changed during paint (lazy rows were measured): lay out again next frame.
     relayout: bool,
+    /// Selectable texts and areas on screen, for input.
+    texts: &'a mut Vec<select::TextBox>,
+    areas: &'a mut Vec<select::Area>,
+    sel: Option<select::PaintSel>,
+    /// Inherited by text views: selectable area, link handler, highlight color.
+    tctx: select::TextCtx<S>,
+    /// Number (in tree order) of the next text view; set by the parent before each child.
+    tbase: u32,
+    /// Lazy-list rows being painted, outermost first.
+    path: Vec<(u64, usize)>,
 }
 
 impl<S> Painter<'_, S> {
@@ -618,8 +636,17 @@ impl<S> Painter<'_, S> {
         self.list.cmds.push(Cmd::Quad(q));
     }
 
-    fn paint(&mut self, v: View<S>, ln: &LNode, origin: (f32, f32), mut xf: Xf, id: u64) {
+    fn paint(&mut self, v: View<S>, ln: &LNode, origin: (f32, f32), xf: Xf, id: u64) {
+        let saved = self.enter_text_ctx(&v, id);
+        self.paint_node(v, ln, origin, xf, id);
+        if let Some(t) = saved {
+            self.tctx = t;
+        }
+    }
+
+    fn paint_node(&mut self, v: View<S>, ln: &LNode, origin: (f32, f32), mut xf: Xf, id: u64) {
         let pin = self.sticky.take();
+        let tbase = std::mem::take(&mut self.tbase);
         let st = v.style;
         let r = Rect::new(origin.0 + ln.pos.0, origin.1 + ln.pos.1, ln.size.0, ln.size.1);
         xf.opacity *= st.opacity;
@@ -678,6 +705,7 @@ impl<S> Painter<'_, S> {
             xf.clip_to(sr, st.radius * xf.s);
         }
 
+        self.area_hit(&xf, id, sr);
         // Before the tap: a view that is both draggable and tappable keeps its tap.
         if st.drag {
             self.hit(&xf, id ^ 0xD6A9, sr, Action::DragWindow);
@@ -707,6 +735,8 @@ impl<S> Painter<'_, S> {
                     }
                     let rv = row(i);
                     let cid = child_id(id, i, rv.key);
+                    let saved_row = self.tctx.row;
+                    self.enter_row(id, i, count);
                     let mut lx = Lx { text: self.text, springs: self.springs, frame: self.frame, along: None };
                     let n = layout(&rv, (Some(r.w), None), &mut lx, cid);
                     if known.is_nan() || (n.size.1 - known).abs() > 0.5 {
@@ -716,7 +746,10 @@ impl<S> Painter<'_, S> {
                         }
                     }
                     let h = n.size.1;
+                    self.path.push((id, i));
                     self.paint(rv, &n, (r.x, y), xf, cid);
+                    self.path.pop();
+                    self.tctx.row = saved_row;
                     y += h;
                 }
             }
@@ -755,6 +788,7 @@ impl<S> Painter<'_, S> {
                 let body = cxf.rect(Rect::new(pos.0, pos.1, w, h));
                 self.hits.push(Hit { id: child_id(id, 1, None), rect: body, round: NO_ROUND, action: Action::Swallow });
                 let cid = child_id(id, 0, child.key);
+                self.tbase = tbase;
                 self.paint(*child, cn, pos, cxf, cid);
             }
             Kind::Image(img, template) => {
@@ -829,6 +863,7 @@ impl<S> Painter<'_, S> {
                 });
                 let mut dxf = xf;
                 dxf.clip = clip;
+                self.text_extras(&dxf, id, ln.text, &t.spans, &t.content, (inner.x, inner.y), (inner.w, inner.h), tbase);
                 self.span_decor(&dxf, ln.text, &t.spans, (inner.x, inner.y));
                 self.list.cmds.push(Cmd::Text(TextCmd {
                     key: ln.text,
@@ -843,12 +878,15 @@ impl<S> Painter<'_, S> {
             Kind::Stack { children, axis, .. } => {
                 let pin = pin.filter(|_| axis == Axis::V && children.iter().any(|c| c.style.sticky));
                 let mut stuck = Vec::new();
+                // Text numbers follow the tree, not the paint order.
+                let bases: Vec<u32> = ln.children.iter().scan(tbase, |b, n| Some(std::mem::replace(b, *b + n.tn))).collect();
                 for (i, (c, n)) in children.into_iter().zip(&ln.children).enumerate() {
                     if pin.is_some() && c.style.sticky {
                         stuck.push((i, c)); // painted last, above the rows that slide under it
                         continue;
                     }
                     let cid = child_id(id, i, c.key);
+                    self.tbase = bases[i];
                     self.paint(c, n, (r.x, r.y), xf, cid);
                 }
                 let tops: Vec<f32> = stuck.iter().map(|(i, _)| r.y + ln.children[*i].pos.1).collect();
@@ -860,6 +898,7 @@ impl<S> Painter<'_, S> {
                         y = y.min(next - n.size.1);
                     }
                     let cid = child_id(id, i, c.key);
+                    self.tbase = bases[i];
                     self.paint(c, n, (r.x, r.y + y - tops[k]), xf, cid);
                 }
             }
@@ -885,7 +924,11 @@ impl<S> Painter<'_, S> {
                 cxf.clip_to(sr, st.radius * xf.s);
                 let cid = child_id(id, 0, child.key);
                 self.sticky = Some(r.y + pad[1]);
+                self.tbase = tbase;
+                let outer = self.tctx.clone();
+                self.enter_scroll(id, sr);
                 self.paint(*child, &ln.children[0], (r.x, r.y - offset), cxf, cid);
+                self.tctx = outer;
                 self.sticky = None;
 
                 // Pull-to-refresh: the indicator lives in the gap the pull opens.
@@ -979,6 +1022,10 @@ pub struct Ui<S> {
     focus: Option<u64>,
     /// Caret, selection, undo history and IME state of the focused text field.
     ed: edit::Editor,
+    /// Selection of read-only text (`.selectable()`).
+    sel: select::SelState,
+    /// Window size of the last frame, for building the view outside a frame (copying).
+    size: (f32, f32),
     open_menu: Option<u64>,
     started: Instant,
     timers: Vec<(Instant, Box<dyn FnOnce(&mut S)>)>,
@@ -1023,6 +1070,8 @@ impl<S: 'static> Ui<S> {
             frame: 0,
             focus: None,
             ed: edit::Editor::default(),
+            sel: select::SelState::default(),
+            size: (0.0, 0.0),
             open_menu: None,
             started: Instant::now(),
             timers: Vec::new(),
@@ -1128,19 +1177,28 @@ impl<S: 'static> Ui<S> {
                 f(&mut self.state);
             }
         }
+        // A selection dragged to the edge of its scroll view scrolls it.
+        let autoscroll = self.sel_autoscroll(dt);
+        if let Some((sid, d)) = autoscroll {
+            if let Some(s) = self.scrolls.get_mut(&sid) {
+                let (lo, hi) = s.bounds();
+                s.offset = (s.offset + d).clamp(lo.min(s.offset), hi.max(s.offset));
+                s.vel = 0.0;
+                s.active_at = Some(now);
+            }
+        }
+        self.size = size;
 
-        let view = (self.view_fn)(&self.state, &Env {
-            width: size.0,
-            height: size.1,
-            titlebar: self.titlebar,
-            window_buttons: self.window_buttons,
-        });
+        let view = (self.view_fn)(&self.state, &self.env());
         let mut lx = Lx { text: &mut self.text, springs: &mut self.springs, frame: self.frame, along: None };
         let root = layout(&view, (Some(size.0), Some(size.1)), &mut lx, 1);
         self.list.cmds.clear();
         self.list.images.clear();
         self.hits.clear();
         self.zones.clear();
+        self.sel.texts.clear();
+        self.sel.areas.clear();
+        let paint_sel = self.sel.for_paint();
         let blink = self.ed.blink_at.map_or(0.0, |t| (now - t).as_secs_f32());
         let fg = if self.background.luminance() < 0.5 { Color::WHITE } else { Color::BLACK };
         let xf = Xf {
@@ -1175,6 +1233,12 @@ impl<S: 'static> Ui<S> {
             time: (now - self.started).as_secs_f32(),
             spin: false,
             relayout: false,
+            texts: &mut self.sel.texts,
+            areas: &mut self.sel.areas,
+            sel: paint_sel,
+            tctx: select::TextCtx::default(),
+            tbase: 0,
+            path: Vec::new(),
         };
         p.paint(view, &root, (0.0, 0.0), xf, 1);
         match p.menu.take() {
@@ -1182,6 +1246,12 @@ impl<S: 'static> Ui<S> {
             None => self.open_menu = None, // its picker is gone
         }
         let (paint_wake, spin, relayout) = (p.wake, p.spin, p.relayout);
+        if p.sel.is_some_and(|s| s.stale) {
+            self.sel.sel = None; // its rows are gone
+        }
+        if autoscroll.is_some() {
+            self.sel_drag(self.ptr.last); // the text under the pointer moved
+        }
         if let Some(id) = self.focus {
             if !self.hits.iter().any(|h| h.id == id) {
                 self.focus = None;
@@ -1207,6 +1277,7 @@ impl<S: 'static> Ui<S> {
             || rehover
             || spin
             || relayout
+            || autoscroll.is_some()
             || self.springs.values().any(Spring::moving)
             || self.scrolls.iter().any(|(id, s)| {
                 let resting = s.hold == if s.refreshing { REFRESH_HOLD } else { 0.0 };
@@ -1299,6 +1370,13 @@ impl<S: 'static> Ui<S> {
                 self.field_press(i, pos);
             }
         }
+        // A press anywhere else drops the selection; on an area it starts a new one. Touch
+        // only scrolls (no long-press selection yet), a link keeps it until released.
+        match hit.map(|i| &self.hits[i].action) {
+            Some(&Action::Select { area }) if !touch => self.sel_press(area, pos),
+            Some(Action::Link(_)) => {}
+            _ => self.sel.sel = None,
+        }
         true
     }
 
@@ -1370,6 +1448,12 @@ impl<S: 'static> Ui<S> {
                 if matches!(self.hits[i].action, Action::Field(_)) {
                     return self.field_drag(i, pos);
                 }
+                if matches!(self.hits[i].action, Action::Select { .. }) {
+                    return self.sel_drag(pos) || hover;
+                }
+                if matches!(self.hits[i].action, Action::Link(_)) {
+                    return self.link_to_selection(i, pos) || hover;
+                }
             }
         }
         hover
@@ -1380,6 +1464,7 @@ impl<S: 'static> Ui<S> {
         self.ptr.down = false;
         let was_dragging = std::mem::take(&mut self.ptr.dragging);
         self.ptr.drag_scroll = None;
+        self.sel_release();
         if was_dragging {
             return true; // inertia continues in frame()
         }
@@ -1406,6 +1491,10 @@ impl<S: 'static> Ui<S> {
                         f(&mut self.state, *index);
                         self.open_menu = None;
                     }
+                    Action::Link(_) => {
+                        self.sel.sel = None;
+                        self.open_link(i);
+                    }
                     _ => {}
                 }
             }
@@ -1430,11 +1519,12 @@ impl<S: 'static> Ui<S> {
     /// [`set_modifiers`](Self::set_modifiers). Returns true if it was used.
     pub fn key(&mut self, key: KeyInput) -> bool {
         match key {
-            KeyInput::Escape => self.open_menu.take().is_some() | self.blur(),
+            KeyInput::Escape => self.open_menu.take().is_some() | self.blur() | self.sel_key(key),
             KeyInput::Enter if self.open_menu.is_some() => {
                 self.open_menu = None;
                 true
             }
+            _ if self.focus.is_none() => self.sel_key(key),
             _ => self.field_key(key),
         }
     }

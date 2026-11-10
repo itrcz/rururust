@@ -398,6 +398,33 @@ extern "C" {
     fn clip_install(on_paste: &wasm_bindgen::closure::Closure<dyn FnMut(String)>, on_cut: &wasm_bindgen::closure::Closure<dyn FnMut()>);
 }
 
+/// Opens a link in the default browser / mail app. The URL comes from content (markdown), so
+/// it goes to the opener as a single argument, never through a shell.
+fn open_url(url: &str) {
+    #[cfg(target_arch = "wasm32")]
+    if let Some(w) = web_sys::window() {
+        let _ = w.open_with_url_and_target(url, "_blank");
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::process::Command;
+        let cmd = if cfg!(target_os = "macos") {
+            Some(Command::new("open").arg(url).spawn())
+        } else if cfg!(target_os = "windows") {
+            // `explorer` hands a URL to the default browser without `cmd`'s parsing of `&`.
+            Some(Command::new("explorer").arg(url).spawn())
+        } else if cfg!(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd")) {
+            Some(Command::new("xdg-open").arg(url).spawn())
+        } else {
+            None // iOS / Android: no opener without platform glue yet
+        };
+        if let Some(Ok(mut child)) = cmd {
+            // Reap it in the background so it does not linger as a zombie.
+            std::thread::spawn(move || child.wait());
+        }
+    }
+}
+
 impl<S: 'static> Runner<S> {
     /// Carries out what the UI asked of the window and keeps IME / clipboard in sync with it.
     /// Must run while a press is still being handled: AppKit starts a window move from the
@@ -425,6 +452,7 @@ impl<S: 'static> Runner<S> {
                 }
                 WindowRequest::Zoom => w.set_maximized(!w.is_maximized()),
                 WindowRequest::SetClipboard(t) => self.clipboard.set(t),
+                WindowRequest::OpenUrl(url) => open_url(&url),
             }
         }
         let ui = &self.app.ui;

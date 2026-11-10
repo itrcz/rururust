@@ -164,7 +164,7 @@ pub(crate) struct Editor {
     anchor: usize,
     /// Restarts the caret blink (set on every edit and move).
     pub(super) blink_at: Option<Instant>,
-    mods: Mods,
+    pub(super) mods: Mods,
     /// Offset of the text inside the field: x for a single line, y for several.
     scroll: (f32, f32),
     /// Scroll so the caret is visible on the next paint.
@@ -246,8 +246,12 @@ impl<S: 'static> Ui<S> {
         self.ed.mods = m;
     }
 
-    /// The text selected in the focused field, if any.
+    /// The selected text: in the focused field, or else of a `.selectable()` area as plain
+    /// text (what Cmd/Ctrl+C copies). The latter builds the view once, so call it on demand.
     pub fn selection_text(&self) -> Option<String> {
+        if self.focus.is_none() {
+            return self.feed_text();
+        }
         let h = self.field_hit()?;
         let r = self.ed.range();
         h.value.get(r).filter(|t| !t.is_empty()).map(str::to_string)
@@ -628,7 +632,7 @@ impl<S> Painter<'_, S> {
             self.text.range_rects(key_v, sel.clone(), &mut rects);
             for q in rects {
                 let q = Rect::new(origin.0 + q.x, origin.1 + q.y, q.w, q.h);
-                self.fill(&cxf, q, 3.0, Fill::Solid(ACCENT.alpha(0.3)), None);
+                self.fill(&cxf, q, 3.0, Fill::Solid(self.tctx.color), None);
             }
         }
         if f.value.is_empty() && pre.is_none() {

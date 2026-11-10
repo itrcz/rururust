@@ -115,7 +115,7 @@ impl TextSystem {
             s.text.hash(&mut h);
             (s.bold, s.italic, s.mono, s.weight, s.size.map(f32::to_bits)).hash(&mut h);
             s.color.map(|c| [c.r.to_bits(), c.g.to_bits(), c.b.to_bits(), c.a.to_bits()]).hash(&mut h);
-            (s.background.is_some(), s.icon.is_some()).hash(&mut h);
+            (s.background.is_some(), s.icon.is_some(), s.link.is_some()).hash(&mut h);
         }
         spec.size.to_bits().hash(&mut h);
         (spec.line_height.to_bits(), spec.tracking.to_bits()).hash(&mut h);
@@ -173,14 +173,17 @@ impl TextSystem {
                 if s.size.is_some() {
                     a = a.metrics(Metrics::new(size, (size * spec.line_height).round()));
                 }
-                // Plates and icons find their glyphs again by this tag.
-                if s.background.is_some() || s.icon.is_some() {
+                // Plates, icons and links find their glyphs again by this tag.
+                if s.background.is_some() || s.icon.is_some() || s.link.is_some() {
                     a = a.metadata(i + 1);
-                    let slot = |em: f32| a.clone().letter_spacing(em);
-                    if s.icon.is_some() {
-                        runs.push((SLOT, slot(1.0 + ICON_GAP)));
-                        continue;
-                    }
+                }
+                // Same runs as `shaped_text`, which byte offsets into the text refer to.
+                let slot = |em: f32| a.clone().letter_spacing(em);
+                if s.icon.is_some() {
+                    runs.push((SLOT, slot(1.0 + ICON_GAP)));
+                    continue;
+                }
+                if s.background.is_some() {
                     runs.push((SLOT, slot(PLATE_PAD)));
                     runs.push((s.text.as_str(), a.clone()));
                     runs.push((SLOT, slot(PLATE_PAD)));
@@ -188,7 +191,7 @@ impl TextSystem {
                 }
                 runs.push((s.text.as_str(), a));
             }
-            let starts = line_starts(&runs.iter().map(|r| r.0).collect::<String>());
+            let starts = line_starts(&shaped_text(spec.spans, ""));
             buffer.set_rich_text(runs, &attrs, Shaping::Advanced, align);
             starts
         };
@@ -409,6 +412,33 @@ impl TextSystem {
             self.entries.retain(|_, e| e.used + 2 >= frame);
         }
     }
+}
+
+/// The text as it is shaped: what byte offsets from `hit`, `caret` and friends index into.
+/// Rich text gets invisible slots around plates and in place of icons; [`strip_slots`]
+/// takes them out again for copying.
+pub(crate) fn shaped_text<'a>(spans: &'a [Span], text: &'a str) -> std::borrow::Cow<'a, str> {
+    if spans.is_empty() {
+        return text.into();
+    }
+    let mut out = String::new();
+    for s in spans {
+        if s.icon.is_some() {
+            out.push_str(SLOT);
+        } else if s.background.is_some() {
+            out.push_str(SLOT);
+            out.push_str(&s.text);
+            out.push_str(SLOT);
+        } else {
+            out.push_str(&s.text);
+        }
+    }
+    out.into()
+}
+
+/// `text` without the invisible slots of [`shaped_text`].
+pub(crate) fn strip_slots(text: &str) -> String {
+    text.replace(SLOT, "")
 }
 
 /// Byte offsets where the lines of `text` start, split the way cosmic-text splits them.

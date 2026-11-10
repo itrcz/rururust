@@ -164,6 +164,14 @@ pub(crate) struct Style {
     pub cursor: Option<Cursor>,
     /// Share of the free space along the parent stack's axis (`.flex()`); 0 = not set.
     pub flex: f32,
+    /// Text inside can be selected and copied (`.selectable()`).
+    pub select: bool,
+    /// Highlight of selected text in this subtree (`.selection_color()`).
+    pub sel_color: Option<Color>,
+    /// Copied instead of the subtree's text (`.copy_as()`).
+    pub copy_as: Option<String>,
+    /// Put between the children's texts when copying (`.copy_sep()`).
+    pub copy_sep: Option<&'static str>,
 }
 
 impl Default for Style {
@@ -189,6 +197,10 @@ impl Default for Style {
             hover: None,
             cursor: None,
             flex: 0.0,
+            select: false,
+            sel_color: None,
+            copy_as: None,
+            copy_sep: None,
         }
     }
 }
@@ -210,6 +222,8 @@ pub struct Span {
     pub background: Option<Color>,
     /// A picture shown in the line instead of text; see [`Span::icon`].
     pub icon: Option<Image>,
+    /// Where the run links to; see [`Span::link`].
+    pub link: Option<String>,
 }
 
 impl Span {
@@ -253,6 +267,14 @@ impl Span {
     /// in the run's color (like [`icon`]): `Span::icon(&github).color(link)`, then the link text.
     pub fn icon(img: &Image) -> Self {
         Span { icon: Some(img.clone()), ..Default::default() }
+    }
+    /// Makes the run a link: the pointer turns into a hand over it, it is underlined while
+    /// hovered, and a click calls the nearest [`View::on_link`] above it, or, without one,
+    /// asks the runner to open the URL ([`WindowRequest::OpenUrl`](crate::WindowRequest::OpenUrl),
+    /// http(s) and mailto only). Give it a color yourself: `Span::new("docs").link(url).color(blue)`.
+    pub fn link(mut self, url: impl Into<String>) -> Self {
+        self.link = Some(url.into());
+        self
     }
 }
 
@@ -460,12 +482,13 @@ pub struct View<S> {
     pub(crate) kind: Kind<S>,
     pub(crate) style: Style,
     pub(crate) on_tap: Option<Box<dyn Fn(&mut S)>>,
+    pub(crate) on_link: Option<Rc<dyn Fn(&mut S, &str)>>,
     pub(crate) key: Option<u64>,
 }
 
 impl<S> View<S> {
     fn new(kind: Kind<S>) -> Self {
-        View { kind, style: Style::default(), on_tap: None, key: None }
+        View { kind, style: Style::default(), on_tap: None, on_link: None, key: None }
     }
 
     // ---- layout ----
@@ -743,6 +766,46 @@ impl<S> View<S> {
     /// ```
     pub fn window_drag(mut self) -> Self {
         self.style.drag = true;
+        self
+    }
+    /// Text inside can be selected with the mouse (drag, double click for a word, triple for
+    /// a paragraph, Shift+click to extend) and copied with Cmd/Ctrl+C as plain text; Cmd/Ctrl+A
+    /// selects all of it. One selection spans every text in the subtree, across the rows of a
+    /// lazy `list` too (rows off screen are built only when copying). Put it on the list of a
+    /// chat or on any container; nested `.selectable()` inside one does nothing. `markdown()`
+    /// is selectable by itself.
+    ///
+    /// ```ignore
+    /// scroll(list(n, 80.0, move |i| bubble(markdown(&msgs[i]))).selectable())
+    /// ```
+    pub fn selectable(mut self) -> Self {
+        self.style.select = true;
+        self
+    }
+    /// Color of the selection highlight under selected text, here and in text fields of the
+    /// subtree. Default: system blue at 30 %. On a dark theme with a blue accent try
+    /// `Color::WHITE.alpha(0.22)`; set it once on the root.
+    pub fn selection_color(mut self, c: Color) -> Self {
+        self.style.sel_color = Some(c);
+        self
+    }
+    /// What copying puts in place of this subtree's text when any of it is selected: a list
+    /// marker `"- "` for a bullet drawn as `•`, a description of a picture, or `""` to leave
+    /// it out.
+    pub fn copy_as(mut self, s: impl Into<String>) -> Self {
+        self.style.copy_as = Some(s.into());
+        self
+    }
+    /// What copying puts between the texts of this stack's children (default: a line break
+    /// in a `vstack`, a space in an `hstack`, an empty line between rows of a `list`).
+    pub fn copy_sep(mut self, s: &'static str) -> Self {
+        self.style.copy_sep = Some(s);
+        self
+    }
+    /// Handles clicks on links ([`Span::link`]) anywhere inside: `.on_link(|s, url| s.open(url))`.
+    /// Without it a click asks the runner to open http(s) and mailto links in the browser.
+    pub fn on_link(mut self, f: impl Fn(&mut S, &str) + 'static) -> Self {
+        self.on_link = Some(Rc::new(f));
         self
     }
     /// Stable identity for animation/scroll state when siblings are reordered.

@@ -1190,3 +1190,166 @@ fn placeholder_takes_its_own_color() {
     ui.frame((400.0, 400.0));
     assert_eq!(texts(&ui)[0].color, gray);
 }
+
+// ---- text selection (docs/decisions/002-text-selection.md)
+
+const SEL: Color = Color::BLUE.alpha(0.3);
+
+/// Text commands with their content position: `(x, y, w, h)` on screen, in paint order.
+fn text_rects(ui: &Ui<impl Sized>) -> Vec<(f32, f32, f32, f32)> {
+    texts(ui).iter().map(|t| (t.pos.0, t.pos.1, t.size.0, t.size.1)).collect()
+}
+
+fn drag(ui: &mut Ui<impl Sized + 'static>, from: (f32, f32), to: (f32, f32)) {
+    ui.pointer_down(from, false);
+    ui.pointer_move(((from.0 + to.0) * 0.5, (from.1 + to.1) * 0.5));
+    ui.pointer_move(to);
+    ui.pointer_up(to);
+}
+
+fn click(ui: &mut Ui<impl Sized + 'static>, at: (f32, f32)) {
+    ui.pointer_down(at, false);
+    ui.pointer_up(at);
+}
+
+fn clipboard(ui: &mut Ui<impl Sized + 'static>) -> Option<String> {
+    ui.requests.clear();
+    ui.key(KeyInput::Copy);
+    ui.requests.iter().find_map(|r| match r {
+        ruru::WindowRequest::SetClipboard(t) => Some(t.clone()),
+        _ => None,
+    })
+}
+
+#[test]
+fn selectable_text_drags_double_and_triple_clicks_and_shift_extends() {
+    let mut ui = Ui::new((), |_: &()| {
+        vstack((text("Привет, дорогой мир\nвторая строка"), button("ok", |_: &mut ()| {})))
+            .selectable()
+            .place(Align::Start, Align::Start)
+    });
+    ui.frame((400.0, 300.0));
+    let (x, y, w, h) = text_rects(&ui)[0];
+    let row1 = y + h * 0.25;
+    // Drag from the start past the end of the first row: the whole first paragraph.
+    drag(&mut ui, (x + 1.0, row1), (x + w + 30.0, row1));
+    assert_eq!(ui.selection_text().as_deref(), Some("Привет, дорогой мир"));
+    ui.frame((400.0, 300.0));
+    assert!(!quads(&ui, SEL).is_empty(), "highlight painted");
+    // A plain click drops it.
+    click(&mut ui, (x + 5.0, row1));
+    assert_eq!(ui.selection_text(), None);
+    ui.frame((400.0, 300.0));
+    assert!(quads(&ui, SEL).is_empty());
+    // Double click: a word; triple: the paragraph.
+    let word = (x + w * 0.45, row1);
+    click(&mut ui, word);
+    click(&mut ui, word);
+    assert_eq!(ui.selection_text().as_deref(), Some("дорогой"));
+    click(&mut ui, word);
+    assert_eq!(ui.selection_text().as_deref(), Some("Привет, дорогой мир"));
+    // Shift+click extends from the anchor into the second paragraph.
+    std::thread::sleep(std::time::Duration::from_millis(450)); // not a fourth click
+    click(&mut ui, (x + 1.0, row1));
+    ui.set_modifiers(ruru::Mods { shift: true, ..Default::default() });
+    click(&mut ui, (x + w - 2.0, y + h * 0.75)); // past the end of the shorter second row
+    ui.set_modifiers(ruru::Mods::default());
+    assert_eq!(ui.selection_text().as_deref(), Some("Привет, дорогой мир\nвторая строка"));
+    assert_eq!(clipboard(&mut ui).as_deref(), Some("Привет, дорогой мир\nвторая строка"));
+    // Escape clears; a button inside the area still works (it is above the area).
+    assert!(ui.key(KeyInput::Escape));
+    assert_eq!(ui.selection_text(), None);
+    // The pointer over the text is an I-beam.
+    ui.pointer_move((x + 5.0, row1));
+    assert_eq!(ui.cursor, Cursor::Text);
+}
+
+#[test]
+fn selection_spans_texts_with_separators_copy_as_and_sticky_order() {
+    let mut ui = Ui::new((), |_: &()| {
+        vstack((
+            text("Title"),
+            hstack((text("•").copy_as("- "), text("item"))).copy_sep(""),
+            hstack((text("a"), text("b"))),
+            image(&Image::from_rgba(1, 1, vec![255; 4])).size(10.0, 10.0).copy_as("[img]"),
+            text("hidden").copy_as(""),
+            text("end"),
+        ))
+        .selectable()
+        .place(Align::Start, Align::Start)
+    });
+    ui.frame((400.0, 400.0));
+    assert!(ui.key(KeyInput::SelectAll));
+    assert_eq!(clipboard(&mut ui).as_deref(), Some("Title\n- item\na b\n[img]\nend"));
+    // Part of it: from inside "Title" into "item" takes the marker whole.
+    let r = text_rects(&ui);
+    drag(&mut ui, (r[0].0 + r[0].2 * 0.5, r[0].1 + 5.0), (r[2].0 + r[2].2 - 1.0, r[2].1 + 5.0));
+    let t = ui.selection_text().unwrap();
+    assert!(t.ends_with("\n- item") && t.len() < "Title\n- item".len(), "{t:?}");
+
+    // Sticky headers are painted last but numbered in tree order.
+    let mut ui = Ui::new((), |_: &()| {
+        scroll(vstack((text("Header").sticky(), text("one"), text("two"))).selectable()).height(300.0)
+    });
+    ui.frame((300.0, 300.0));
+    let r = text_rects(&ui);
+    let (header, two) = (r.iter().find(|t| t.1 < 5.0).unwrap(), r.iter().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap());
+    drag(&mut ui, (header.0 + 1.0, header.1 + 5.0), (two.0 + two.2 + 20.0, two.1 + 5.0));
+    assert_eq!(ui.selection_text().as_deref(), Some("Header\none\ntwo"));
+}
+
+#[test]
+fn selection_runs_across_lazy_rows_and_copies_rows_off_screen() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let built = Rc::new(Cell::new(0usize));
+    let counter = built.clone();
+    let mut ui = Ui::new((), move |_: &()| {
+        let counter = counter.clone();
+        scroll(
+            list(1000, 40.0, move |i| {
+                counter.set(counter.get() + 1);
+                text(format!("row {i}")).height(40.0)
+            })
+            .selectable(),
+        )
+    });
+    let size = (300.0, 400.0);
+    ui.frame(size);
+    ui.frame(size);
+    let per_frame = {
+        let b = built.get();
+        ui.frame(size);
+        built.get() - b
+    };
+    // Drag from row 0 to row 2.
+    drag(&mut ui, (2.0, 15.0), (200.0, 95.0));
+    assert_eq!(ui.selection_text().as_deref(), Some("row 0\n\nrow 1\n\nrow 2"));
+    // A selection costs no rows off screen in a normal frame.
+    let b = built.get();
+    ui.frame(size);
+    assert_eq!(built.get() - b, per_frame);
+    assert!(!quads(&ui, SEL).is_empty());
+    // Scroll far away (the anchor goes off screen) and Shift+click: the selection grows.
+    for _ in 0..10 {
+        ui.wheel((150.0, 200.0), -200.0, ruru::WheelPhase::Line);
+    }
+    ui.frame(size);
+    let r = text_rects(&ui);
+    let far = r.iter().find(|t| t.1 > 100.0).unwrap();
+    ui.set_modifiers(ruru::Mods { shift: true, ..Default::default() });
+    click(&mut ui, (far.0 + far.2 + 10.0, far.1 + 5.0));
+    ui.set_modifiers(ruru::Mods::default());
+    let t = ui.selection_text().unwrap();
+    assert!(t.starts_with("row 0\n\nrow 1") && t.matches("\n\n").count() > 40, "{}", &t[t.len() - 20..]);
+    // Cmd+A, Cmd+C: every row, each built once for the copy.
+    ui.key(KeyInput::SelectAll);
+    let b = built.get();
+    let all = clipboard(&mut ui).unwrap();
+    assert_eq!(built.get() - b, 1000);
+    assert!(all.starts_with("row 0\n\nrow 1\n\n") && all.ends_with("row 998\n\nrow 999"));
+    // A typed-into field takes the focus and the selection goes.
+    let b = built.get();
+    ui.frame(size);
+    assert_eq!(built.get() - b, per_frame, "select-all builds nothing extra while painting");
+}
