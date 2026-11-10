@@ -89,6 +89,38 @@ impl TextSystem {
         }
     }
 
+    /// X offset of the caret placed before byte `index` of a single-line text.
+    pub(crate) fn caret_x(&self, key: u64, index: usize) -> f32 {
+        let mut x = 0.0;
+        if let Some(e) = self.entries.get(&key) {
+            for run in e.buffer.layout_runs() {
+                for g in run.glyphs.iter() {
+                    if g.start >= index {
+                        return g.x;
+                    }
+                    x = g.x + g.w;
+                }
+            }
+        }
+        x
+    }
+
+    /// Byte index of the caret position closest to `x` in a single-line text.
+    pub(crate) fn index_at(&self, key: u64, x: f32) -> usize {
+        let mut end = 0;
+        if let Some(e) = self.entries.get(&key) {
+            for run in e.buffer.layout_runs() {
+                for g in run.glyphs.iter() {
+                    if x < g.x + g.w * 0.5 {
+                        return g.start;
+                    }
+                    end = g.end;
+                }
+            }
+        }
+        end
+    }
+
     pub(crate) fn end_frame(&mut self) {
         self.frame += 1;
         if self.entries.len() > 512 {

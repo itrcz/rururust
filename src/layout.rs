@@ -14,10 +14,14 @@ pub(crate) struct LNode {
     pub text: u64,
     /// Content height (Scroll nodes only).
     pub content_h: f32,
+    /// Shaped labels with their sizes (Tabs nodes only).
+    pub texts: Vec<(u64, (f32, f32))>,
 }
 
 pub(crate) const TOGGLE: (f32, f32) = (51.0, 31.0);
 pub(crate) const SLIDER_H: f32 = 28.0;
+pub(crate) const FIELD_FONT: f32 = 17.0;
+pub(crate) const TABS_PAD: f32 = 6.0;
 
 fn fills_main<S>(v: &View<S>, axis: Axis) -> bool {
     if matches!(v.kind, Kind::Spacer) {
@@ -54,6 +58,39 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), ts: &mut 
             let (key, size) = ts.measure(&spec, inner.0);
             node.text = key;
             size
+        }
+        Kind::Image(img) => {
+            let (nw, nh) = (img.0.width as f32, img.0.height.max(1) as f32);
+            let w = match st.width {
+                Dim::Auto => inner.0.map_or(nw, |p| p.min(nw)),
+                _ => inner.0.unwrap_or(nw),
+            };
+            let h = match st.height {
+                Dim::Auto => w * nh / nw.max(1.0),
+                _ => inner.1.unwrap_or(w * nh / nw.max(1.0)),
+            };
+            (w, h)
+        }
+        Kind::TextField { value, placeholder, .. } => {
+            let shown = if value.is_empty() { placeholder } else { value };
+            let (key, size) = ts.measure(&TextSpec { text: shown, size: FIELD_FONT, weight: 400, center: false }, None);
+            node.text = key;
+            (inner.0.unwrap_or(220.0), size.1)
+        }
+        Kind::Picker { options, selected, .. } => {
+            let label = options.get(*selected).map_or("", |s| s.as_str());
+            let (key, size) = ts.measure(&TextSpec { text: label, size: FIELD_FONT, weight: 400, center: false }, None);
+            node.text = key;
+            (size.0 + 26.0, size.1)
+        }
+        Kind::Tabs { labels, .. } => {
+            let mut widest = 0.0f32;
+            for l in labels {
+                let m = ts.measure(&TextSpec { text: l, size: 15.0, weight: 600, center: false }, None);
+                widest = widest.max(m.1 .0);
+                node.texts.push(m);
+            }
+            ((widest + 40.0) * labels.len() as f32 + 2.0 * TABS_PAD, 56.0)
         }
         Kind::Toggle(..) => TOGGLE,
         Kind::Slider(..) => (inner.0.unwrap_or(200.0), SLIDER_H),

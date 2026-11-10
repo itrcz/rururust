@@ -37,15 +37,15 @@ pub use app::App;
 pub use render::Renderer;
 pub use text::TextSystem;
 pub use types::{Color, Rect};
-pub use ui::{DrawList, Ui};
+pub use ui::{DrawList, KeyInput, Ui};
 pub use view::{
-    button, hstack, rect, scroll, slider, spacer, text, toggle, vstack, zstack, Align, Children, Dim, Fill, Glass,
-    Shadow, View, Weight,
+    button, hstack, image, picker, rect, scroll, slider, spacer, tab_bar, text, text_field, toggle, vstack, zstack,
+    Align, Children, Dim, Fill, Glass, Image, Shadow, View, Weight,
 };
 
 pub mod prelude {
     pub use crate::{
-        button, hstack, rect, scroll, slider, spacer, text, toggle, vstack, zstack, Align, App, Color, Fill, Glass,
-        View, Weight,
+        button, hstack, image, picker, rect, scroll, slider, spacer, tab_bar, text, text_field, toggle, vstack,
+        zstack, Align, App, Color, Fill, Glass, Image, View, Weight,
     };
 }

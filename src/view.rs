@@ -5,6 +5,9 @@
 
 use crate::types::Color;
 use std::hash::{Hash, Hasher};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Dim {
@@ -102,6 +105,21 @@ impl Glass {
     }
 }
 
+impl Glass {
+    /// Scales the whole effect: 0 is an invisible pane, 1 leaves the material as it is,
+    /// larger values make it frostier and more opaque.
+    pub fn strength(mut self, k: f32) -> Self {
+        let k = k.max(0.0);
+        self.frost *= k * k;
+        self.refraction = (self.refraction * k).min(1.0);
+        self.dispersion = (self.dispersion * k).min(1.0);
+        self.rim = (self.rim * k).min(1.0);
+        self.saturation = 1.0 + (self.saturation - 1.0) * k;
+        self.tint.a = (self.tint.a * k).min(1.0);
+        self
+    }
+}
+
 impl Default for Glass {
     fn default() -> Self {
         Self::regular()
@@ -148,7 +166,51 @@ pub(crate) struct TextData {
     pub center: bool,
 }
 
+/// Decoded picture, cheap to clone. Create it once (not inside `view`) and keep it in
+/// your state or a static.
+#[derive(Clone)]
+pub struct Image(pub(crate) Arc<ImageData>);
+
+pub(crate) struct ImageData {
+    pub id: u64,
+    pub width: u32,
+    pub height: u32,
+    /// RGBA8, premultiplied alpha.
+    pub pixels: Vec<u8>,
+}
+
+impl Image {
+    /// From straight-alpha RGBA8 pixels, row by row.
+    pub fn from_rgba(width: u32, height: u32, mut pixels: Vec<u8>) -> Image {
+        assert_eq!(pixels.len(), (width * height * 4) as usize, "pixel buffer size");
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        for px in pixels.chunks_exact_mut(4) {
+            let a = px[3] as u16;
+            if a < 255 {
+                for c in &mut px[..3] {
+                    *c = ((*c as u16 * a + 127) / 255) as u8;
+                }
+            }
+        }
+        Image(Arc::new(ImageData { id: NEXT.fetch_add(1, Ordering::Relaxed), width, height, pixels }))
+    }
+
+    /// Decodes a PNG or JPEG file, e.g. `Image::decode(include_bytes!("photo.jpg"))`.
+    pub fn decode(bytes: &[u8]) -> Result<Image, String> {
+        let img = image::load_from_memory(bytes).map_err(|e| e.to_string())?.into_rgba8();
+        Ok(Image::from_rgba(img.width(), img.height(), img.into_raw()))
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        (self.0.width, self.0.height)
+    }
+}
+
 pub(crate) enum Kind<S> {
+    Image(Image),
+    TextField { value: String, placeholder: String, on_change: Box<dyn Fn(&mut S, String)> },
+    Picker { options: Vec<String>, selected: usize, on_select: Rc<dyn Fn(&mut S, usize)> },
+    Tabs { labels: Vec<String>, selected: usize, on_select: Box<dyn Fn(&mut S, usize)> },
     Empty,
     Spacer,
     Stack { axis: Axis, spacing: f32, align: Align, children: Vec<View<S>> },
@@ -387,12 +449,48 @@ pub fn scroll<S>(child: View<S>) -> View<S> {
     View::new(Kind::Scroll(Box::new(child))).fill()
 }
 pub fn button<S>(label: impl Into<String>, on_tap: impl Fn(&mut S) + 'static) -> View<S> {
-    hstack(text(label).weight(Weight::Semibold))
+    zstack(text(label).weight(Weight::Semibold))
         .padding_xy(20.0, 13.0)
         .background(Color::BLUE)
         .color(Color::WHITE)
         .radius(14.0)
         .on_tap(on_tap)
+}
+/// A picture. It keeps its aspect ratio; when both sides are set it fills the box and
+/// crops the overflow. Combine with `.radius()` for rounded corners.
+pub fn image<S>(img: &Image) -> View<S> {
+    View::new(Kind::Image(img.clone()))
+}
+/// Single-line text input. Fills the available width.
+pub fn text_field<S>(
+    value: impl Into<String>,
+    placeholder: impl Into<String>,
+    on_change: impl Fn(&mut S, String) + 'static,
+) -> View<S> {
+    View::new(Kind::TextField { value: value.into(), placeholder: placeholder.into(), on_change: Box::new(on_change) })
+        .padding_xy(14.0, 12.0)
+        .background(Color::rgba(0.47, 0.47, 0.5, 0.24))
+        .radius(12.0)
+}
+/// Drop-down choice: shows the selected option and opens a glass menu with all of them.
+pub fn picker<S, T: AsRef<str>>(options: &[T], selected: usize, on_select: impl Fn(&mut S, usize) + 'static) -> View<S> {
+    let options: Vec<String> = options.iter().map(|o| o.as_ref().to_string()).collect();
+    let selected = selected.min(options.len().saturating_sub(1));
+    View::new(Kind::Picker { options, selected, on_select: Rc::new(on_select) })
+        .padding_xy(14.0, 10.0)
+        .background(Color::rgba(0.47, 0.47, 0.5, 0.24))
+        .radius(12.0)
+}
+/// Floating glass tab bar. A glass "drop" marks the selected tab: it flows to a tab when
+/// you tap it, and while held it swells past the bar and can be dragged across the tabs,
+/// bending everything underneath like a lens.
+pub fn tab_bar<S, T: AsRef<str>>(labels: &[T], selected: usize, on_select: impl Fn(&mut S, usize) + 'static) -> View<S> {
+    let labels: Vec<String> = labels.iter().map(|l| l.as_ref().to_string()).collect();
+    let selected = selected.min(labels.len().saturating_sub(1));
+    View::new(Kind::Tabs { labels, selected, on_select: Box::new(on_select) })
+        .glass()
+        .radius(28.0)
+        .shadow(Color::BLACK.alpha(0.35), 30.0, 10.0)
 }
 /// iOS-style switch.
 pub fn toggle<S>(on: bool, on_change: impl Fn(&mut S, bool) + 'static) -> View<S> {

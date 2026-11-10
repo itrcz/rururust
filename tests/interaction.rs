@@ -60,3 +60,116 @@ fn press_animates_then_settles() {
     ui.frame((400.0, 400.0));
     assert!(ui.animating);
 }
+
+struct Form {
+    name: String,
+    city: usize,
+}
+
+fn form() -> Ui<Form> {
+    let mut ui = Ui::new(Form { name: String::new(), city: 0 }, |s: &Form| {
+        zstack(
+            vstack((
+                text_field(s.name.as_str(), "Name", |s: &mut Form, v| s.name = v).width(300.0),
+                picker(&["One", "Two", "Three"], s.city, |s: &mut Form, i| s.city = i).width(300.0),
+            ))
+            .align(Align::Start)
+            .place(Align::Start, Align::Start),
+        )
+        .fill()
+    });
+    ui.frame((400.0, 600.0));
+    ui
+}
+
+#[test]
+fn typing_needs_focus_and_edits_at_the_caret() {
+    use ruru::KeyInput::*;
+    let mut ui = form();
+    assert!(!ui.text_input("x"), "nothing is focused yet");
+    ui.pointer_down((150.0, 20.0), false);
+    ui.pointer_up((150.0, 20.0));
+    assert!(ui.has_focus());
+    // Several keys before the next frame must all land.
+    ui.text_input("H");
+    ui.text_input("i");
+    ui.text_input("й");
+    assert_eq!(ui.state.name, "Hiй");
+    ui.frame((400.0, 600.0));
+    ui.key(Backspace);
+    assert_eq!(ui.state.name, "Hi");
+    ui.key(Home);
+    ui.text_input(">");
+    ui.key(Delete);
+    assert_eq!(ui.state.name, ">i");
+    ui.key(End);
+    ui.key(Left);
+    ui.text_input("-");
+    assert_eq!(ui.state.name, ">-i");
+    ui.key(Escape);
+    assert!(!ui.has_focus());
+    // Clicking elsewhere also drops focus.
+    ui.pointer_down((150.0, 20.0), false);
+    ui.pointer_up((150.0, 20.0));
+    ui.pointer_down((350.0, 500.0), false);
+    assert!(!ui.has_focus());
+}
+
+#[test]
+fn clicking_inside_text_places_the_caret() {
+    let mut ui = form();
+    ui.state.name = "abcdef".into();
+    ui.frame((400.0, 600.0));
+    ui.pointer_down((15.0, 20.0), false); // left edge of the text
+    ui.pointer_up((15.0, 20.0));
+    ui.text_input("_");
+    assert_eq!(ui.state.name, "_abcdef");
+}
+
+#[test]
+fn picker_opens_a_menu_and_selects() {
+    let mut ui = form();
+    let picker = (150.0, 68.0);
+    ui.pointer_down(picker, false);
+    ui.pointer_up(picker);
+    ui.frame((400.0, 600.0)); // menu appears below the picker
+    let second_row = (150.0, 68.0 + 21.0 + 6.0 + 6.0 + 44.0 * 1.5);
+    ui.pointer_down(second_row, false);
+    ui.pointer_up(second_row);
+    assert_eq!(ui.state.city, 1);
+    // Open again and click outside: closes without changing the choice.
+    ui.frame((400.0, 600.0));
+    ui.pointer_down(picker, false);
+    ui.pointer_up(picker);
+    ui.frame((400.0, 600.0));
+    ui.pointer_down((390.0, 590.0), false);
+    ui.pointer_up((390.0, 590.0));
+    ui.frame((400.0, 600.0));
+    ui.pointer_down(second_row, false);
+    ui.pointer_up(second_row);
+    assert_eq!(ui.state.city, 1);
+}
+
+#[test]
+fn tab_drop_selects_on_tap_and_on_drag_release() {
+    struct T {
+        tab: usize,
+    }
+    let mut ui = Ui::new(T { tab: 0 }, |s: &T| {
+        zstack(tab_bar(&["One", "Two", "Three"], s.tab, |s: &mut T, i| s.tab = i).place(Align::Start, Align::Start)).fill()
+    });
+    ui.frame((400.0, 200.0));
+    // Three equal tabs: the bar is 6 pt of padding + 3 tabs + 6 pt.
+    let tab_w = 40.0 + 44.0; // rough; only the ordering of the taps matters below
+    ui.pointer_down((6.0 + tab_w * 2.5, 28.0), false);
+    ui.pointer_up((6.0 + tab_w * 2.5, 28.0));
+    assert_eq!(ui.state.tab, 2);
+    // Grab the drop, drag it left and let go below the bar: the tab under it wins.
+    ui.frame((400.0, 200.0));
+    ui.pointer_down((6.0 + tab_w * 2.5, 28.0), false);
+    ui.pointer_move((10.0, 150.0));
+    ui.frame((400.0, 200.0));
+    assert!(ui.animating, "the drop is moving");
+    ui.pointer_up((10.0, 150.0));
+    assert_eq!(ui.state.tab, 0);
+}

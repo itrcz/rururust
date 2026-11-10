@@ -6,7 +6,9 @@
 
 use crate::text::TextSystem;
 use crate::types::{Color, Rect};
-use crate::ui::{Cmd, DrawList, Quad, TextCmd, KIND_GLASS};
+use crate::ui::{Cmd, DrawList, Quad, TextCmd, KIND_GLASS, KIND_IMAGE};
+use crate::view::Image;
+use std::collections::HashMap;
 use glyphon::{Cache, ColorMode, Resolution, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport};
 use std::ops::Range;
 use wgpu::util::DeviceExt;
@@ -27,6 +29,8 @@ struct Batch<'a> {
     only_glass: bool,
     glass_rects: Vec<Rect>,
     texts: Vec<&'a TextCmd>,
+    /// The one picture this batch's image quads sample (index into `DrawList::images`).
+    image: Option<usize>,
 }
 
 struct Level {
@@ -64,6 +68,11 @@ pub struct Renderer {
     atlas: TextAtlas,
     text_renderers: Vec<TextRenderer>,
     scratch: Vec<Quad>,
+    image_layout: wgpu::BindGroupLayout,
+    image_none: wgpu::BindGroup,
+    /// Uploaded pictures by id, with the frame they were last drawn in.
+    images: HashMap<u64, (wgpu::BindGroup, u64)>,
+    frame: u64,
 }
 
 fn tex_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -100,6 +109,7 @@ impl Renderer {
             label: Some("ruru linear"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
 
@@ -122,10 +132,14 @@ impl Renderer {
                 sampler_entry(3),
             ],
         });
+        let image_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ruru image"),
+            entries: &[tex_entry(0)],
+        });
         let quad_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/quad.wgsl"));
         let quad_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("ruru quad"),
-            bind_group_layouts: &[Some(&quad_layout)],
+            bind_group_layouts: &[Some(&quad_layout), Some(&image_layout)],
             immediate_size: 0,
         });
         let attrs = wgpu::vertex_attr_array![
@@ -220,6 +234,12 @@ impl Renderer {
         let dummy_view = dummy.create_view(&Default::default());
         let quad_bind_plain = Self::quad_bind(&device, &quad_layout, &globals, &dummy_view, &dummy_view, &sampler);
 
+        let image_none = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ruru no image"),
+            layout: &image_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&dummy_view) }],
+        });
+
         let instance_cap = 256;
         let instances = Self::instance_buffer(&device, instance_cap);
 
@@ -248,7 +268,69 @@ impl Renderer {
             atlas,
             text_renderers: Vec::new(),
             scratch: Vec::new(),
+            image_layout,
+            image_none,
+            images: HashMap::new(),
+            frame: 0,
         }
+    }
+
+    /// Uploads a picture with a full mip chain (box filter) the first time it is drawn.
+    fn upload_image(&mut self, img: &Image) {
+        let frame = self.frame;
+        if let Some(e) = self.images.get_mut(&img.0.id) {
+            e.1 = frame;
+            return;
+        }
+        let (w, h) = (img.0.width.max(1), img.0.height.max(1));
+        let mips = 32 - w.max(h).leading_zeros();
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ruru image"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: mips,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let (mut mw, mut mh) = (w, h);
+        let mut level: Vec<u8> = img.0.pixels.clone();
+        for mip in 0..mips {
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: mip,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &level,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(mw * 4), rows_per_image: None },
+                wgpu::Extent3d { width: mw, height: mh, depth_or_array_layers: 1 },
+            );
+            let (nw, nh) = ((mw / 2).max(1), (mh / 2).max(1));
+            let mut next = vec![0u8; (nw * nh * 4) as usize];
+            for y in 0..nh {
+                for x in 0..nw {
+                    let (x0, y0) = ((x * 2).min(mw - 1), (y * 2).min(mh - 1));
+                    let (x1, y1) = ((x0 + 1).min(mw - 1), (y0 + 1).min(mh - 1));
+                    for c in 0..4 {
+                        let at = |px: u32, py: u32| level[((py * mw + px) * 4 + c) as usize] as u32;
+                        next[((y * nw + x) * 4 + c) as usize] =
+                            ((at(x0, y0) + at(x1, y0) + at(x0, y1) + at(x1, y1) + 2) / 4) as u8;
+                    }
+                }
+            }
+            level = next;
+            (mw, mh) = (nw, nh);
+        }
+        let view = texture.create_view(&Default::default());
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ruru image"),
+            layout: &self.image_layout,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }],
+        });
+        self.images.insert(img.0.id, (bind, frame));
     }
 
     fn instance_buffer(device: &wgpu::Device, cap: usize) -> wgpu::Buffer {
@@ -382,6 +464,7 @@ impl Renderer {
             only_glass: backdrop,
             glass_rects: Vec::new(),
             texts: Vec::new(),
+            image: None,
         };
         let mut batches: Vec<Batch> = vec![new_batch(false, 0)];
         for cmd in &list.cmds {
@@ -402,10 +485,18 @@ impl Renderer {
                         let grown = r.inflate(q.p0[2] * 3.0 + 1.0);
                         let over_text =
                             cur.texts.iter().any(|t| Rect::new(t.pos.0, t.pos.1, t.size.0, t.size.1).intersects(&grown));
-                        if over_text {
+                        // One picture per draw call: a different one starts a new batch.
+                        let picture = (q.p0[3] == KIND_IMAGE).then_some(q.c1[0] as usize);
+                        let id = |i: usize| list.images.get(i).map(|m| m.0.id);
+                        let other_image = matches!((picture, cur.image), (Some(a), Some(b)) if id(a) != id(b));
+                        if over_text || other_image {
                             batches.push(new_batch(false, n));
                         }
-                        batches.last_mut().unwrap().only_glass = false;
+                        let cur = batches.last_mut().unwrap();
+                        cur.only_glass = false;
+                        if picture.is_some() {
+                            cur.image = picture;
+                        }
                     }
                     quads.push(*q);
                     batches.last_mut().unwrap().quads.end = n + 1;
@@ -419,6 +510,16 @@ impl Renderer {
         let has_glass = batches.iter().any(|b| b.backdrop);
 
         // ---- 2. upload
+        self.frame += 1;
+        for b in &batches {
+            if let Some(img) = b.image.and_then(|i| list.images.get(i)) {
+                self.upload_image(img);
+            }
+        }
+        if self.images.len() > 64 {
+            let frame = self.frame;
+            self.images.retain(|_, e| e.1 + 600 > frame);
+        }
         
         if quads.len() > self.instance_cap {
             self.instance_cap = quads.len().next_power_of_two();
@@ -446,7 +547,10 @@ impl Renderer {
                     buffer: &e.buffer,
                     left: t.pos.0 * scale,
                     top: t.pos.1 * scale,
-                    scale: t.scale * scale,
+                    // Animated scale is snapped to 1/16 steps: otherwise every frame of a
+                    // press or menu animation rasterizes each glyph at a brand-new size and
+                    // floods the glyph atlas.
+                    scale: (t.scale * 16.0).round() / 16.0 * scale,
                     bounds: TextBounds {
                         left: (t.clip.x * scale).floor() as i32,
                         top: (t.clip.y * scale).floor() as i32,
@@ -499,6 +603,8 @@ impl Renderer {
                     if !b.quads.is_empty() {
                         pass.set_pipeline(&self.quad_pipeline);
                         pass.set_bind_group(0, bind, &[]);
+                        let picture = b.image.and_then(|i| list.images.get(i)).and_then(|m| self.images.get(&m.0.id));
+                        pass.set_bind_group(1, picture.map_or(&self.image_none, |e| &e.0), &[]);
                         pass.set_vertex_buffer(0, self.instances.slice(..));
                         pass.draw(0..4, b.quads.clone());
                     }

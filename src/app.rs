@@ -2,7 +2,7 @@
 
 use crate::render::Renderer;
 use crate::types::Color;
-use crate::ui::Ui;
+use crate::ui::{KeyInput, Ui};
 use crate::view::View;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -10,7 +10,8 @@ use std::sync::Arc;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 pub struct App<S> {
@@ -49,7 +50,14 @@ impl<S: 'static> App<S> {
         #[cfg(target_arch = "wasm32")]
         console_error_panic_hook::set_once();
         let event_loop = EventLoop::new().expect("event loop");
-        let runner = Runner { app: self, window: None, gfx: Rc::new(RefCell::new(None)), cursor: (0.0, 0.0) };
+        let runner = Runner {
+            app: self,
+            window: None,
+            gfx: Rc::new(RefCell::new(None)),
+            cursor: (0.0, 0.0),
+            command: false,
+            wake_at: None,
+        };
         #[cfg(not(target_arch = "wasm32"))]
         {
             let mut runner = runner;
@@ -111,6 +119,10 @@ struct Runner<S> {
     window: Option<Arc<Window>>,
     gfx: Rc<RefCell<Option<Gfx>>>,
     cursor: (f32, f32),
+    /// Ctrl / Cmd is held: key presses are shortcuts, not text.
+    command: bool,
+    /// When the UI asked to be redrawn without input (caret blink).
+    wake_at: Option<web_time::Instant>,
 }
 
 impl<S: 'static> Runner<S> {
@@ -147,6 +159,7 @@ impl<S: 'static> Runner<S> {
         ui.frame_ms += (ms - ui.frame_ms) * if ui.frame_ms == 0.0 { 1.0 } else { 0.1 };
         window.pre_present_notify();
         gfx.renderer.queue.present(frame);
+        self.wake_at = ui.wake_in.map(|s| web_time::Instant::now() + std::time::Duration::from_secs_f32(s));
         if ui.animating {
             window.request_redraw();
         }
@@ -158,6 +171,19 @@ impl<S: 'static> Runner<S> {
 }
 
 impl<S: 'static> ApplicationHandler for Runner<S> {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        match self.wake_at {
+            Some(t) if t <= web_time::Instant::now() => {
+                self.wake_at = None;
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            Some(t) => event_loop.set_control_flow(ControlFlow::WaitUntil(t)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -224,6 +250,28 @@ impl<S: 'static> ApplicationHandler for Runner<S> {
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / scale,
                 };
                 ui.wheel(self.cursor, dy)
+            }
+            WindowEvent::ModifiersChanged(m) => {
+                self.command = m.state().control_key() || m.state().super_key();
+                false
+            }
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                let named = match &event.logical_key {
+                    Key::Named(NamedKey::Backspace) => Some(KeyInput::Backspace),
+                    Key::Named(NamedKey::Delete) => Some(KeyInput::Delete),
+                    Key::Named(NamedKey::ArrowLeft) => Some(KeyInput::Left),
+                    Key::Named(NamedKey::ArrowRight) => Some(KeyInput::Right),
+                    Key::Named(NamedKey::Home) => Some(KeyInput::Home),
+                    Key::Named(NamedKey::End) => Some(KeyInput::End),
+                    Key::Named(NamedKey::Enter) => Some(KeyInput::Enter),
+                    Key::Named(NamedKey::Escape) => Some(KeyInput::Escape),
+                    _ => None,
+                };
+                match (named, &event.text) {
+                    (Some(k), _) => ui.key(k),
+                    (None, Some(text)) if !self.command => ui.text_input(text),
+                    _ => false,
+                }
             }
             WindowEvent::Touch(t) => {
                 let pos = (t.location.x as f32 / scale, t.location.y as f32 / scale);

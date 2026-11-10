@@ -1,10 +1,11 @@
 //! Platform-independent core: owns the app state, rebuilds the view tree,
 //! lays it out, paints it into a `DrawList`, and routes pointer input.
 
-use crate::layout::{layout, LNode, SLIDER_H};
+use crate::layout::{layout, LNode, FIELD_FONT, SLIDER_H, TABS_PAD};
 use crate::text::{TextSpec, TextSystem};
 use crate::types::{Color, Rect};
-use crate::view::{Fill, Glass, Kind, Shadow, View};
+use crate::view::{Fill, Glass, Image, Kind, Shadow, View};
+use std::rc::Rc;
 use bytemuck::{Pod, Zeroable};
 use std::collections::HashMap;
 use web_time::Instant;
@@ -14,6 +15,7 @@ use web_time::Instant;
 pub(crate) const KIND_FILL: f32 = 0.0;
 pub(crate) const KIND_SHADOW: f32 = 1.0;
 pub(crate) const KIND_GLASS: f32 = 2.0;
+pub(crate) const KIND_IMAGE: f32 = 3.0;
 
 /// One GPU instance. Units are logical points; the shader applies the scale factor.
 #[repr(C)]
@@ -47,6 +49,8 @@ pub enum Cmd {
 #[derive(Default)]
 pub struct DrawList {
     pub cmds: Vec<Cmd>,
+    /// Pictures used this frame; image quads refer to them by index (in `c1[0]`).
+    pub images: Vec<Image>,
 }
 
 // ---------------------------------------------------------------- animation
@@ -99,6 +103,50 @@ enum Action<S> {
     /// x of value 0, width of the value range (screen space)
     Slider(f32, f32, Box<dyn Fn(&mut S, f32)>),
     Scroll { max: f32 },
+    /// Text field: shaped-text key (0 when empty), screen x of the text origin, scale.
+    Field { key: u64, x0: f32, scale: f32, value: String, on_change: Box<dyn Fn(&mut S, String)> },
+    /// Tab bar: screen x of the first tab, width of one tab, number of tabs.
+    Tabs { x0: f32, tab_w: f32, n: usize, on_select: Box<dyn Fn(&mut S, usize)> },
+    OpenMenu,
+    Dismiss,
+    Pick(usize, Rc<dyn Fn(&mut S, usize)>),
+}
+
+/// Keys the UI understands besides typed text.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum KeyInput {
+    Backspace,
+    Delete,
+    Left,
+    Right,
+    Home,
+    End,
+    Enter,
+    Escape,
+}
+
+/// An open picker menu, painted above everything else.
+struct Menu<S> {
+    id: u64,
+    anchor: Rect,
+    options: Vec<String>,
+    selected: usize,
+    on_select: Rc<dyn Fn(&mut S, usize)>,
+    fg: Color,
+}
+
+fn prev_char(s: &str, i: usize) -> usize {
+    s[..i].char_indices().next_back().map_or(0, |(p, _)| p)
+}
+fn next_char(s: &str, i: usize) -> usize {
+    s[i..].chars().next().map_or(s.len(), |c| i + c.len_utf8())
+}
+fn floor_char(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
 }
 
 struct Hit<S> {
@@ -150,14 +198,87 @@ struct Painter<'a, S> {
     scrolls: &'a mut HashMap<u64, ScrollState>,
     pressed: Option<u64>,
     frame: u64,
+    text: &'a mut TextSystem,
+    focus: Option<u64>,
+    caret: usize,
+    caret_on: bool,
+    open_menu: Option<u64>,
+    menu: Option<Menu<S>>,
+    pointer_x: f32,
 }
 
 impl<S> Painter<'_, S> {
+    fn label(&mut self, xf: &Xf, key: u64, pos: (f32, f32), size: (f32, f32), color: Color) {
+        self.list.cmds.push(Cmd::Text(TextCmd {
+            key,
+            pos: (pos.0 * xf.s + xf.tx, pos.1 * xf.s + xf.ty),
+            size: (size.0 * xf.s, size.1 * xf.s),
+            scale: xf.s,
+            color: color.alpha(color.a * xf.opacity),
+            clip: xf.clip,
+        }));
+    }
+
+    fn paint_menu(&mut self, m: Menu<S>, size: (f32, f32)) {
+        const ROW: f32 = 44.0;
+        let screen = Rect::new(0.0, 0.0, size.0, size.1);
+        // Anything outside the menu closes it.
+        self.hits.push(Hit { id: m.id ^ 0xD15, rect: screen, action: Action::Dismiss });
+        let spec = |text| TextSpec { text, size: FIELD_FONT, weight: 400, center: false };
+        let rows: Vec<(u64, (f32, f32))> = m.options.iter().map(|o| self.text.measure(&spec(o), None)).collect();
+        let (check, check_size) = self.text.measure(&TextSpec { weight: 600, ..spec("✓") }, None);
+        let widest = rows.iter().map(|r| r.1 .0).fold(0.0, f32::max);
+        let w = (widest + 46.0 + check_size.0).max(m.anchor.w).min(size.0 - 16.0);
+        let h = ROW * rows.len() as f32 + 12.0;
+        let x = m.anchor.x.min(size.0 - w - 8.0).max(8.0);
+        let below = m.anchor.y + m.anchor.h + 6.0;
+        let (y, down) = if below + h <= size.1 - 8.0 { (below, true) } else { ((m.anchor.y - h - 6.0).max(8.0), false) };
+
+        // The menu grows out of the control it belongs to.
+        let frame = self.frame;
+        let s = self.springs.entry((m.id, 4)).or_insert(Spring { x: 0.0, v: 0.0, target: 1.0, used: 0 });
+        s.used = frame;
+        let t = s.x;
+        let k = 0.8 + 0.2 * t;
+        let (ax, ay) = (m.anchor.x + m.anchor.w * 0.5, if down { y } else { y + h });
+        let xf = Xf {
+            s: k,
+            tx: ax * (1.0 - k),
+            ty: ay * (1.0 - k),
+            opacity: t.clamp(0.0, 1.0),
+            clip: screen,
+            clip_r: 0.0,
+            fg: m.fg,
+        };
+        let r = Rect::new(x, y, w, h);
+        self.shadow(&xf, r, 18.0, Shadow { color: Color::BLACK.alpha(0.35), blur: 40.0, y: 12.0 }, true);
+        self.glass(&xf, r, 18.0, Glass::frosted(), None);
+        for (i, (key, ts)) in rows.into_iter().enumerate() {
+            let row = Rect::new(x + 6.0, y + 6.0 + ROW * i as f32, w - 12.0, ROW);
+            let rid = child_id(m.id, i, Some(0xA000 + i as u64));
+            if self.pressed == Some(rid) {
+                self.fill(&xf, row, 12.0, Fill::Solid(Color::WHITE.alpha(0.16)), None);
+            }
+            self.label(&xf, key, (row.x + 10.0, row.y + (ROW - ts.1) * 0.5), ts, m.fg);
+            if i == m.selected {
+                let cx = row.x + row.w - 10.0 - check_size.0;
+                self.label(&xf, check, (cx, row.y + (ROW - check_size.1) * 0.5), check_size, m.fg);
+            }
+            self.hits.push(Hit { id: rid, rect: xf.rect(row), action: Action::Pick(i, m.on_select.clone()) });
+        }
+    }
+
     fn spring(&mut self, id: u64, slot: u8, target: f32) -> f32 {
         let s = self.springs.entry((id, slot)).or_insert(Spring { x: target, v: 0.0, target, used: 0 });
         s.target = target;
         s.used = self.frame;
         s.x
+    }
+
+    /// Like `spring`, but also returns the current velocity.
+    fn spring_v(&mut self, id: u64, slot: u8, target: f32) -> (f32, f32) {
+        let x = self.spring(id, slot, target);
+        (x, self.springs[&(id, slot)].v)
     }
 
     fn quad(&mut self, xf: &Xf, r: Rect, radius: f32, kind: f32) -> Quad {
@@ -262,6 +383,113 @@ impl<S> Painter<'_, S> {
         let pad = st.padding;
         match v.kind {
             Kind::Empty | Kind::Spacer => {}
+            Kind::Image(img) => {
+                let mut q = self.quad(&xf, r, st.radius, KIND_IMAGE);
+                // Fill the box and crop the overflow, keeping the picture's aspect ratio.
+                let (iw, ih) = (img.0.width.max(1) as f32, img.0.height.max(1) as f32);
+                let k = (r.w / iw).max(r.h / ih).max(1e-6);
+                let (uw, uh) = (r.w / (iw * k) * 0.5, r.h / (ih * k) * 0.5);
+                q.c0 = [0.5 - uw, 0.5 - uh, 0.5 + uw, 0.5 + uh];
+                q.c1[0] = self.list.images.len() as f32;
+                if let Some((w, c)) = st.border {
+                    q.border = c.arr();
+                    q.p0[1] = w * xf.s;
+                }
+                self.list.images.push(img);
+                self.list.cmds.push(Cmd::Quad(q));
+            }
+            Kind::TextField { value, on_change, .. } => {
+                let focused = self.focus == Some(id);
+                let f = self.spring(id, 3, if focused { 1.0 } else { 0.0 }).clamp(0.0, 1.0);
+                if f > 0.01 {
+                    self.fill(&xf, r, st.radius, Fill::Solid(Color::CLEAR), Some((2.0, Color::BLUE.alpha(f))));
+                }
+                let inner = Rect::new(r.x + pad[0], r.y + pad[1], r.w - pad[0] - pad[2], r.h - pad[1] - pad[3]);
+                let caret = if focused { floor_char(&value, self.caret) } else { 0 };
+                let cx = if value.is_empty() { 0.0 } else { self.text.caret_x(ln.text, caret) };
+                // Keep the caret in view when the text is longer than the field.
+                let shift = if focused { (cx - inner.w + 2.0).max(0.0) } else { 0.0 };
+                let mut cxf = xf;
+                cxf.clip = xf.clip.intersect(&xf.rect(inner.inflate(1.0)));
+                cxf.clip_r = 0.0;
+                let color = if value.is_empty() { xf.fg.alpha(xf.fg.a * 0.4) } else { xf.fg };
+                self.label(&cxf, ln.text, (inner.x - shift, inner.y), (inner.w, inner.h), color);
+                if focused && self.caret_on {
+                    let bar = Rect::new(inner.x + cx - shift, inner.y + 1.0, 2.0, inner.h - 2.0);
+                    self.fill(&cxf, bar, 1.0, Fill::Solid(Color::BLUE), None);
+                }
+                self.hits.push(Hit {
+                    id,
+                    rect: sr.intersect(&xf.clip),
+                    action: Action::Field {
+                        key: if value.is_empty() { 0 } else { ln.text },
+                        x0: (inner.x - shift) * xf.s + xf.tx,
+                        scale: xf.s,
+                        value,
+                        on_change,
+                    },
+                });
+            }
+            Kind::Tabs { labels, selected, on_select } => {
+                let n = labels.len().max(1);
+                let tab_w = (r.w - 2.0 * TABS_PAD) / n as f32;
+                let center = |i: usize| r.x + TABS_PAD + tab_w * (i as f32 + 0.5);
+                let held = self.pressed == Some(id);
+                // The drop rests on the selected tab; while held it follows the pointer.
+                let target = if held {
+                    ((self.pointer_x - xf.tx) / xf.s).clamp(center(0), center(n - 1))
+                } else {
+                    center(selected)
+                };
+                let (cx, vel) = self.spring_v(id, 5, target);
+                let p = self.spring(id, 6, if held { 1.0 } else { 0.0 });
+                for (i, (key, ts)) in ln.texts.iter().enumerate() {
+                    let near = (1.0 - (center(i) - cx).abs() / tab_w).clamp(0.0, 1.0);
+                    let color = xf.fg.alpha(xf.fg.a * (0.6 + 0.4 * near));
+                    self.label(&xf, *key, (center(i) - ts.0 * 0.5, r.y + (r.h - ts.1) * 0.5), *ts, color);
+                }
+                // Liquid: it swells when grabbed and stretches along its motion.
+                let stretch = (vel.abs() * 0.035).min(tab_w * 0.6);
+                let lw = tab_w * (1.0 + 0.14 * p) + stretch;
+                let lh = (r.h - 2.0 * TABS_PAD) * (1.0 + 0.42 * p) * (1.0 - 0.18 * stretch / (tab_w * 0.6));
+                let lens = Rect::new(cx - lw * 0.5, r.y + (r.h - lh) * 0.5, lw, lh);
+                if p > 0.02 {
+                    let sh = Shadow { color: Color::BLACK.alpha(0.22 * p), blur: 18.0, y: 5.0 };
+                    self.shadow(&xf, lens, lh * 0.5, sh, true);
+                }
+                let drop = Glass {
+                    tint: Color::WHITE.alpha(0.13 - 0.09 * p.clamp(0.0, 1.0)),
+                    saturation: 1.25,
+                    frost: 1.5 * (1.0 - p.clamp(0.0, 1.0)),
+                    refraction: 1.0,
+                    depth: 16.0,
+                    dispersion: 0.6,
+                    rim: 0.55,
+                };
+                self.glass(&xf, lens, lh * 0.5, drop, None);
+                self.hits.push(Hit {
+                    id,
+                    rect: sr.inflate(4.0).intersect(&xf.clip),
+                    action: Action::Tabs {
+                        x0: (r.x + TABS_PAD) * xf.s + xf.tx,
+                        tab_w: tab_w * xf.s,
+                        n,
+                        on_select,
+                    },
+                });
+            }
+            Kind::Picker { options, selected, on_select } => {
+                let inner = Rect::new(r.x + pad[0], r.y + pad[1], r.w - pad[0] - pad[2], r.h - pad[1] - pad[3]);
+                self.label(&xf, ln.text, (inner.x, inner.y), (inner.w - 26.0, inner.h), xf.fg);
+                let spec = TextSpec { text: "⌄", size: 15.0, weight: 700, center: false };
+                let (chev, cs) = self.text.measure(&spec, None);
+                let at = (inner.x + inner.w - cs.0 - 2.0, inner.y + (inner.h - cs.1) * 0.5 - 3.0);
+                self.label(&xf, chev, at, cs, xf.fg.alpha(xf.fg.a * 0.6));
+                self.hits.push(Hit { id, rect: sr.intersect(&xf.clip), action: Action::OpenMenu });
+                if self.open_menu == Some(id) {
+                    self.menu = Some(Menu { id, anchor: sr, options, selected, on_select, fg: xf.fg });
+                }
+            }
             Kind::Text(_) => {
                 let pos = (r.x + pad[0], r.y + pad[1]);
                 self.list.cmds.push(Cmd::Text(TextCmd {
@@ -351,6 +579,12 @@ pub struct Ui<S> {
     ptr: Pointer,
     last_frame: Option<Instant>,
     frame: u64,
+    focus: Option<u64>,
+    caret: usize,
+    caret_at: Option<Instant>,
+    open_menu: Option<u64>,
+    /// Seconds until the UI wants another frame even without input (caret blink).
+    pub wake_in: Option<f32>,
     /// Draw a frames-per-second counter in the top-right corner. While it is on the UI
     /// redraws continuously (otherwise there would be nothing to count when idle).
     pub show_fps: bool,
@@ -377,6 +611,11 @@ impl<S> Ui<S> {
             ptr: Pointer::default(),
             last_frame: None,
             frame: 0,
+            focus: None,
+            caret: 0,
+            caret_at: None,
+            open_menu: None,
+            wake_in: None,
             show_fps: false,
             frame_ms: 0.0,
             fps: 0.0,
@@ -419,7 +658,9 @@ impl<S> Ui<S> {
         let view = (self.view_fn)(&self.state);
         let root = layout(&view, (Some(size.0), Some(size.1)), &mut self.text);
         self.list.cmds.clear();
+        self.list.images.clear();
         self.hits.clear();
+        let blink = self.caret_at.map_or(0.0, |t| (now - t).as_secs_f32());
         let fg = if self.background.luminance() < 0.5 { Color::WHITE } else { Color::BLACK };
         let xf = Xf {
             s: 1.0,
@@ -438,8 +679,25 @@ impl<S> Ui<S> {
             scrolls: &mut self.scrolls,
             pressed: self.ptr.pressed,
             frame,
+            text: &mut self.text,
+            focus: self.focus,
+            caret: self.caret,
+            caret_on: blink % 1.0 < 0.5,
+            open_menu: self.open_menu,
+            menu: None,
+            pointer_x: self.ptr.last.0,
         };
         p.paint(view, &root, (0.0, 0.0), xf, 1);
+        match p.menu.take() {
+            Some(menu) => p.paint_menu(menu, size),
+            None => self.open_menu = None, // its picker is gone
+        }
+        if let Some(id) = self.focus {
+            if !self.hits.iter().any(|h| h.id == id) {
+                self.focus = None;
+            }
+        }
+        self.wake_in = self.focus.map(|_| 0.5 - blink % 0.5 + 0.01);
 
         if self.show_fps {
             self.paint_fps(now, size);
@@ -511,8 +769,14 @@ impl<S> Ui<S> {
         }
         let hit = self.hit(pos, false);
         self.ptr.pressed = hit.map(|i| self.hits[i].id);
+        self.focus = None;
         if let Some(i) = hit {
             self.slide(i, pos.0);
+            if let Action::Field { key, x0, scale, .. } = &self.hits[i].action {
+                self.focus = Some(self.hits[i].id);
+                self.caret = if *key == 0 { 0 } else { self.text.index_at(*key, (pos.0 - x0) / scale) };
+                self.caret_at = Some(Instant::now());
+            }
         }
         true
     }
@@ -528,7 +792,7 @@ impl<S> Ui<S> {
                     .ptr
                     .pressed
                     .and_then(|id| self.hits.iter().find(|h| h.id == id))
-                    .is_some_and(|h| matches!(h.action, Action::Slider(..)));
+                    .is_some_and(|h| matches!(h.action, Action::Slider(..) | Action::Tabs { .. }));
                 if !on_slider {
                     self.ptr.dragging = true;
                     self.ptr.pressed = None;
@@ -551,6 +815,9 @@ impl<S> Ui<S> {
                     self.slide(i, pos.0);
                     return true;
                 }
+                if matches!(self.hits[i].action, Action::Tabs { .. }) {
+                    return true; // the drop follows the pointer
+                }
             }
         }
         false
@@ -563,16 +830,90 @@ impl<S> Ui<S> {
         if was_dragging {
             return true; // inertia continues in frame()
         }
+        // A dragged tab drop selects whatever tab it is released over, even off the bar.
+        if let Some(h) = pressed.and_then(|id| self.hits.iter().find(|h| h.id == id)) {
+            if let Action::Tabs { x0, tab_w, n, on_select } = &h.action {
+                let index = ((pos.0 - x0) / tab_w).floor().clamp(0.0, (*n - 1) as f32) as usize;
+                on_select(&mut self.state, index);
+                return true;
+            }
+        }
         if let (Some(id), Some(i)) = (pressed, self.hit(pos, false)) {
             if self.hits[i].id == id {
                 match &self.hits[i].action {
                     Action::Tap(f) => f(&mut self.state),
                     Action::Toggle(on, f) => f(&mut self.state, !on),
+                    Action::OpenMenu => {
+                        self.springs.remove(&(id, 4)); // replay the opening animation
+                        self.open_menu = Some(id);
+                    }
+                    Action::Dismiss => self.open_menu = None,
+                    Action::Pick(index, f) => {
+                        f(&mut self.state, *index);
+                        self.open_menu = None;
+                    }
                     _ => {}
                 }
             }
         }
         true
+    }
+
+    /// True while a text field has keyboard focus.
+    pub fn has_focus(&self) -> bool {
+        self.focus.is_some()
+    }
+
+    fn edit(&mut self, f: impl FnOnce(&mut String, &mut usize)) -> bool {
+        let Some(i) = self.focus.and_then(|id| self.hits.iter().position(|h| h.id == id)) else { return false };
+        let Action::Field { value, on_change, .. } = &mut self.hits[i].action else { return false };
+        let mut next = value.clone();
+        let mut caret = floor_char(&next, self.caret);
+        f(&mut next, &mut caret);
+        self.caret = caret;
+        self.caret_at = Some(Instant::now());
+        if next != *value {
+            // Remember it right away: several keys can arrive before the next frame.
+            *value = next.clone();
+            on_change(&mut self.state, next);
+        }
+        true
+    }
+
+    /// Typed text (already translated by the keyboard layout). Returns true if it was used.
+    pub fn text_input(&mut self, text: &str) -> bool {
+        if text.is_empty() || text.chars().any(char::is_control) {
+            return false;
+        }
+        self.edit(|v, c| {
+            v.insert_str(*c, text);
+            *c += text.len();
+        })
+    }
+
+    /// Editing / navigation key. Returns true if it was used.
+    pub fn key(&mut self, key: KeyInput) -> bool {
+        match key {
+            KeyInput::Escape | KeyInput::Enter => {
+                self.open_menu.take().is_some() | self.focus.take().is_some()
+            }
+            _ => self.edit(|v, c| match key {
+                KeyInput::Backspace if *c > 0 => {
+                    let p = prev_char(v, *c);
+                    v.replace_range(p..*c, "");
+                    *c = p;
+                }
+                KeyInput::Delete if *c < v.len() => {
+                    let n = next_char(v, *c);
+                    v.replace_range(*c..n, "");
+                }
+                KeyInput::Left => *c = prev_char(v, *c),
+                KeyInput::Right => *c = next_char(v, *c),
+                KeyInput::Home => *c = 0,
+                KeyInput::End => *c = v.len(),
+                _ => {}
+            }),
+        }
     }
 
     /// Mouse wheel / trackpad scroll, delta in points.

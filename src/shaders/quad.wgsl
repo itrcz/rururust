@@ -9,6 +9,7 @@ struct Globals {
 @group(0) @binding(1) var sharp: texture_2d<f32>; // the scene behind the glass, unblurred
 @group(0) @binding(2) var pyr: texture_2d<f32>;   // its blur pyramid
 @group(0) @binding(3) var samp: sampler;
+@group(1) @binding(0) var img: texture_2d<f32>;   // picture for image quads
 
 struct Instance {
     @location(0) rect: vec4f,
@@ -234,6 +235,13 @@ fn fs(in: VOut) -> @location(0) vec4f {
         bg += (1.0 - t) * (1.0 - t) * 0.05;
         bg += (noise(in.xy) - 0.5) / 255.0; // dither away banding
         col = vec4f(clamp(bg, vec3f(0.0), vec3f(1.0)), 1.0);
+    } else if kind == 3.0 {
+        // Picture: c0 is the visible part of it in UV space. Pick the mip that matches
+        // the on-screen size so a large photo shown small doesn't shimmer.
+        let uv = mix(in.c0.xy, in.c0.zw, p / (half * 2.0) + 0.5);
+        let texels = (in.c0.z - in.c0.x) * f32(textureDimensions(img).x);
+        let lod = max(log2(texels / max(half.x * 2.0, 1.0)), 0.0);
+        col = textureSampleLevel(img, samp, uv, lod);
     } else {
         let dir = in.p1.xy;
         let extent = abs(dir.x) * half.x + abs(dir.y) * half.y;
