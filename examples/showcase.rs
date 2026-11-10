@@ -46,6 +46,8 @@ struct Demo {
     refreshing: bool,
     messages: Rc<Vec<Msg>>,
     draft: String,
+    /// The reply being streamed; replacing it cancels the previous stream.
+    reply: Option<Task>,
 }
 
 const TABS: [&str; 4] = ["Home", "Chat", "Gallery", "Forms"];
@@ -293,7 +295,19 @@ fn send(s: &mut Demo) {
         return;
     }
     Rc::make_mut(&mut s.messages).push(Msg { me: true, text });
-    after(0.7, |s: &mut Demo| Rc::make_mut(&mut s.messages).push(Msg { me: false, text: REPLY.into() }));
+    // Stands in for an LLM: the reply arrives word by word from a background task.
+    s.reply = Some(spawn(|link: Link<Demo>| async move {
+        sleep(0.5).await;
+        link.send(|s| Rc::make_mut(&mut s.messages).push(Msg { me: false, text: String::new() }));
+        for word in REPLY.split_inclusive(char::is_whitespace) {
+            sleep(0.03 + 0.03 * (word.len() as f32 / 8.0).min(1.0)).await;
+            link.send(move |s| {
+                if let Some(m) = Rc::make_mut(&mut s.messages).last_mut().filter(|m| !m.me) {
+                    m.text.push_str(word);
+                }
+            });
+        }
+    }));
 }
 
 fn gallery(s: &Demo) -> View<Demo> {
@@ -483,6 +497,7 @@ impl Demo {
                 Msg { me: false, text: REPLY.into() },
             ]),
             draft: String::new(),
+            reply: None,
         }
     }
 }

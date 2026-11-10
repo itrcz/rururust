@@ -730,7 +730,9 @@ impl<S> Painter<'_, S> {
                 let s = self.scrolls.entry(id).or_default();
                 let max = (content - r.h).max(0.0);
                 // Chat-style: start at the end and follow new content while parked there.
-                if stick && (s.used == 0 || (s.offset >= s.max - 1.0 && s.vel == 0.0 && max > s.max)) {
+                // Shrinking too: a lazy row measured smaller than its estimate must not
+                // leave the view hanging past the end and bouncing back.
+                if stick && (s.used == 0 || (s.offset >= s.max - 1.0 && s.vel == 0.0 && max != s.max)) {
                     s.offset = max;
                 }
                 s.max = max;
@@ -889,6 +891,8 @@ impl<S: 'static> Ui<S> {
 
     /// Builds, lays out and paints one frame for a window of `size` points.
     pub fn frame(&mut self, size: (f32, f32)) {
+        // Updates sent through `Link`s from background work.
+        self.pump();
         let now = Instant::now();
         let dt = match self.last_frame {
             Some(t) if self.animating || self.wake_in.is_some() => (now - t).as_secs_f32().min(1.0 / 20.0),
@@ -952,7 +956,10 @@ impl<S: 'static> Ui<S> {
                     s.vel += (-220.0 * (s.offset - end) - 30.0 * s.vel) * h;
                     s.offset += s.vel * h;
                 }
-                if (s.offset - end).abs() < 0.25 && s.vel.abs() < 6.0 {
+                // Crossing the edge ends the bounce: with long frames the spring overshoots,
+                // and the leftover speed would coast the list away from the edge.
+                let crossed = (s.offset - end).signum() != (before - end).signum();
+                if crossed || (s.offset - end).abs() < 0.25 && s.vel.abs() < 6.0 {
                     s.offset = end;
                     s.vel = 0.0;
                 }
