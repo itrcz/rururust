@@ -48,7 +48,10 @@ impl<S: 'static> App<S> {
 
     pub fn run(self) {
         #[cfg(target_arch = "wasm32")]
-        console_error_panic_hook::set_once();
+        {
+            console_error_panic_hook::set_once();
+            webkit_upload_fix();
+        }
         let event_loop = EventLoop::new().expect("event loop");
         let runner = Runner {
             app: self,
@@ -69,6 +72,79 @@ impl<S: 'static> App<S> {
             event_loop.spawn_app(runner);
         }
     }
+}
+
+// WebKit's WebGPU (seen in Playwright WebKit) intermittently drops `GPUQueue.writeTexture` into
+// a texture that is sampled every frame: all uploads of an unlucky frame never land, while
+// `copyBufferToTexture` from a command encoder is reliable. glyphon uploads every new glyph with
+// `write_texture` into the atlas it samples each frame, so glyphs vanished from the atlas. Measured
+// by reading the atlas back: lost uploads come in whole frames; via the copy path none were lost.
+// The shim keeps the queue-ordering of `writeTexture`: copies of a frame are staged in one
+// buffer and submitted right before the next `submit`. Unusual layouts fall back to the original.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
+export function webkit_upload_fix() {
+  if (typeof GPUQueue === "undefined" || GPUQueue.prototype.__ruruUpload) return;
+  // Only WebKit needs it (Safari, and every iOS browser); Chromium's UA also says AppleWebKit.
+  const ua = navigator.userAgent;
+  if (!/AppleWebKit/.test(ua) || /Chrome|Chromium|Edg\//.test(ua)) return;
+  const Q = GPUQueue.prototype, D = GPUDevice.prototype;
+  const writeTexture = Q.writeTexture, submit = Q.submit, createTexture = D.createTexture;
+  const texel = { r8unorm: 1, rgba8unorm: 4, "rgba8unorm-srgb": 4, bgra8unorm: 4, "bgra8unorm-srgb": 4 };
+  const deviceOf = new WeakMap(); // queue -> device
+  const pending = new WeakMap(); // queue -> [{ dst, size, rows, bpr }]
+  Q.__ruruUpload = true;
+  D.createTexture = function (desc) { deviceOf.set(this.queue, this); return createTexture.call(this, desc); };
+  Q.writeTexture = function (dst, data, layout, size) {
+    try {
+      const bpp = texel[dst.texture.format];
+      const w = size.width ?? size[0], h = size.height ?? size[1] ?? 1, d = size.depthOrArrayLayers ?? size[2] ?? 1;
+      if (bpp && d === 1 && deviceOf.has(this) && w > 0 && h > 0) {
+        const src = ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : new Uint8Array(data);
+        const off = layout.offset || 0, row = w * bpp, stride = layout.bytesPerRow ?? row;
+        const bpr = Math.ceil(row / 256) * 256, rows = new Uint8Array(bpr * h);
+        for (let y = 0; y < h; y++) rows.set(src.subarray(off + y * stride, off + y * stride + row), y * bpr);
+        let list = pending.get(this);
+        if (!list) pending.set(this, (list = []));
+        list.push({ dst: { ...dst }, size: [w, h, 1], rows, bpr });
+        return;
+      }
+    } catch (_) {}
+    return writeTexture.call(this, dst, data, layout, size);
+  };
+  Q.submit = function (buffers) {
+    const list = pending.get(this);
+    if (list) {
+      pending.delete(this);
+      try {
+        const device = deviceOf.get(this);
+        const total = list.reduce((n, c) => n + c.rows.byteLength, 0);
+        const staging = device.createBuffer({ size: total, usage: GPUBufferUsage.COPY_SRC, mappedAtCreation: true });
+        const view = new Uint8Array(staging.getMappedRange());
+        const enc = device.createCommandEncoder();
+        let at = 0;
+        for (const c of list) {
+          view.set(c.rows, at);
+          enc.copyBufferToTexture({ buffer: staging, offset: at, bytesPerRow: c.bpr }, c.dst, c.size);
+          at += c.rows.byteLength;
+        }
+        staging.unmap();
+        // Separate submit: a copy into a texture destroyed meanwhile must not void the frame.
+        submit.call(this, [enc.finish()]);
+        this.onSubmittedWorkDone().then(() => staging.destroy(), () => {});
+      } catch (_) {
+        // Lost device or an allocation failure: hand the uploads to the browser as they were.
+        for (const c of list) {
+          try { writeTexture.call(this, c.dst, c.rows, { bytesPerRow: c.bpr }, c.size); } catch (_) {}
+        }
+      }
+    }
+    return submit.call(this, buffers);
+  };
+}
+"#)]
+extern "C" {
+    fn webkit_upload_fix();
 }
 
 struct Gfx {
