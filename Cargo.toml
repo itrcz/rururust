@@ -26,7 +26,7 @@ headless = ["renderer", "dep:pollster", "dep:png"]
 webgl = ["wgpu?/webgl"]
 
 [dependencies]
-cosmic-text = "0.19"
+cosmic-text = { version = "0.19", features = ["shape-run-cache"] }
 bytemuck = { version = "1", features = ["derive"] }
 web-time = "1"
 unicode-segmentation = "1"  # already in the tree through cosmic-text

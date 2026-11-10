@@ -578,9 +578,9 @@ impl Renderer {
             if used_text == self.text_renderers.len() {
                 self.text_renderers.push(TextRenderer::new(&mut self.atlas, &self.device, Default::default(), None));
             }
-            let entries = &text.entries;
+            let (fonts, buffers) = text.for_drawing();
             let areas = b.texts.iter().flat_map(|t| {
-                let e = entries.get(&t.key);
+                let e = buffers.get(t.key);
                 let c = t.color;
                 let to8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
                 let px = |r: &Rect| TextBounds {
@@ -613,7 +613,7 @@ impl Renderer {
                 }
                 parts.into_iter().filter(|(b, _)| b.right > b.left && b.bottom > b.top).filter_map(move |(bounds, a)| {
                     Some(TextArea {
-                        buffer: &e?.buffer,
+                        buffer: e?,
                         left: t.pos.0 * scale,
                         top: t.pos.1 * scale,
                         // Animated scale is snapped to 1/16 steps: otherwise every frame of a
@@ -627,7 +627,7 @@ impl Renderer {
                 })
             });
             let ok = self.text_renderers[used_text]
-                .prepare(&self.device, &self.queue, &mut text.fonts, &mut self.atlas, &self.viewport, areas, &mut self.swash)
+                .prepare(&self.device, &self.queue, fonts, &mut self.atlas, &self.viewport, areas, &mut self.swash)
                 .is_ok();
             text_slot.push(ok.then_some(used_text));
             used_text += 1;
