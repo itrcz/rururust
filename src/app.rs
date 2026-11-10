@@ -569,6 +569,7 @@ impl<S: 'static> Runner<S> {
             ui.window_buttons = if full { 0.0 } else { MAC_BUTTONS };
         }
         let started = web_time::Instant::now();
+        ui.scale = scale;
         ui.frame((size.width as f32 / scale, size.height as f32 / scale));
 
         let frame = match gfx.surface.get_current_texture() {

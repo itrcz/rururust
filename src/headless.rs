@@ -43,6 +43,7 @@ pub fn render_png_after<S: 'static>(
     let view = texture.create_view(&Default::default());
     for i in 0..frames.max(1) {
         before(ui, i);
+        ui.scale = scale;
         ui.frame((width as f32, height as f32));
         // A PNG has no desktop behind it: the background is drawn opaque, as before.
         renderer.render(&view, (pw, ph), scale, &ui.list, &mut ui.text, Color { a: 1.0, ..ui.background });

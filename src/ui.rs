@@ -446,11 +446,73 @@ struct Xf {
     /// The clip's corners are continuous (`.smooth()`), not circular.
     clip_smooth: bool,
     fg: Color,
+    /// Device pixels per point, for snapping to the pixel grid; 0 turns snapping off for
+    /// what is drawn with it (a knob or lens that swells on a spring: steps would show).
+    px: f32,
+}
+
+/// `v` (screen points) moved to the nearest edge between device pixels. Half rounds up,
+/// so a shift by whole pixels (scrolling) shifts the result by exactly as much.
+pub(crate) fn snap(v: f32, px: f32) -> f32 {
+    (v * px + 0.5).floor() / px
+}
+
+/// Both edges of `r` on the pixel grid. A hairline (half a pixel or more) that would
+/// round away stays one pixel thick, centered where it was; anything thinner (a panel
+/// collapsing to nothing) is let go, so it meets its neighbour.
+pub(crate) fn snap_rect(r: Rect, px: f32) -> Rect {
+    let axis = |a: f32, len: f32| {
+        let (mut lo, mut hi) = (snap(a, px), snap(a + len, px));
+        if len * px >= 0.499 && hi - lo < 0.5 / px {
+            lo = snap(a + len * 0.5 - 0.5 / px, px);
+            hi = lo + 1.0 / px;
+        }
+        (lo, hi - lo)
+    };
+    let (x, w) = axis(r.x, r.w);
+    let (y, h) = axis(r.y, r.h);
+    Rect::new(x, y, w, h)
 }
 
 impl Xf {
     fn rect(&self, r: Rect) -> Rect {
         Rect::new(r.x * self.s + self.tx, r.y * self.s + self.ty, r.w * self.s, r.h * self.s)
+    }
+    /// Pixels per point when this transform snaps: not while it scales (press, pop-in), where
+    /// whole-pixel steps would make the size judder.
+    fn grid(&self) -> f32 {
+        if self.px > 0.0 && (self.s - 1.0).abs() < 1e-4 { self.px } else { 0.0 }
+    }
+    /// Screen rect of `r` with its edges on device pixels: crisp edges and hairlines, and
+    /// neighbours that share an edge still meet.
+    fn rect_px(&self, r: Rect) -> Rect {
+        let sr = self.rect(r);
+        match self.grid() {
+            0.0 => sr,
+            px => snap_rect(sr, px),
+        }
+    }
+    /// The local point nearest to `p` that lands on a device pixel. Text and whatever is
+    /// drawn relative to it (plates, selection) start here, so they move together.
+    fn at_px(&self, p: (f32, f32)) -> (f32, f32) {
+        match self.grid() {
+            0.0 => p,
+            px => {
+                let (x, y) = (p.0 * self.s + self.tx, p.1 * self.s + self.ty);
+                (p.0 + (snap(x, px) - x) / self.s, p.1 + (snap(y, px) - y) / self.s)
+            }
+        }
+    }
+    /// A border width `w` (points) on screen: never thinner than one device pixel, and a
+    /// whole number of them while it is thin, so a hairline is one solid row of pixels.
+    fn line(&self, w: f32) -> f32 {
+        let sw = w * self.s;
+        if self.px <= 0.0 || w <= 0.0 {
+            return sw;
+        }
+        let d = sw * self.px;
+        let d = if self.grid() > 0.0 && d <= 1.5 { (d - 0.01).round() } else { d };
+        d.max(1.0) / self.px
     }
     /// Narrows the clip to the screen rect `r` with corner radius `radius`. The GPU clips to
     /// one rounded rectangle, so nested clips keep the corners of whichever is inside.
@@ -529,6 +591,8 @@ struct Painter<'a, S> {
     ctx_at: (f32, f32),
     /// The view whose tooltip shows.
     tip: Option<u64>,
+    /// Device pixels per point.
+    px: f32,
 }
 
 impl<S> Painter<'_, S> {
@@ -541,6 +605,7 @@ impl<S> Painter<'_, S> {
     }
 
     fn label(&mut self, xf: &Xf, key: u64, pos: (f32, f32), size: (f32, f32), color: Color) {
+        let pos = xf.at_px(pos);
         self.list.cmds.push(Cmd::Text(TextCmd {
             key,
             pos: (pos.0 * xf.s + xf.tx, pos.1 * xf.s + xf.ty),
@@ -570,7 +635,7 @@ impl<S> Painter<'_, S> {
         q.c1[0] = self.list.images.len() as f32;
         if let Some((w, c)) = border {
             q.border = c.arr();
-            q.p0[1] = w * xf.s;
+            q.p0[1] = xf.line(w);
         }
         self.list.images.push(img.clone());
         self.list.cmds.push(Cmd::Quad(q));
@@ -657,6 +722,7 @@ impl<S> Painter<'_, S> {
             clip_r: 0.0,
             clip_smooth: false,
             fg: m.fg,
+            px: self.px,
         };
         let r = Rect::new(x, y, w, h);
         self.shadow(&xf, r, 18.0, Shadow { color: Color::BLACK.alpha(0.35), blur: 40.0, y: 12.0 }, true);
@@ -700,7 +766,7 @@ impl<S> Painter<'_, S> {
 
     fn quad(&mut self, xf: &Xf, r: Rect, radius: f32, kind: f32) -> Quad {
         Quad {
-            rect: xf.rect(r).arr(),
+            rect: xf.rect_px(r).arr(),
             clip: xf.clip.arr(),
             c0: [0.0; 4],
             c1: [0.0; 4],
@@ -729,7 +795,7 @@ impl<S> Painter<'_, S> {
         }
         if let Some((w, c)) = border {
             q.border = c.arr();
-            q.p0[1] = w * xf.s;
+            q.p0[1] = xf.line(w);
         }
         self.list.cmds.push(Cmd::Quad(q));
     }
@@ -751,7 +817,7 @@ impl<S> Painter<'_, S> {
         q.p1[1] = g.refraction;
         if let Some((w, c)) = border {
             q.border = c.arr();
-            q.p0[1] = w * xf.s;
+            q.p0[1] = xf.line(w);
         }
         self.list.cmds.push(Cmd::Quad(q));
     }
@@ -791,7 +857,7 @@ impl<S> Painter<'_, S> {
             xf.opacity *= 1.0 - 0.3 * p;
         }
 
-        let sr = xf.rect(r);
+        let sr = xf.rect_px(r);
         let margin = st.shadow.map_or(0.0, |s| s.blur * 2.0 + s.y.abs());
         if !sr.inflate(margin * xf.s).intersects(&xf.clip) || xf.opacity <= 0.001 {
             return; // culled
@@ -838,7 +904,7 @@ impl<S> Painter<'_, S> {
         self.smooth = false;
         if st.clip || ln.clip {
             // Inside the border: children never show through or under it.
-            let bw = st.border.map_or(0.0, |b| b.0) * xf.s;
+            let bw = st.border.map_or(0.0, |b| xf.line(b.0));
             xf.clip_to(sr.inflate(-bw), (st.radius * xf.s - bw).max(0.0), st.smooth);
         }
 
@@ -973,6 +1039,8 @@ impl<S> Painter<'_, S> {
                         (cx, r.y + r.h - h - 100.0 + (1.0 - t) * 40.0)
                     }
                 };
+                // Slides as one piece in whole pixels: its parts keep their sizes on the way.
+                let pos = cxf.at_px(pos);
                 if mode != OverlayMode::Toast {
                     self.fill(&xf, r, 0.0, Fill::Solid(Color::BLACK.alpha(0.45 * tc)), None);
                     self.hit(&xf, id, sr, Action::Block(on_dismiss));
@@ -1012,7 +1080,7 @@ impl<S> Painter<'_, S> {
                 let lens = Rect::new(cx - lw * 0.5, r.y + (r.h - lh) * 0.5, lw, lh);
                 if p > 0.02 {
                     let sh = Shadow { color: Color::BLACK.alpha(0.22 * p), blur: 18.0, y: 5.0 };
-                    self.shadow(&xf, lens, lh * 0.5, sh, true);
+                    self.shadow(&Xf { px: 0.0, ..xf }, lens, lh * 0.5, sh, true);
                 }
                 let drop = Glass {
                     tint: Color::WHITE.alpha(0.13 - 0.09 * p.clamp(0.0, 1.0)),
@@ -1023,7 +1091,9 @@ impl<S> Painter<'_, S> {
                     dispersion: 0.6,
                     rim: 0.55,
                 };
-                self.glass(&xf, lens, lh * 0.5, drop, None);
+                // The drop swells and stretches as it slides: no pixel steps.
+                let lxf = Xf { px: 0.0, ..xf };
+                self.glass(&lxf, lens, lh * 0.5, drop, None);
                 self.hit(&xf, id, sr.inflate(4.0), Action::Tabs {
                         x0: (r.x + TABS_PAD) * xf.s + xf.tx,
                         tab_w: tab_w * xf.s,
@@ -1044,7 +1114,8 @@ impl<S> Painter<'_, S> {
                 }
             }
             Kind::Text(t) => {
-                let inner = Rect::new(r.x + pad[0], r.y + pad[1], r.w - pad[0] - pad[2], r.h - pad[1] - pad[3]);
+                let at = xf.at_px((r.x + pad[0], r.y + pad[1]));
+                let inner = Rect::new(at.0, at.1, r.w - pad[0] - pad[2], r.h - pad[1] - pad[3]);
                 let box_ = xf.rect(inner);
                 // Text limited to some lines is cut to its box; the last line may fade out.
                 let clip = if t.lines > 0 { xf.clip.intersect(&box_.inflate(1.0)) } else { xf.clip };
@@ -1129,7 +1200,10 @@ impl<S> Painter<'_, S> {
                 self.tbase = tbase;
                 let outer = self.tctx.clone();
                 self.enter_scroll(id, sr);
-                self.paint(*child, &ln.children[0], (r.x, r.y - offset), cxf, cid);
+                // The physics stays fractional; the content is drawn whole pixels off, so text
+                // stays sharp and hairlines don't flicker while it moves.
+                let top = cxf.at_px((r.x, r.y - offset)).1;
+                self.paint(*child, &ln.children[0], (r.x, top), cxf, cid);
                 self.tctx = outer;
                 self.sticky = None;
 
@@ -1193,8 +1267,10 @@ impl<S> Painter<'_, S> {
                 let kw = r.h - 4.0 + 6.0 * p;
                 let kx = r.x + 2.0 + (r.w - 4.0 - kw) * t;
                 let knob = Rect::new(kx, r.y + 2.0, kw, r.h - 4.0);
-                self.shadow(&xf, knob, knob.h * 0.5, Shadow { color: Color::BLACK.alpha(0.25), blur: 8.0, y: 3.0 }, false);
-                self.fill(&xf, knob, knob.h * 0.5, Fill::Solid(Color::WHITE), None);
+                // It slides and stretches on springs: drawn as is, not in pixel steps.
+                let kxf = Xf { px: 0.0, ..xf };
+                self.shadow(&kxf, knob, knob.h * 0.5, Shadow { color: Color::BLACK.alpha(0.25), blur: 8.0, y: 3.0 }, false);
+                self.fill(&kxf, knob, knob.h * 0.5, Fill::Solid(Color::WHITE), None);
                 self.hit(&xf, id, sr.inflate(6.0), Action::Toggle(on, f));
             }
             Kind::Menu { items, style } => self.paint_menu(items, style, ln, r, xf, id),
@@ -1288,6 +1364,10 @@ pub struct Ui<S> {
     pub titlebar: f32,
     /// Passed to the view as [`Env::window_buttons`]; set by the runner.
     pub window_buttons: f32,
+    /// Device pixels per point (2 on a Retina screen); set by the runner every frame, so a
+    /// window moved to another monitor follows. Edges, hairlines and text are snapped to
+    /// this pixel grid. Default 1.
+    pub scale: f32,
     fps: f32,
     fps_label: String,
     fps_label_at: Option<Instant>,
@@ -1332,6 +1412,7 @@ impl<S: 'static> Ui<S> {
             requests: Vec::new(),
             titlebar: 0.0,
             window_buttons: 0.0,
+            scale: 1.0,
             fps: 0.0,
             fps_label: String::new(),
             fps_label_at: None,
@@ -1473,6 +1554,7 @@ impl<S: 'static> Ui<S> {
             clip_r: 0.0,
             clip_smooth: false,
             fg,
+            px: self.scale,
         };
         let frame = self.frame;
         let mut p = Painter {
@@ -1514,6 +1596,7 @@ impl<S: 'static> Ui<S> {
             managed_seen: false,
             ctx_at: self.ctx_at,
             tip: tip_show,
+            px: self.scale,
         };
         p.paint(view, &root, (0.0, 0.0), xf, 1);
         p.paint_layers();

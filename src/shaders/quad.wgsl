@@ -194,6 +194,21 @@ fn premul(c: vec4f) -> vec4f {
     return vec4f(c.rgb * c.a, c.a);
 }
 
+fn luma(c: vec3f) -> f32 {
+    return dot(c, vec3f(0.2126, 0.7152, 0.0722));
+}
+
+// Coverage `c` of something lighter (`over`) laid on `under`, adjusted so that blending in
+// gamma space gives the brightness linear blending would. Darker-over-lighter is left as is:
+// there gamma blending already reads right.
+fn lin_cover(c: f32, under: f32, over: f32) -> f32 {
+    if over <= under + 0.02 || c <= 0.0 || c >= 1.0 {
+        return c;
+    }
+    let t = pow(mix(pow(under, 2.2), pow(over, 2.2), c), 1.0 / 2.2);
+    return clamp((t - under) / (over - under), 0.0, 1.0);
+}
+
 fn noise(p: vec2f) -> f32 {
     return fract(sin(dot(p, vec2f(12.9898, 78.233))) * 43758.5453);
 }
@@ -228,7 +243,7 @@ fn fs(in: VOut) -> @location(0) vec4f {
     let alpha = clip * in.p1.w;
     // Shape cut by the clip as one distance: where the edges coincide (a border on a clipped
     // panel) the edge is antialiased once, not twice, and keeps its weight around the corners.
-    let cover = clamp(0.5 - max(d, dc), 0.0, 1.0);
+    var cover = clamp(0.5 - max(d, dc), 0.0, 1.0);
     let opacity = in.p1.w;
 
     if kind == 1.0 {
@@ -312,7 +327,19 @@ fn fs(in: VOut) -> @location(0) vec4f {
 
     let bw = in.p0.y;
     if bw > 0.0 {
-        let b = premul(in.border) * clamp(d + bw + 0.5, 0.0, 1.0);
+        var band = clamp(d + bw + 0.5, 0.0, 1.0);
+        if bw <= 2.5 {
+            // A thin light line on a curve straddles two pixels at half coverage; blended in
+            // gamma space it gives less light than the same line on a straight edge, which
+            // sits on one. Coverage goes through the curve so the light adds up as in linear
+            // space: even brightness around the corner. Under the line: the fill here, and
+            // beyond the shape's edge assumed as dark as the fill over black.
+            let under = luma(col.rgb / max(col.a, 1e-4)) * col.a;
+            let over = mix(under, luma(in.border.rgb), in.border.a);
+            band = lin_cover(band, under, over);
+            cover = lin_cover(cover, under, over);
+        }
+        let b = premul(in.border) * band;
         col = b + col * (1.0 - b.a);
     }
     if kind == 2.0 {

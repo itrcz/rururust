@@ -614,8 +614,10 @@ impl Renderer {
                 parts.into_iter().filter(|(b, _)| b.right > b.left && b.bottom > b.top).filter_map(move |(bounds, a)| {
                     Some(TextArea {
                         buffer: &e?.buffer,
-                        left: t.pos.0 * scale,
-                        top: t.pos.1 * scale,
+                        // The painter put snapped text on whole pixels; float noise (20.999998)
+                        // must not fall a pixel short where glyph rows are truncated.
+                        left: on_pixel(t.pos.0 * scale),
+                        top: on_pixel(t.pos.1 * scale),
                         // Animated scale is snapped to 1/16 steps: otherwise every frame of a
                         // press or menu animation rasterizes each glyph at a brand-new size and
                         // floods the glyph atlas.
@@ -703,4 +705,10 @@ impl Renderer {
         drop(batches);
         self.scratch = quads;
     }
+}
+
+/// `v` rounded when it is a whole number give or take float error, else as is.
+fn on_pixel(v: f32) -> f32 {
+    let r = v.round();
+    if (v - r).abs() < 1e-3 { r } else { v }
 }

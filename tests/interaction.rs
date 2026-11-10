@@ -729,7 +729,7 @@ fn animate_glides_to_the_new_size_and_settles() {
         widths.push(w);
         // The neighbour takes the space as it frees up.
         let green = quads(&ui, Color::GREEN)[0];
-        assert!((green[0] - w).abs() < 0.01 && (green[2] - (800.0 - w)).abs() < 0.01);
+        assert!((green[0] - w).abs() < 0.01 && (green[2] - (800.0 - w)).abs() < 0.01, "w={w} green={green:?}");
         // The content keeps its width and is cut, not squeezed.
         if let Some(b) = quads(&ui, Color::BLUE).first() {
             assert_eq!(b[2], content_w);
@@ -2186,4 +2186,95 @@ fn bordered_clip_draws_its_border_over_children_and_cuts_them_inside_it() {
     let child = qs.iter().find(|q| q.c0 == [red.r, red.g, red.b, red.a]).unwrap();
     assert_eq!(child.clip, [1.0, 1.0, 198.0, 98.0], "children are cut inside the border");
     assert_eq!(child.p1[2], 19.0, "with the inner radius");
+}
+
+// ---------------------------------------------------------------- pixel grid
+
+fn on_grid(v: f32, scale: f32) -> bool {
+    let p = v * scale;
+    (p - p.round()).abs() < 1e-3
+}
+
+#[test]
+fn scrolled_content_stays_on_the_pixel_grid_and_text_keeps_to_its_plate() {
+    use ruru::WheelPhase::*;
+    const PLATE: Color = Color::RED;
+    const LINE: Color = Color::GREEN;
+    for scale in [1.0, 1.5, 2.0] {
+        let mut ui = Ui::new((), |_: &()| {
+            let row = |i: usize| {
+                vstack((
+                    rect().height(7.3 + i as f32 * 0.37).fill_width(),
+                    text(format!("Plate {i}")).padding(3.3).background(PLATE).radius(4.0),
+                    rect().height(0.5).fill_width().background(LINE),
+                ))
+                .align(Align::Start)
+                .padding_ltrb(10.25, 0.0, 0.0, 0.0)
+            };
+            scroll(vstack((0..40).map(row).collect::<Vec<_>>()).spacing(5.1).fill_width())
+        });
+        ui.scale = scale;
+        let size = (300.0, 400.0);
+        ui.frame(size);
+        ui.wheel((150.0, 200.0), 0.0, Started);
+        let mut rel = std::collections::HashMap::new();
+        for k in 0..12 {
+            ui.wheel((150.0, 200.0), -(3.0 + k as f32 * 0.137), Moved);
+            ui.frame(size);
+            let plates = quads(&ui, PLATE);
+            let lines = quads(&ui, LINE);
+            let ts = texts(&ui);
+            assert!(!plates.is_empty() && !lines.is_empty() && ts.len() == plates.len());
+            for q in plates.iter().chain(&lines) {
+                assert!(q.iter().all(|&v| on_grid(v, scale)), "scale {scale}: quad off the grid {q:?}");
+            }
+            for l in &lines {
+                assert!((l[3] * scale - 1.0).abs() < 1e-3, "scale {scale}: hairline is one pixel, got {l:?}");
+            }
+            for (t, p) in ts.iter().zip(&plates) {
+                assert!(on_grid(t.pos.0, scale) && on_grid(t.pos.1, scale), "scale {scale}: text at {:?}", t.pos);
+                let d = ((t.pos.0 - p[0]) * scale, (t.pos.1 - p[1]) * scale);
+                let d = (d.0.round(), d.1.round());
+                // At every offset the same distance from a text to its plate: they move as one.
+                assert_eq!(*rel.entry(t.key).or_insert(d), d, "scale {scale}: text moved against its plate");
+            }
+        }
+    }
+}
+
+#[test]
+fn animate_snaps_without_size_judder() {
+    // A sliding sidebar at 1.5x: edges land on pixels, the neighbour still meets it, the
+    // content inside keeps its size, and the width only ever moves one way.
+    let mut ui = Ui::new(true, |open: &bool| {
+        hstack((
+            vstack(rect().size(200.0, 40.0).background(Color::BLUE)).width(if *open { 280.3 } else { 0.0 }).background(Color::RED).animate(),
+            rect().fill().background(Color::GREEN),
+        ))
+        .fill()
+    });
+    let scale = 1.5;
+    ui.scale = scale;
+    let size = (800.0, 400.0);
+    ui.frame(size);
+    ui.state = false;
+    let mut widths = Vec::new();
+    for _ in 0..500 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        ui.frame(size);
+        let red = quads(&ui, Color::RED).first().copied().unwrap_or([0.0; 4]);
+        let green = quads(&ui, Color::GREEN)[0];
+        assert!(red.iter().chain(&green).all(|&v| on_grid(v, scale)), "{red:?} {green:?}");
+        assert!((green[0] - red[2]).abs() < 1e-3, "the neighbour meets it: {red:?} {green:?}");
+        if let Some(b) = quads(&ui, Color::BLUE).first() {
+            assert!((b[2] - 200.0).abs() < 1e-3 && (b[3] - 40.0).abs() < 1e-3, "content keeps its size: {b:?}");
+        }
+        widths.push(red[2]);
+        if !ui.animating {
+            break;
+        }
+    }
+    assert!(widths.len() > 5);
+    assert!(widths.windows(2).all(|p| p[1] <= p[0] + 1e-3), "no step back: {widths:?}");
+    assert_eq!(*widths.last().unwrap(), 0.0);
 }

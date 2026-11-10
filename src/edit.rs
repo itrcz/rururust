@@ -621,7 +621,7 @@ impl<S> Painter<'_, S> {
             }
             ed.scroll = (sx, sy);
         }
-        let origin = (inner.x - sx, inner.y - sy);
+        let origin = xf.at_px((inner.x - sx, inner.y - sy));
         let mut cxf = xf;
         cxf.clip = xf.clip.intersect(&xf.rect(Rect::new(inner.x - 2.0, inner.y, inner.w + 4.0, inner.h)));
         cxf.clip_r = 0.0;
