@@ -12,6 +12,9 @@ pub(crate) struct Lx<'a> {
     pub text: &'a mut TextSystem,
     pub springs: &'a mut HashMap<(u64, u8), Spring>,
     pub frame: u64,
+    /// Set by a stack for a `.flex()` child just before laying it out: the axis along which
+    /// the child takes its share, so it fills it without knowing its parent.
+    pub along: Option<Axis>,
 }
 
 impl Lx<'_> {
@@ -62,7 +65,7 @@ pub(crate) const FIELD_FONT: f32 = 17.0;
 pub(crate) const TABS_PAD: f32 = 6.0;
 
 fn fills_main<S>(v: &View<S>, axis: Axis) -> bool {
-    if matches!(v.kind, Kind::Spacer) {
+    if matches!(v.kind, Kind::Spacer) || v.style.flex > 0.0 {
         return true;
     }
     match axis {
@@ -90,6 +93,12 @@ pub(crate) fn child_id(parent: u64, index: usize, key: Option<u64>) -> u64 {
 
 pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut Lx, id: u64) -> LNode {
     let st = &v.style;
+    // A flex child fills its share along the parent's axis unless it has a size there.
+    let (dim_w, dim_h) = match lx.along.take() {
+        Some(Axis::H) if st.width == Dim::Auto => (Dim::Fill, st.height),
+        Some(Axis::V) if st.height == Dim::Auto => (st.width, Dim::Fill),
+        _ => (st.width, st.height),
+    };
     let pad = st.padding;
     let (pad_w, pad_h) = (pad[0] + pad[2], pad[1] + pad[3]);
     let clamp_w = |w: f32| w.min(st.max.0).max(st.min.0);
@@ -100,8 +109,8 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
         Dim::Fixed(x) => Some(x),
         _ => prop.or(max.is_finite().then_some(max)),
     };
-    let mut ow = offer(st.width, prop.0, st.max.0).map(clamp_w);
-    let mut oh = offer(st.height, prop.1, st.max.1).map(clamp_h);
+    let mut ow = offer(dim_w, prop.0, st.max.0).map(clamp_w);
+    let mut oh = offer(dim_h, prop.1, st.max.1).map(clamp_h);
     // An animated view collapsing to 0 keeps laying its content out at the last real size,
     // so the content slides out of view instead of being squeezed.
     let mut last = (0.0f32, 0.0f32);
@@ -121,7 +130,15 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
         Kind::Empty | Kind::Spacer => (0.0, 0.0),
         Kind::Text(t) => {
             let spec =
-                TextSpec { spans: &t.spans, text: &t.content, size: t.size, weight: t.weight as u16, center: t.center };
+                TextSpec {
+                spans: &t.spans,
+                text: &t.content,
+                size: t.size,
+                weight: t.weight as u16,
+                center: t.center,
+                line_height: t.line_height,
+                tracking: t.tracking,
+            };
             if t.lines > 0 {
                 let fade = t.truncate == Truncate::Fade;
                 let (key, size, cut) = lx.text.measure_lines(&spec, inner.0, t.lines, fade);
@@ -136,11 +153,11 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
         }
         Kind::Image(img, _) => {
             let (nw, nh) = (img.0.width as f32, img.0.height.max(1) as f32);
-            let w = match st.width {
+            let w = match dim_w {
                 Dim::Auto => inner.0.map_or(nw, |p| p.min(nw)),
                 _ => inner.0.unwrap_or(nw),
             };
-            let h = match st.height {
+            let h = match dim_h {
                 Dim::Auto => w * nh / nw.max(1.0),
                 _ => inner.1.unwrap_or(w * nh / nw.max(1.0)),
             };
@@ -149,14 +166,14 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
         Kind::TextField(f) => crate::ui::edit::layout_field(f, inner.0, lx.text, &mut node),
         Kind::Picker { options, selected, .. } => {
             let label = options.get(*selected).map_or("", |s| s.as_str());
-            let (key, size) = lx.text.measure(&TextSpec { spans: &[], text: label, size: FIELD_FONT, weight: 400, center: false }, None);
+            let (key, size) = lx.text.measure(&TextSpec { spans: &[], text: label, size: FIELD_FONT, weight: 400, center: false, ..Default::default() }, None);
             node.text = key;
             (size.0 + 26.0, size.1)
         }
         Kind::Tabs { labels, .. } => {
             let mut widest = 0.0f32;
             for l in labels {
-                let m = lx.text.measure(&TextSpec { spans: &[], text: l, size: 15.0, weight: 600, center: false }, None);
+                let m = lx.text.measure(&TextSpec { spans: &[], text: l, size: 15.0, weight: 600, center: false, ..Default::default() }, None);
                 widest = widest.max(m.1 .0);
                 node.texts.push(m);
             }
@@ -221,12 +238,13 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
             let gaps = spacing * children.len().saturating_sub(1) as f32;
             let mut used = gaps;
             let mut cross = 0.0f32;
-            let mut flex = 0usize;
+            let weight = |c: &View<_>| if c.style.flex > 0.0 { c.style.flex } else { 1.0 };
+            let mut flex = 0.0f32;
             node.children = children.iter().map(|_| LNode::default()).collect();
             // Pass 1: fixed children take what they need.
             for (i, c) in children.iter().enumerate() {
                 if fills_main(c, *axis) {
-                    flex += 1;
+                    flex += weight(c);
                     continue;
                 }
                 let n = layout(c, prop_for(main_prop.map(|m| (m - used).max(0.0))), lx, child_id(id, i, c.key));
@@ -235,11 +253,15 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
                 node.children[i] = n;
             }
             // Pass 2: flexible children share the rest.
-            if flex > 0 {
-                let share = main_prop.map(|m| ((m - used).max(0.0)) / flex as f32);
+            if flex > 0.0 {
+                let free = main_prop.map(|m| (m - used).max(0.0));
                 for (i, c) in children.iter().enumerate() {
                     if !fills_main(c, *axis) {
                         continue;
+                    }
+                    let share = free.map(|f| f * weight(c) / flex);
+                    if c.style.flex > 0.0 {
+                        lx.along = Some(*axis);
                     }
                     let mut n = layout(c, prop_for(share), lx, child_id(id, i, c.key));
                     if let (Kind::Spacer, Some(sh)) = (&c.kind, share) {
@@ -268,8 +290,8 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
         Dim::Auto => content,
     };
     node.size = (
-        clamp_w(resolve(st.width, prop.0, content.0 + pad_w)),
-        clamp_h(resolve(st.height, prop.1, content.1 + pad_h)),
+        clamp_w(resolve(dim_w, prop.0, content.0 + pad_w)),
+        clamp_h(resolve(dim_h, prop.1, content.1 + pad_h)),
     );
     // Children are placed in the size they were laid out for; an animated node then shows
     // only as much of it as its spring has reached.
@@ -287,10 +309,10 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
             laid.1 = last.1;
         }
         // A size that follows the parent (fill) tracks window resizes directly.
-        if st.width != Dim::Fill {
+        if dim_w != Dim::Fill {
             node.size.0 = lx.spring(id, SLOT_W, target.0).max(0.0);
         }
-        if st.height != Dim::Fill {
+        if dim_h != Dim::Fill {
             node.size.1 = lx.spring(id, SLOT_H, target.1).max(0.0);
         }
         node.clip = (node.size.0 - laid.0).abs() > 0.25 || (node.size.1 - laid.1).abs() > 0.25;

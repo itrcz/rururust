@@ -38,6 +38,17 @@ pub struct TextSystem {
     frame: u64,
 }
 
+/// Default line height, as a multiple of the font size.
+pub(crate) const LINE_HEIGHT: f32 = 1.3;
+/// Room on each side of a span's background plate, in em.
+const PLATE_PAD: f32 = 0.3;
+/// Gap after an inline icon, in em.
+const ICON_GAP: f32 = 0.3;
+/// Stands in for padding and icons inside a line: invisible, zero-width once shaped (so its
+/// advance is exactly the letter spacing we give it), and it joins the neighbouring word
+/// like a letter, so a plate or icon never wraps away from its text.
+const SLOT: &str = "\u{2064}";
+
 pub(crate) struct TextSpec<'a> {
     /// Styled runs; when empty, `text` is used.
     pub spans: &'a [Span],
@@ -45,6 +56,33 @@ pub(crate) struct TextSpec<'a> {
     pub size: f32,
     pub weight: u16,
     pub center: bool,
+    /// Line height as a multiple of `size`.
+    pub line_height: f32,
+    /// Letter spacing in em.
+    pub tracking: f32,
+}
+
+impl Default for TextSpec<'_> {
+    fn default() -> Self {
+        TextSpec { spans: &[], text: "", size: 17.0, weight: 400, center: false, line_height: LINE_HEIGHT, tracking: 0.0 }
+    }
+}
+
+impl TextSpec<'_> {
+    pub(crate) fn line_h(&self) -> f32 {
+        (self.size * self.line_height).round()
+    }
+}
+
+/// Where a span with a plate or an icon landed: one box per visual row it touches.
+pub(crate) struct SpanBox {
+    /// Index into the text's spans.
+    pub span: usize,
+    pub x: f32,
+    pub w: f32,
+    /// Baseline of the row.
+    pub baseline: f32,
+    pub size: f32,
 }
 
 impl TextSystem {
@@ -75,10 +113,12 @@ impl TextSystem {
         spec.text.hash(&mut h);
         for s in spec.spans {
             s.text.hash(&mut h);
-            (s.bold, s.italic, s.mono).hash(&mut h);
+            (s.bold, s.italic, s.mono, s.weight, s.size.map(f32::to_bits)).hash(&mut h);
             s.color.map(|c| [c.r.to_bits(), c.g.to_bits(), c.b.to_bits(), c.a.to_bits()]).hash(&mut h);
+            (s.background.is_some(), s.icon.is_some()).hash(&mut h);
         }
         spec.size.to_bits().hash(&mut h);
+        (spec.line_height.to_bits(), spec.tracking.to_bits()).hash(&mut h);
         spec.weight.hash(&mut h);
         spec.center.hash(&mut h);
         width.map(f32::to_bits).hash(&mut h);
@@ -95,21 +135,29 @@ impl TextSystem {
             e.used = frame;
             return (key, e.size);
         }
-        let line_h = (spec.size * 1.3).round();
+        let line_h = spec.line_h();
         let mut buffer = Buffer::new(&mut self.fonts, Metrics::new(spec.size, line_h));
         buffer.set_size(width, None);
         if ellipsis > 0 && width.is_some() {
             buffer.set_ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(ellipsis)));
         }
-        let attrs = Attrs::new().family(Family::SansSerif).weight(Weight(spec.weight));
+        let mut attrs = Attrs::new().family(Family::SansSerif).weight(Weight(spec.weight));
+        if spec.tracking != 0.0 {
+            attrs = attrs.letter_spacing(spec.tracking);
+        }
         let align = (spec.center && width.is_some()).then_some(TextAlign::Center);
-        if spec.spans.is_empty() {
+        let starts = if spec.spans.is_empty() {
             buffer.set_text(spec.text, &attrs, Shaping::Advanced, align);
+            line_starts(spec.text)
         } else {
-            let runs = spec.spans.iter().map(|s| {
+            let mut runs: Vec<(&str, Attrs)> = Vec::with_capacity(spec.spans.len());
+            for (i, s) in spec.spans.iter().enumerate() {
                 let mut a = attrs.clone();
                 if s.bold {
                     a = a.weight(Weight(700));
+                }
+                if let Some(w) = s.weight {
+                    a = a.weight(Weight(w as u16));
                 }
                 if s.italic {
                     a = a.cache_key_flags(CacheKeyFlags::FAKE_ITALIC); // slanted, no extra font file
@@ -121,26 +169,58 @@ impl TextSystem {
                     let to8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
                     a = a.color(TextColor::rgba(to8(c.r), to8(c.g), to8(c.b), to8(c.a)));
                 }
-                (s.text.as_str(), a)
-            });
+                let size = s.size.unwrap_or(spec.size);
+                if s.size.is_some() {
+                    a = a.metrics(Metrics::new(size, (size * spec.line_height).round()));
+                }
+                // Plates and icons find their glyphs again by this tag.
+                if s.background.is_some() || s.icon.is_some() {
+                    a = a.metadata(i + 1);
+                    let slot = |em: f32| a.clone().letter_spacing(em);
+                    if s.icon.is_some() {
+                        runs.push((SLOT, slot(1.0 + ICON_GAP)));
+                        continue;
+                    }
+                    runs.push((SLOT, slot(PLATE_PAD)));
+                    runs.push((s.text.as_str(), a.clone()));
+                    runs.push((SLOT, slot(PLATE_PAD)));
+                    continue;
+                }
+                runs.push((s.text.as_str(), a));
+            }
+            let starts = line_starts(&runs.iter().map(|r| r.0).collect::<String>());
             buffer.set_rich_text(runs, &attrs, Shaping::Advanced, align);
-        }
-        buffer.shape_until_scroll(&mut self.fonts, false);
-        let starts = if spec.spans.is_empty() {
-            line_starts(spec.text)
-        } else {
-            line_starts(&spec.spans.iter().map(|s| s.text.as_str()).collect::<String>())
+            starts
         };
-        let (mut w, mut lines) = (0.0f32, 0u32);
+        buffer.shape_until_scroll(&mut self.fonts, false);
+        let (mut w, mut h) = (0.0f32, 0.0f32);
         for run in buffer.layout_runs() {
             w = w.max(run.line_w);
-            lines += 1;
+            h = h.max(run.line_top + run.line_height);
         }
         // A centered, wrapped block occupies its full wrap width.
         let w = if align.is_some() { width.unwrap() } else { w.ceil() };
-        let size = (w, lines.max(1) as f32 * line_h);
+        let size = (w, if h > 0.0 { h } else { line_h });
         self.entries.insert(key, Entry { buffer, size, starts, used: frame });
         (key, size)
+    }
+
+    /// Boxes of the spans that have a plate or an icon, row by row.
+    pub(crate) fn span_boxes(&self, key: u64, out: &mut Vec<SpanBox>) {
+        let Some(e) = self.entries.get(&key) else { return };
+        for run in e.buffer.layout_runs() {
+            for g in run.glyphs {
+                if g.metadata == 0 {
+                    continue;
+                }
+                match out.last_mut() {
+                    Some(b) if b.span + 1 == g.metadata && b.baseline == run.line_y && g.x <= b.x + b.w + 0.5 => {
+                        b.w = (g.x + g.w - b.x).max(b.w);
+                    }
+                    _ => out.push(SpanBox { span: g.metadata - 1, x: g.x, w: g.w, baseline: run.line_y, size: g.font_size }),
+                }
+            }
+        }
     }
 
     /// Returns a cache key for the shaped text and its size, wrapping at `max_w` if needed.
@@ -162,7 +242,7 @@ impl TextSystem {
         lines: usize,
         fade: bool,
     ) -> (u64, (f32, f32), bool) {
-        let line_h = (spec.size * 1.3).round();
+        let line_h = spec.line_h();
         let max_h = lines as f32 * line_h;
         let natural = self.entry(spec, None, 0);
         let w = match max_w {
@@ -365,7 +445,7 @@ mod tests {
     use super::*;
 
     fn shaped(ts: &mut TextSystem, text: &str, w: Option<f32>) -> u64 {
-        ts.measure(&TextSpec { spans: &[], text, size: 17.0, weight: 400, center: false }, w).0
+        ts.measure(&TextSpec { text, ..Default::default() }, w).0
     }
 
     #[test]

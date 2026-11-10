@@ -416,6 +416,52 @@ impl<S> Painter<'_, S> {
         }));
     }
 
+    /// A picture filling `r`; with `tint` only its shape is used, painted in that color.
+    fn picture(&mut self, xf: &Xf, r: Rect, radius: f32, img: &Image, tint: Option<Color>, border: Option<(f32, Color)>) {
+        let mut q = self.quad(xf, r, radius, KIND_IMAGE);
+        if let Some(c) = tint {
+            q.c1[1] = 1.0;
+            q.c1[2] = c.r;
+            q.c1[3] = c.g;
+            q.p1[0] = c.b;
+            q.p1[1] = c.a;
+        }
+        // Fill the box and crop the overflow, keeping the picture's aspect ratio.
+        let (iw, ih) = (img.0.width.max(1) as f32, img.0.height.max(1) as f32);
+        let k = (r.w / iw).max(r.h / ih).max(1e-6);
+        let (uw, uh) = (r.w / (iw * k) * 0.5, r.h / (ih * k) * 0.5);
+        q.c0 = [0.5 - uw, 0.5 - uh, 0.5 + uw, 0.5 + uh];
+        q.c1[0] = self.list.images.len() as f32;
+        if let Some((w, c)) = border {
+            q.border = c.arr();
+            q.p0[1] = w * xf.s;
+        }
+        self.list.images.push(img.clone());
+        self.list.cmds.push(Cmd::Quad(q));
+    }
+
+    /// Plates and icons of a rich text, drawn under its glyphs.
+    fn span_decor(&mut self, xf: &Xf, key: u64, spans: &[crate::view::Span], at: (f32, f32)) {
+        if !spans.iter().any(|s| s.background.is_some() || s.icon.is_some()) {
+            return;
+        }
+        let mut boxes = Vec::new();
+        self.text.span_boxes(key, &mut boxes);
+        for b in boxes {
+            let Some(s) = spans.get(b.span) else { continue };
+            let base = at.1 + b.baseline;
+            if let Some(img) = &s.icon {
+                // One em square, centered on the cap height so it sits with capitals.
+                let r = Rect::new(at.0 + b.x, base - 0.36 * b.size - 0.5 * b.size, b.size, b.size);
+                self.picture(xf, r, 0.0, img, Some(s.color.unwrap_or(xf.fg)), None);
+            } else if let Some(c) = s.background {
+                // From the descender to just above the capitals: ~15 pt at 14 pt text.
+                let r = Rect::new(at.0 + b.x, base - 0.8 * b.size, b.w, 1.08 * b.size);
+                self.fill(xf, r, 0.28 * b.size, Fill::Solid(c), None);
+            }
+        }
+    }
+
     /// Spring that starts from `initial` the first time it is seen (appear animations).
     fn spring_from(&mut self, id: u64, slot: u8, initial: f32, target: f32) -> f32 {
         let s = self.springs.entry((id, slot)).or_insert(Spring::new(initial, target, Spring::BOUNCY));
@@ -449,7 +495,7 @@ impl<S> Painter<'_, S> {
         // Anything outside the menu closes it.
         self.hits.push(Hit { id: m.id ^ 0xD15, rect: screen, round: NO_ROUND, action: Action::Dismiss });
         self.zones.push(Zone { id: m.id ^ 0xD15, rect: screen, round: NO_ROUND, cursor: None, blocks: true });
-        let spec = |text| TextSpec { spans: &[], text, size: FIELD_FONT, weight: 400, center: false };
+        let spec = |text| TextSpec { spans: &[], text, size: FIELD_FONT, weight: 400, center: false, ..Default::default() };
         let rows: Vec<(u64, (f32, f32))> = m.options.iter().map(|o| self.text.measure(&spec(o), None)).collect();
         let (check, check_size) = self.text.measure(&TextSpec { weight: 600, ..spec("✓") }, None);
         let widest = rows.iter().map(|r| r.1 .0).fold(0.0, f32::max);
@@ -661,7 +707,7 @@ impl<S> Painter<'_, S> {
                     }
                     let rv = row(i);
                     let cid = child_id(id, i, rv.key);
-                    let mut lx = Lx { text: self.text, springs: self.springs, frame: self.frame };
+                    let mut lx = Lx { text: self.text, springs: self.springs, frame: self.frame, along: None };
                     let n = layout(&rv, (Some(r.w), None), &mut lx, cid);
                     if known.is_nan() || (n.size.1 - known).abs() > 0.5 {
                         if let Some(slot) = self.text.lists.get_mut(&id).and_then(|c| c.heights.get_mut(i)) {
@@ -712,27 +758,7 @@ impl<S> Painter<'_, S> {
                 self.paint(*child, cn, pos, cxf, cid);
             }
             Kind::Image(img, template) => {
-                let mut q = self.quad(&xf, r, st.radius, KIND_IMAGE);
-                if template {
-                    // A glyph: keep only the shape, paint it in the text color.
-                    q.c1[1] = 1.0;
-                    q.c1[2] = xf.fg.r;
-                    q.c1[3] = xf.fg.g;
-                    q.p1[0] = xf.fg.b;
-                    q.p1[1] = xf.fg.a;
-                }
-                // Fill the box and crop the overflow, keeping the picture's aspect ratio.
-                let (iw, ih) = (img.0.width.max(1) as f32, img.0.height.max(1) as f32);
-                let k = (r.w / iw).max(r.h / ih).max(1e-6);
-                let (uw, uh) = (r.w / (iw * k) * 0.5, r.h / (ih * k) * 0.5);
-                q.c0 = [0.5 - uw, 0.5 - uh, 0.5 + uw, 0.5 + uh];
-                q.c1[0] = self.list.images.len() as f32;
-                if let Some((w, c)) = st.border {
-                    q.border = c.arr();
-                    q.p0[1] = w * xf.s;
-                }
-                self.list.images.push(img);
-                self.list.cmds.push(Cmd::Quad(q));
+                self.picture(&xf, r, st.radius, &img, template.then_some(xf.fg), st.border);
             }
             Kind::TextField(f) => self.paint_field(f, &st, r, sr, xf, id),
             Kind::Tabs { labels, selected, on_select } => {
@@ -782,7 +808,7 @@ impl<S> Painter<'_, S> {
             Kind::Picker { options, selected, on_select } => {
                 let inner = Rect::new(r.x + pad[0], r.y + pad[1], r.w - pad[0] - pad[2], r.h - pad[1] - pad[3]);
                 self.label(&xf, ln.text, (inner.x, inner.y), (inner.w - 26.0, inner.h), xf.fg);
-                let spec = TextSpec { spans: &[], text: "⌄", size: 15.0, weight: 700, center: false };
+                let spec = TextSpec { spans: &[], text: "⌄", size: 15.0, weight: 700, center: false, ..Default::default() };
                 let (chev, cs) = self.text.measure(&spec, None);
                 let at = (inner.x + inner.w - cs.0 - 2.0, inner.y + (inner.h - cs.1) * 0.5 - 3.0);
                 self.label(&xf, chev, at, cs, xf.fg.alpha(xf.fg.a * 0.6));
@@ -797,10 +823,13 @@ impl<S> Painter<'_, S> {
                 // Text limited to some lines is cut to its box; the last line may fade out.
                 let clip = if t.lines > 0 { xf.clip.intersect(&box_.inflate(1.0)) } else { xf.clip };
                 let fade = (ln.fade && t.truncate == Truncate::Fade).then(|| {
-                    let line_h = (t.size * 1.3).round() * xf.s;
+                    let line_h = (t.size * t.line_height).round() * xf.s;
                     let w = (FADE_W * xf.s).min(box_.w * 0.5);
                     Rect::new(box_.x + box_.w - w, box_.y + box_.h - line_h, w, line_h)
                 });
+                let mut dxf = xf;
+                dxf.clip = clip;
+                self.span_decor(&dxf, ln.text, &t.spans, (inner.x, inner.y));
                 self.list.cmds.push(Cmd::Text(TextCmd {
                     key: ln.text,
                     pos: (box_.x, box_.y),
@@ -1106,7 +1135,7 @@ impl<S: 'static> Ui<S> {
             titlebar: self.titlebar,
             window_buttons: self.window_buttons,
         });
-        let mut lx = Lx { text: &mut self.text, springs: &mut self.springs, frame: self.frame };
+        let mut lx = Lx { text: &mut self.text, springs: &mut self.springs, frame: self.frame, along: None };
         let root = layout(&view, (Some(size.0), Some(size.1)), &mut lx, 1);
         self.list.cmds.clear();
         self.list.images.clear();
@@ -1192,7 +1221,7 @@ impl<S: 'static> Ui<S> {
             self.fps_label = format!("{:.0} fps  {:.1} ms", self.fps, self.frame_ms);
             self.fps_label_at = Some(now);
         }
-        let spec = TextSpec { spans: &[], text: &self.fps_label, size: 12.0, weight: 600, center: false };
+        let spec = TextSpec { spans: &[], text: &self.fps_label, size: 12.0, weight: 600, center: false, ..Default::default() };
         let (key, ts) = self.text.measure(&spec, None);
         let clip = Rect::new(0.0, 0.0, size.0, size.1);
         let (w, h) = (ts.0 + 16.0, ts.1 + 8.0);

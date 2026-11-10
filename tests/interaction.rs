@@ -1019,3 +1019,112 @@ fn caret_blinks_with_timers_not_continuous_frames() {
     assert!(!ui.animating);
     assert!(ui.wake_in.is_none(), "a selection doesn't blink: no wake-ups");
 }
+
+// ---- typography: line height, letter spacing, span weight/size, plates, icons, flex
+
+fn text_size(make: impl Fn() -> View<()> + 'static) -> (f32, f32) {
+    let mut ui = Ui::new((), move |_: &()| vstack(make()).place(Align::Start, Align::Start));
+    ui.frame((600.0, 400.0));
+    texts(&ui)[0].size
+}
+
+#[test]
+fn line_height_sets_the_row_pitch() {
+    let base = text_size(|| text(LONG).font_size(14.0).width(120.0));
+    let airy = text_size(|| text(LONG).font_size(14.0).line_height(1.625).width(120.0));
+    let rows = (base.1 / 18.0).round();
+    assert!(rows >= 3.0, "{base:?}");
+    assert_eq!(base.1, rows * 18.0); // 14 * 1.3
+    assert_eq!(airy.1, rows * 23.0); // 14 * 1.625, rounded
+    assert_eq!(text_size(|| text("one").font_size(14.0).line_height(1.625)).1, 23.0);
+}
+
+#[test]
+fn letter_spacing_weight_and_size_of_spans() {
+    let plain = text_size(|| text("Spacing").font_size(14.0));
+    let loose = text_size(|| text("Spacing").font_size(14.0).letter_spacing(0.1));
+    // 7 letters, 1.4 pt each.
+    assert!((loose.0 - plain.0 - 9.8).abs() < 1.5, "{plain:?} {loose:?}");
+    let regular = text_size(|| rich_text(vec![Span::new("Semibold words")]));
+    let semi = text_size(|| rich_text(vec![Span::new("Semibold words").weight(Weight::Semibold)]));
+    let bold = text_size(|| rich_text(vec![Span::new("Semibold words").bold()]));
+    assert!(regular.0 < semi.0 && semi.0 < bold.0, "{regular:?} {semi:?} {bold:?}");
+    let big = text_size(|| rich_text(vec![Span::new("a "), Span::new("Big").size(34.0)]));
+    assert!(big.1 >= 44.0 && regular.1 == 22.0, "{big:?}");
+}
+
+#[test]
+fn background_plate_follows_the_span_and_keeps_the_line_height() {
+    let plate = Color::hex(0x303030);
+    let row = move |bg: bool| {
+        let code = Span::new("wgpu").code();
+        let code = if bg { code.background(plate) } else { code };
+        rich_text(vec![Span::new("use "), code, Span::new(" here")]).font_size(14.0)
+    };
+    let without = text_size(move || row(false));
+    let mut ui = Ui::new((), move |_: &()| vstack(row(true)).place(Align::Start, Align::Start));
+    ui.frame((600.0, 400.0));
+    let with = texts(&ui)[0].size;
+    assert_eq!(with.1, without.1, "the plate does not make the line taller");
+    // Room on both sides: 2 x 0.3 em.
+    assert!((with.0 - without.0 - 8.4).abs() < 1.0, "{without:?} {with:?}");
+    let q = quads(&ui, plate);
+    assert_eq!(q.len(), 1);
+    let [x, y, w, h] = q[0];
+    assert!(x > 20.0 && w > 30.0 && w < 50.0, "{:?}", q[0]);
+    assert!(y >= 0.0 && y + h <= with.1 && (h - 15.1).abs() < 0.5, "{:?}", q[0]);
+
+    // Wrapped across two rows: one plate per row.
+    let mut ui = Ui::new((), move |_: &()| {
+        vstack(rich_text(vec![Span::new("x "), Span::new("alpha beta gamma delta").code().background(plate)]).font_size(14.0).width(110.0))
+            .place(Align::Start, Align::Start)
+    });
+    ui.frame((600.0, 400.0));
+    let q = quads(&ui, plate);
+    assert!(q.len() >= 2 && q[1][1] > q[0][1], "{q:?}");
+}
+
+#[test]
+fn inline_icon_takes_room_in_the_line() {
+    let img = Image::from_rgba(2, 2, vec![255; 16]);
+    let plain = text_size(|| rich_text(vec![Span::new("egui")]).font_size(14.0));
+    let img2 = img.clone();
+    let mut ui = Ui::new((), move |_: &()| {
+        vstack(rich_text(vec![Span::icon(&img2), Span::new("egui")]).font_size(14.0)).place(Align::Start, Align::Start)
+    });
+    ui.frame((600.0, 400.0));
+    let with = texts(&ui)[0].size;
+    assert_eq!(with.1, plain.1);
+    assert!((with.0 - plain.0 - 14.0 * 1.3).abs() < 1.0, "{plain:?} {with:?}");
+    assert_eq!(ui.list.images.len(), 1);
+}
+
+#[test]
+fn flex_shares_the_free_space_by_weight() {
+    let mut ui = Ui::new((), |_: &()| {
+        hstack((
+            rect().width(40.0).height(10.0).background(Color::GRAY),
+            rect().height(10.0).flex(1.0).background(Color::RED),
+            rect().height(10.0).flex(3.0).background(Color::GREEN),
+            rect().height(10.0).fill_width().background(Color::BLUE),
+        ))
+        .spacing(10.0)
+        .width(570.0)
+        .place(Align::Start, Align::Start)
+    });
+    ui.frame((600.0, 400.0));
+    // 570 - 40 - 3 * 10 = 500 shared 1 : 3 : 1.
+    assert_eq!(quads(&ui, Color::RED)[0][2], 100.0);
+    assert_eq!(quads(&ui, Color::GREEN)[0][2], 300.0);
+    assert_eq!(quads(&ui, Color::BLUE)[0][2], 100.0);
+    assert_eq!(quads(&ui, Color::GREEN)[0][0], 160.0);
+    // In a vstack it shares the height.
+    let mut ui = Ui::new((), |_: &()| {
+        vstack((rect().width(10.0).flex(1.0).background(Color::RED), rect().width(10.0).flex(2.0).background(Color::GREEN)))
+            .height(300.0)
+            .place(Align::Start, Align::Start)
+    });
+    ui.frame((600.0, 400.0));
+    assert_eq!(quads(&ui, Color::RED)[0][3], 100.0);
+    assert_eq!(quads(&ui, Color::GREEN)[0][3], 200.0);
+}

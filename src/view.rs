@@ -43,7 +43,7 @@ pub struct Mods {
     pub alt: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Weight {
     Regular = 400,
     Medium = 500,
@@ -162,6 +162,8 @@ pub(crate) struct Style {
     /// Highlight laid over the background while the pointer is over the view.
     pub hover: Option<Color>,
     pub cursor: Option<Cursor>,
+    /// Share of the free space along the parent stack's axis (`.flex()`); 0 = not set.
+    pub flex: f32,
 }
 
 impl Default for Style {
@@ -186,6 +188,7 @@ impl Default for Style {
             animate: false,
             hover: None,
             cursor: None,
+            flex: 0.0,
         }
     }
 }
@@ -199,6 +202,14 @@ pub struct Span {
     /// Monospaced, for code.
     pub mono: bool,
     pub color: Option<Color>,
+    /// Exact weight; wins over `bold`.
+    pub weight: Option<Weight>,
+    /// Font size in points; the text's own size when unset.
+    pub size: Option<f32>,
+    /// Rounded plate under the run (inline code, tags); see [`Span::background`].
+    pub background: Option<Color>,
+    /// A picture shown in the line instead of text; see [`Span::icon`].
+    pub icon: Option<Image>,
 }
 
 impl Span {
@@ -220,6 +231,28 @@ impl Span {
     pub fn color(mut self, c: Color) -> Self {
         self.color = Some(c);
         self
+    }
+    /// Any weight, e.g. semibold for emphasis: `Span::new("Note").weight(Weight::Semibold)`.
+    pub fn weight(mut self, w: Weight) -> Self {
+        self.weight = Some(w);
+        self
+    }
+    /// Font size of this run in points; its line grows to fit.
+    pub fn size(mut self, pt: f32) -> Self {
+        self.size = Some(pt.max(1.0));
+        self
+    }
+    /// A rounded plate under the run that follows it across line wraps, with a little room
+    /// on both sides: `Span::new("wgpu").code().background(Color::hex(0x303030))`.
+    /// It never makes the line taller.
+    pub fn background(mut self, c: Color) -> Self {
+        self.background = Some(c);
+        self
+    }
+    /// A glyph-like picture inside the line, one em wide, followed by a small gap and painted
+    /// in the run's color (like [`icon`]): `Span::icon(&github).color(link)`, then the link text.
+    pub fn icon(img: &Image) -> Self {
+        Span { icon: Some(img.clone()), ..Default::default() }
     }
 }
 
@@ -286,6 +319,10 @@ pub(crate) struct TextData {
     /// Most lines shown; 0 = no limit.
     pub lines: usize,
     pub truncate: Truncate,
+    /// Line height as a multiple of the font size.
+    pub line_height: f32,
+    /// Extra space between letters, in em.
+    pub tracking: f32,
 }
 
 /// How text that does not fit its lines ends (see [`View::lines`], [`View::truncate`]).
@@ -320,6 +357,12 @@ pub enum Cursor {
 /// your state or a static.
 #[derive(Clone)]
 pub struct Image(pub(crate) Arc<ImageData>);
+
+impl std::fmt::Debug for Image {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Image({}x{})", self.0.width, self.0.height)
+    }
+}
 
 pub(crate) struct ImageData {
     pub id: u64,
@@ -506,6 +549,17 @@ impl<S> View<S> {
         self.style.animate = true;
         self
     }
+    /// Inside an `hstack` / `vstack`: take a share of the space left after the other
+    /// children, in proportion to `weight` among siblings with `.flex()` or `.fill_*()`
+    /// (those count as 1). Proportional columns at any width:
+    ///
+    /// ```ignore
+    /// hstack((name.flex(1.0), value.flex(1.5), note.flex(1.5)))
+    /// ```
+    pub fn flex(mut self, weight: f32) -> Self {
+        self.style.flex = weight.max(0.0);
+        self
+    }
     /// Position inside a parent `zstack` (horizontal, vertical).
     pub fn place(mut self, x: Align, y: Align) -> Self {
         self.style.place = Some((x, y));
@@ -617,6 +671,22 @@ impl<S> View<S> {
     pub fn weight(mut self, w: Weight) -> Self {
         if let Kind::Text(t) = &mut self.kind {
             t.weight = w;
+        }
+        self
+    }
+    /// Text only: line height as a multiple of the font size (1.3 unless set). Reading text
+    /// usually wants 1.4–1.6: `text(body).font_size(14.0).line_height(1.625)`.
+    pub fn line_height(mut self, k: f32) -> Self {
+        if let Kind::Text(t) = &mut self.kind {
+            t.line_height = k.max(0.5);
+        }
+        self
+    }
+    /// Text only: extra space between letters in em (0.01 = 1 % of the font size);
+    /// negative tightens. Small text often reads better a little looser.
+    pub fn letter_spacing(mut self, em: f32) -> Self {
+        if let Kind::Text(t) = &mut self.kind {
+            t.tracking = em;
         }
         self
     }
@@ -760,6 +830,8 @@ pub fn text<S>(content: impl Into<String>) -> View<S> {
         center: false,
         lines: 0,
         truncate: Truncate::Ellipsis,
+        line_height: crate::text::LINE_HEIGHT,
+        tracking: 0.0,
     }))
 }
 /// Text made of differently styled runs (bold, italic, code, colored) that wrap together.
@@ -772,6 +844,8 @@ pub fn rich_text<S>(spans: Vec<Span>) -> View<S> {
         center: false,
         lines: 0,
         truncate: Truncate::Ellipsis,
+        line_height: crate::text::LINE_HEIGHT,
+        tracking: 0.0,
     }))
 }
 /// Flexible empty space inside a stack.

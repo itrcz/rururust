@@ -31,11 +31,13 @@ pub(crate) struct Field<S> {
     pub max_lines: usize,
     /// No ring of its own: the app draws the container.
     pub plain: bool,
+    /// Placeholder color; the text color at 40 % when unset.
+    pub placeholder_color: Option<Color>,
 }
 
 impl<S> Field<S> {
     pub(crate) fn new(value: String, placeholder: String, on_change: Box<dyn Fn(&mut S, String)>) -> Self {
-        Field { value, placeholder, on_change, on_submit: None, size: FIELD_FONT, max_lines: 1, plain: false }
+        Field { value, placeholder, on_change, on_submit: None, size: FIELD_FONT, max_lines: 1, plain: false, placeholder_color: None }
     }
 }
 
@@ -79,6 +81,13 @@ impl<S> View<S> {
         }
         self
     }
+    /// Text field: color of the placeholder (the text color at 40 % unless set).
+    pub fn placeholder_color(mut self, c: Color) -> Self {
+        if let Some(f) = self.field() {
+            f.placeholder_color = Some(c);
+        }
+        self
+    }
     /// Text field without its own look: no background, padding, corners or focus ring.
     /// Put it in a container styled the way the app needs (e.g. a chat composer).
     pub fn plain(mut self) -> Self {
@@ -94,11 +103,11 @@ impl<S> View<S> {
 }
 
 fn line_h(size: f32) -> f32 {
-    (size * 1.3).round() // as text.rs lays out lines
+    (size * crate::text::LINE_HEIGHT).round() // as text.rs lays out lines
 }
 
 fn spec(text: &str, size: f32) -> TextSpec<'_> {
-    TextSpec { spans: &[], text, size, weight: 400, center: false }
+    TextSpec { spans: &[], text, size, weight: 400, center: false, ..Default::default() }
 }
 
 fn wrap_at(multi: bool, w: f32) -> Option<f32> {
@@ -624,7 +633,8 @@ impl<S> Painter<'_, S> {
         }
         if f.value.is_empty() && pre.is_none() {
             let (key_p, size_p) = self.text.measure(&spec(&f.placeholder, f.size), wrap);
-            self.label(&cxf, key_p, origin, size_p, xf.fg.alpha(xf.fg.a * 0.4));
+            let color = f.placeholder_color.unwrap_or(xf.fg.alpha(xf.fg.a * 0.4));
+            self.label(&cxf, key_p, origin, size_p, color);
         } else {
             self.label(&cxf, key_d, origin, (size_d.0.max(inner.w), size_d.1.max(inner.h)), xf.fg);
         }
