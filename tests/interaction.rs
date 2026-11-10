@@ -1353,3 +1353,90 @@ fn selection_runs_across_lazy_rows_and_copies_rows_off_screen() {
     ui.frame(size);
     assert_eq!(built.get() - b, per_frame, "select-all builds nothing extra while painting");
 }
+
+#[test]
+fn selection_drag_at_the_edge_scrolls_until_released() {
+    let mut ui = Ui::new((), |_: &()| scroll(list(1000, 40.0, |i| text(format!("row {i}")).height(40.0)).selectable()));
+    let size = (300.0, 400.0);
+    ui.frame(size);
+    ui.pointer_down((2.0, 15.0), false);
+    ui.pointer_move((150.0, 395.0)); // inside the bottom 24 pt
+    ui.frame(size);
+    assert!(ui.animating, "keeps scrolling without input");
+    for _ in 0..20 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        ui.frame(size);
+    }
+    let t = ui.selection_text().unwrap();
+    let last: usize = t.rsplit("row ").next().unwrap().trim().parse().unwrap_or(0);
+    assert!(last >= 10, "selection followed the scroll: ends at row {last}");
+    ui.pointer_up((150.0, 395.0));
+    let mut frames = 0;
+    let before = ui.selection_text();
+    while ui.animating {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        ui.frame(size);
+        frames += 1;
+        assert!(frames < 400, "idle after release");
+    }
+    assert_eq!(ui.selection_text(), before, "released: no more scrolling");
+}
+
+#[derive(Default)]
+struct Links {
+    opened: Vec<String>,
+}
+
+fn links_ui(handler: bool) -> Ui<Links> {
+    let mut ui = Ui::new(Links::default(), move |_: &Links| {
+        let line = rich_text(vec![
+            Span::new("See the "),
+            Span::new("documentation").link("https://example.com/docs").color(Color::TEAL),
+            Span::new(" or "),
+            Span::new("this").link("javascript:alert(1)"),
+        ]);
+        let v = vstack(line).selectable().place(Align::Start, Align::Start);
+        if handler {
+            v.on_link(|s: &mut Links, url| s.opened.push(url.to_string()))
+        } else {
+            v
+        }
+    });
+    ui.frame((500.0, 200.0));
+    ui
+}
+
+#[test]
+fn links_open_on_click_underline_on_hover_and_select_on_drag() {
+    let mut ui = links_ui(false);
+    let (x, y, w, h) = text_rects(&ui)[0];
+    // "documentation" sits around 40 % of the line.
+    let link = (x + w * 0.4, y + h * 0.5);
+    ui.pointer_move(link);
+    assert_eq!(ui.cursor, Cursor::Pointer);
+    ui.frame((500.0, 200.0));
+    assert_eq!(quads(&ui, Color::TEAL).len(), 1, "underlined while hovered");
+    click(&mut ui, link);
+    assert_eq!(ui.requests, vec![ruru::WindowRequest::OpenUrl("https://example.com/docs".into())]);
+    // Only http(s) and mailto open without a handler.
+    ui.requests.clear();
+    click(&mut ui, (x + w - 3.0, y + h * 0.5));
+    assert!(ui.requests.is_empty());
+    // Off the link: no hand, no underline.
+    ui.pointer_move((x + 3.0, y + h * 0.5));
+    assert_eq!(ui.cursor, Cursor::Text);
+    ui.frame((500.0, 200.0));
+    assert!(quads(&ui, Color::TEAL).is_empty());
+    // A press on the link that moves away selects instead of opening.
+    drag(&mut ui, link, (x + 2.0, y + h * 0.5));
+    assert!(ui.requests.is_empty());
+    let t = ui.selection_text().unwrap();
+    assert!(t.starts_with("See the ") && t.len() > 8, "{t:?}");
+
+    // With `.on_link()` the app gets every URL.
+    let mut ui = links_ui(true);
+    click(&mut ui, link);
+    click(&mut ui, (x + w - 3.0, y + h * 0.5));
+    assert!(ui.requests.is_empty());
+    assert_eq!(ui.state.opened, vec!["https://example.com/docs".to_string(), "javascript:alert(1)".to_string()]);
+}
