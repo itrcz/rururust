@@ -1940,3 +1940,107 @@ fn resizing_keeps_the_top_row_of_a_parked_feed_in_place() {
         assert!((y - y0).abs() < 1.0, "at width {w} row {top} moved {y0} → {y}");
     }
 }
+
+// ---------------------------------------------------------------- selection in a chat window
+
+const ANSWER: &str = "First paragraph of the answer with some words.\n\n| key | value |\n|---|---|\n| alpha | beta gamma |\n\n```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n\nLast line.";
+
+struct Gw {
+    draft: String,
+    open: bool,
+}
+
+/// The window of the chat app this was reported against: a title bar to drag the window
+/// by, a rounded clipped panel with an outline on top, a sidebar, the feed (a selectable
+/// lazy list of markdown in a centered column, stuck to the bottom) and a composer.
+fn grom() -> Ui<Gw> {
+    use ruru::{CodeBlockStyle, MarkdownStyle, TableStyle};
+    let style = std::rc::Rc::new(MarkdownStyle {
+        code_block: CodeBlockStyle { radius: 8.0, padding: 12.0, ..Default::default() },
+        table: TableStyle { rule: Some((1.0, Color::WHITE.alpha(0.1))), ..Default::default() },
+        ..Default::default()
+    });
+    let mut ui = Ui::new(Gw { draft: String::new(), open: true }, move |s: &Gw| {
+        let style = style.clone();
+        let hover_btn = || zstack(rect().size(16.0, 16.0)).size(28.0, 28.0).radius(6.0).hover(Color::WHITE.alpha(0.1));
+        let titlebar = hstack((hover_btn().on_tap(|s: &mut Gw| s.open = !s.open), text("Title").fill_width(), hover_btn()))
+            .fill_width()
+            .height(40.0)
+            .window_drag();
+        let rows = list(3, 120.0, move |k| {
+            let actions = hstack((rect().size(16.0, 16.0), rect().size(16.0, 16.0))).spacing(8.0).copy_as("");
+            vstack((ruru::markdown_styled(ANSWER, &style), actions)).spacing(8.0).align(Align::Start).fill_width().padding_v(k as f32 + 12.0)
+        })
+        .selectable();
+        let column = zstack(rows.fill_width().max_width(600.0)).fill_width();
+        let feed = scroll(column.padding_ltrb(24.0, 12.0, 24.0, 20.0)).stick_to_bottom().fill().color(Color::WHITE);
+        let field = text_field(s.draft.as_str(), "Ask", |s: &mut Gw, v| s.draft = v).multiline().plain();
+        let composer = zstack(vstack((field, hstack((rect().size(20.0, 20.0), spacer())).fill_width())).fill_width().max_width(600.0).padding(12.0).background(Color::hex(0x303030)).border(1.0, Color::WHITE.alpha(0.1)).radius(16.0))
+            .fill_width()
+            .padding(12.0);
+        let workspace = vstack((feed, composer)).fill();
+        let sidebar = hstack((vstack(text("chat")).fill(), rect().width(1.0).fill_height())).width(if s.open { 200.0 } else { 0.0 }).fill_height().animate();
+        let outline = rect().fill().radius(12.0).border(1.0, Color::WHITE.alpha(0.1));
+        let panel = zstack((hstack((sidebar, workspace)).fill(), outline)).fill().background(Color::hex(0x202020)).radius(12.0).clip();
+        let body = hstack((rect().width(50.0).fill_height(), panel)).fill().padding_ltrb(0.0, 0.0, 8.0, 8.0);
+        vstack((titlebar, body)).fill().selection_color(Color::hex(0x2060ff).alpha(0.4))
+    });
+    for _ in 0..6 {
+        ui.frame((1000.0, 1200.0));
+    }
+    ui
+}
+
+/// A mouse drag as a person does it: frames in between, the pointer moving in steps.
+fn drag_live(ui: &mut Ui<Gw>, from: (f32, f32), to: (f32, f32)) {
+    ui.pointer_move(from);
+    ui.frame((1000.0, 1200.0));
+    ui.pointer_down(from, false);
+    ui.frame((1000.0, 1200.0));
+    for k in 1..=8 {
+        let t = k as f32 / 8.0;
+        ui.pointer_move((from.0 + (to.0 - from.0) * t, from.1 + (to.1 - from.1) * t));
+        ui.frame((1000.0, 1200.0));
+    }
+    ui.pointer_up(to);
+    ui.frame((1000.0, 1200.0));
+}
+
+/// Text rects of the feed, top to bottom (title, sidebar and field placeholder left out).
+fn feed_texts(ui: &Ui<Gw>) -> Vec<(f32, f32, f32, f32)> {
+    let mut r: Vec<_> = text_rects(ui).into_iter().filter(|r| r.0 > 280.0 && r.1 > 45.0 && r.1 < 1000.0).collect();
+    r.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap().then(a.0.partial_cmp(&b.0).unwrap()));
+    r
+}
+
+#[test]
+fn chat_window_selects_paragraphs_cells_and_code() {
+    let mut ui = grom();
+    let t = feed_texts(&ui);
+    assert!(t.len() >= 3 * 6, "three messages on screen: {t:?}");
+    // A paragraph: from its start to the middle.
+    let p = t[0];
+    drag_live(&mut ui, (p.0 + 1.0, p.1 + p.3 * 0.5), (p.0 + p.2 * 0.5, p.1 + p.3 * 0.5));
+    let s = ui.selection_text().unwrap_or_default();
+    assert!(s.starts_with("First par") && s.len() > 10, "paragraph: {s:?}");
+    assert!(ui.cursor == ruru::Cursor::Text, "an I-beam over text");
+
+    // A table cell.
+    let cell = *t.iter().find(|r| r.1 > p.1 + p.3 + 5.0 && r.0 > p.0 + 30.0).unwrap();
+    drag_live(&mut ui, (cell.0 + 1.0, cell.1 + cell.3 * 0.5), (cell.0 + cell.2 - 1.0, cell.1 + cell.3 * 0.5));
+    let s = ui.selection_text().unwrap_or_default();
+    assert!(!s.is_empty(), "table cell selects");
+
+    // The code block, whole, keeps its lines and indent.
+    let code = *t.iter().filter(|r| r.3 > 40.0).next().expect("a three-line code block");
+    drag_live(&mut ui, (code.0 + 1.0, code.1 + 2.0), (code.0 + code.2 + 40.0, code.1 + code.3 - 2.0));
+    let s = ui.selection_text().unwrap_or_default();
+    assert_eq!(s, "fn main() {\n    println!(\"hi\");\n}", "code block");
+    assert_eq!(clipboard(&mut ui).as_deref(), Some("fn main() {\n    println!(\"hi\");\n}"));
+
+    // Across two messages.
+    let second = t.iter().filter(|r| r.0 == p.0 && r.1 > code.1 + code.3).nth(1).copied().unwrap();
+    drag_live(&mut ui, (p.0 + 1.0, p.1 + p.3 * 0.5), (second.0 + 20.0, second.1 + second.3 * 0.5));
+    let s = ui.selection_text().unwrap_or_default();
+    assert!(s.contains("Last line.") && s.contains("fn main"), "across messages: {s:?}");
+}
