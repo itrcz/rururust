@@ -57,6 +57,8 @@ pub struct Renderer {
     globals: wgpu::Buffer,
     sampler: wgpu::Sampler,
     quad_pipeline: wgpu::RenderPipeline,
+    /// Same shader, no blending: glass writes its finished pixel (see `quad.wgsl`).
+    glass_pipeline: wgpu::RenderPipeline,
     quad_layout: wgpu::BindGroupLayout,
     quad_bind_plain: wgpu::BindGroup,
     instances: wgpu::Buffer,
@@ -155,31 +157,36 @@ impl Renderer {
             write_mask: wgpu::ColorWrites::ALL,
         })];
         let strip = wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() };
-        let quad_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("ruru quad"),
-            layout: Some(&quad_pl),
-            vertex: wgpu::VertexState {
-                module: &quad_shader,
-                entry_point: Some("vs"),
-                compilation_options: Default::default(),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Quad>() as u64,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &attrs,
-                })],
-            },
-            primitive: strip,
-            depth_stencil: None,
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &quad_shader,
-                entry_point: Some("fs"),
-                compilation_options: Default::default(),
-                targets: &target,
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        let glass_target = [Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })];
+        let quad_pipeline_with = |label: &str, target: &[Option<wgpu::ColorTargetState>]| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&quad_pl),
+                vertex: wgpu::VertexState {
+                    module: &quad_shader,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[Some(wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<Quad>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &attrs,
+                    })],
+                },
+                primitive: strip,
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &quad_shader,
+                    entry_point: Some("fs"),
+                    compilation_options: Default::default(),
+                    targets: target,
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let quad_pipeline = quad_pipeline_with("ruru quad", &target);
+        let glass_pipeline = quad_pipeline_with("ruru glass", &glass_target);
 
         // ---- blur pipelines
         let blur_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -258,6 +265,7 @@ impl Renderer {
             globals,
             sampler,
             quad_pipeline,
+            glass_pipeline,
             quad_layout,
             quad_bind_plain,
             instances,
@@ -661,12 +669,23 @@ impl Renderer {
                 let mut pass = Self::pass(&mut encoder, scene_view, load);
                 for (k, b) in batches[i..j].iter().enumerate() {
                     if !b.quads.is_empty() {
-                        pass.set_pipeline(&self.quad_pipeline);
                         pass.set_bind_group(0, bind, &[]);
                         let picture = b.image.and_then(|i| list.images.get(i)).and_then(|m| self.images.get(&m.0.id));
                         pass.set_bind_group(1, picture.map_or(&self.image_none, |e| &e.0), &[]);
                         pass.set_vertex_buffer(0, self.instances.slice(..));
-                        pass.draw(0..4, b.quads.clone());
+                        // Runs of glass and of everything else, each with its own blending.
+                        let is_glass = |i: u32| quads[i as usize].p0[3] == KIND_GLASS;
+                        let mut a = b.quads.start;
+                        while a < b.quads.end {
+                            let glass = is_glass(a);
+                            let mut e = a + 1;
+                            while e < b.quads.end && is_glass(e) == glass {
+                                e += 1;
+                            }
+                            pass.set_pipeline(if glass { &self.glass_pipeline } else { &self.quad_pipeline });
+                            pass.draw(0..4, a..e);
+                            a = e;
+                        }
                     }
                     if let Some(slot) = text_slot[i + k] {
                         let _ = self.text_renderers[slot].render(&self.atlas, &self.viewport, &mut pass);

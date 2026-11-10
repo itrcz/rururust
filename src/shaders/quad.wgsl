@@ -135,7 +135,7 @@ fn refract_offset(slope: f32, eta: f32) -> f32 {
 
 // Bicubic B-spline fetch from one pyramid mip with 4 bilinear taps: hides the blocky
 // look of a magnified low-resolution level.
-fn bspline(uv: vec2f, mip: f32) -> vec3f {
+fn bspline(uv: vec2f, mip: f32) -> vec4f {
     let size = vec2f(textureDimensions(pyr, u32(mip)));
     let t = uv * size - 0.5;
     let i = floor(t);
@@ -150,24 +150,25 @@ fn bspline(uv: vec2f, mip: f32) -> vec3f {
     let g1 = w2 + w3;
     let h0 = (i - 0.5 + w1 / g0) / size;
     let h1 = (i + 1.5 + w3 / g1) / size;
-    let a = textureSampleLevel(pyr, samp, vec2f(h0.x, h0.y), mip).rgb;
-    let b = textureSampleLevel(pyr, samp, vec2f(h1.x, h0.y), mip).rgb;
-    let c = textureSampleLevel(pyr, samp, vec2f(h0.x, h1.y), mip).rgb;
-    let d = textureSampleLevel(pyr, samp, vec2f(h1.x, h1.y), mip).rgb;
+    let a = textureSampleLevel(pyr, samp, vec2f(h0.x, h0.y), mip);
+    let b = textureSampleLevel(pyr, samp, vec2f(h1.x, h0.y), mip);
+    let c = textureSampleLevel(pyr, samp, vec2f(h0.x, h1.y), mip);
+    let d = textureSampleLevel(pyr, samp, vec2f(h1.x, h1.y), mip);
     return g0.y * (g0.x * a + g1.x * b) + g1.y * (g0.x * c + g1.x * d);
 }
 
 // The backdrop at pixel `q`, blurred by a gaussian of `sigma` px: the sharp scene for
 // tiny radii, otherwise two neighbouring pyramid levels blended continuously.
 // Level n of the 13-tap pyramid has a sigma of about 0.96 * 2^n px.
-fn frost(q: vec2f, sigma: f32) -> vec3f {
+// Premultiplied: alpha < 1 where a transparent window shows the desktop.
+fn frost(q: vec2f, sigma: f32) -> vec4f {
     let uv = q / g.screen;
     let level = log2(max(sigma, 1e-4) / 1.9) + 1.0;
     if level <= 0.0 || g.levels < 1.0 {
-        return textureSampleLevel(sharp, samp, uv, 0.0).rgb;
+        return textureSampleLevel(sharp, samp, uv, 0.0);
     }
     if level < 1.0 {
-        return mix(textureSampleLevel(sharp, samp, uv, 0.0).rgb, bspline(uv, 0.0), level);
+        return mix(textureSampleLevel(sharp, samp, uv, 0.0), bspline(uv, 0.0), level);
     }
     let l = min(level, g.levels);
     let lo = min(floor(l), g.levels - 1.0);
@@ -236,27 +237,33 @@ fn fs(in: VOut) -> @location(0) vec4f {
         let nrm = dg.yz;
         let t = clamp(-d / depth, 0.0, 1.0);
         let sigma = in.p1.x * 0.5 * g.scale;
+        // The snapshot is premultiplied: the glass works on straight colour and keeps the
+        // backdrop's alpha, so over a transparent window it stays as see-through as the
+        // window around it instead of turning into dark, opaque premultiplied colour.
         var bg: vec3f;
+        var ba: f32;
         if t < 1.0 && in.p1.y > 0.0 {
             let slope = bevel_slope(t);
             let reach = nrm * in.p1.y * depth;
             let disp = in.c1.w * 0.25;
             let mid = frost(in.xy - reach * refract_offset(slope, 1.5), sigma);
+            ba = mid.a;
+            bg = mid.rgb / max(mid.a, 1e-4);
             if disp > 0.0 {
-                bg = vec3f(
-                    frost(in.xy - reach * refract_offset(slope, 1.5 - disp), sigma).r,
-                    mid.g,
-                    frost(in.xy - reach * refract_offset(slope, 1.5 + disp), sigma).b,
-                );
-            } else {
-                bg = mid;
+                let r = frost(in.xy - reach * refract_offset(slope, 1.5 - disp), sigma);
+                let b = frost(in.xy - reach * refract_offset(slope, 1.5 + disp), sigma);
+                bg = vec3f(r.r / max(r.a, 1e-4), bg.g, b.b / max(b.a, 1e-4));
             }
         } else {
-            bg = frost(in.xy, sigma);
+            let f = frost(in.xy, sigma);
+            ba = f.a;
+            bg = f.rgb / max(f.a, 1e-4);
         }
         let luma = dot(bg, vec3f(0.2126, 0.7152, 0.0722));
         bg = mix(vec3f(luma), bg, in.c1.x);
-        bg = mix(bg, in.c0.rgb, in.c0.a);
+        // The tint is laid over the backdrop and adds its own coverage.
+        let ga = ba + (1.0 - ba) * in.c0.a;
+        bg = (bg * ba * (1.0 - in.c0.a) + in.c0.rgb * in.c0.a) / max(ga, 1e-4);
 
         // Specular rim: a crisp line that takes its colour from what is behind the glass,
         // strongest on the edge facing the light (top-left), weaker on the opposite one.
@@ -271,7 +278,7 @@ fn fs(in: VOut) -> @location(0) vec4f {
         // Faint lift across the bevel gives the slab some thickness.
         bg += (1.0 - t) * (1.0 - t) * 0.05;
         bg += (noise(in.xy) - 0.5) / 255.0; // dither away banding
-        col = vec4f(clamp(bg, vec3f(0.0), vec3f(1.0)), 1.0);
+        col = vec4f(clamp(bg, vec3f(0.0), vec3f(1.0)) * ga, ga);
     } else if kind == 3.0 {
         // Picture: c0 is the visible part of it in UV space. Pick the mip that matches
         // the on-screen size so a large photo shown small doesn't shimmer.
@@ -294,6 +301,17 @@ fn fs(in: VOut) -> @location(0) vec4f {
     if bw > 0.0 {
         let b = premul(in.border) * clamp(d + bw + 0.5, 0.0, 1.0);
         col = b + col * (1.0 - b.a);
+    }
+    if kind == 2.0 {
+        // Glass is drawn without blending: it already contains the backdrop, and blending
+        // it over a translucent scene (transparent window) would count that backdrop twice.
+        // Its edge is blended here against the snapshot, which is what lies underneath.
+        let k = cover * alpha;
+        if k <= 0.0 {
+            discard;
+        }
+        let under = textureSampleLevel(sharp, samp, in.xy / g.screen, 0.0);
+        return mix(under, col, k);
     }
     return col * cover * alpha;
 }
