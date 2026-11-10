@@ -3,7 +3,7 @@
 use crate::render::Renderer;
 use crate::types::Color;
 use crate::ui::{KeyInput, Ui, WheelPhase, WindowRequest};
-use crate::view::ViewFn;
+use crate::view::{Cursor, ViewFn};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorIcon, Window, WindowId};
 
 /// Who draws the window's title bar.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -120,6 +120,7 @@ impl<S: 'static> App<S> {
             window: None,
             gfx: Rc::new(RefCell::new(None)),
             cursor: (0.0, 0.0),
+            shown_cursor: Cursor::Default,
             command: false,
             wake_at: None,
             transparent: false,
@@ -269,6 +270,8 @@ struct Runner<S> {
     window: Option<Arc<Window>>,
     gfx: Rc<RefCell<Option<Gfx>>>,
     cursor: (f32, f32),
+    /// Pointer shape last given to the window.
+    shown_cursor: Cursor,
     /// Ctrl / Cmd is held: key presses are shortcuts, not text.
     command: bool,
     /// When the UI asked to be redrawn without input (caret blink).
@@ -419,6 +422,7 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
                 self.cursor = (position.x as f32 / scale, position.y as f32 / scale);
                 ui.pointer_move(self.cursor)
             }
+            WindowEvent::CursorLeft { .. } => ui.pointer_leave(),
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => match state {
                 ElementState::Pressed => ui.pointer_down(self.cursor, false),
                 ElementState::Released => ui.pointer_up(self.cursor),
@@ -473,6 +477,20 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
         // Must run while the press is still being handled: AppKit starts the move from the
         // current mouse-down event.
         if let Some(w) = &self.window {
+            let cursor = self.app.ui.cursor;
+            if cursor != self.shown_cursor {
+                self.shown_cursor = cursor;
+                w.set_cursor(match cursor {
+                    Cursor::Default => CursorIcon::Default,
+                    Cursor::Pointer => CursorIcon::Pointer,
+                    Cursor::Text => CursorIcon::Text,
+                    Cursor::ResizeH => CursorIcon::EwResize,
+                    Cursor::ResizeV => CursorIcon::NsResize,
+                    Cursor::Grab => CursorIcon::Grab,
+                    Cursor::Grabbing => CursorIcon::Grabbing,
+                    Cursor::NotAllowed => CursorIcon::NotAllowed,
+                });
+            }
             for r in std::mem::take(&mut self.app.ui.requests) {
                 match r {
                     WindowRequest::DragWindow => {

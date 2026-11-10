@@ -142,6 +142,16 @@ pub(crate) struct Style {
     pub sticky: bool,
     /// Pressing on the view (outside interactive children) moves the window.
     pub drag: bool,
+    /// Size limits (width, height); `max` is infinite when unset.
+    pub min: (f32, f32),
+    pub max: (f32, f32),
+    /// Children are cut to this view's rounded shape.
+    pub clip: bool,
+    /// Size changes glide to the new value instead of jumping.
+    pub animate: bool,
+    /// Highlight laid over the background while the pointer is over the view.
+    pub hover: Option<Color>,
+    pub cursor: Option<Cursor>,
 }
 
 impl Default for Style {
@@ -160,6 +170,12 @@ impl Default for Style {
             place: None,
             sticky: false,
             drag: false,
+            min: (0.0, 0.0),
+            max: (f32::INFINITY, f32::INFINITY),
+            clip: false,
+            animate: false,
+            hover: None,
+            cursor: None,
         }
     }
 }
@@ -257,6 +273,37 @@ pub(crate) struct TextData {
     pub size: f32,
     pub weight: Weight,
     pub center: bool,
+    /// Most lines shown; 0 = no limit.
+    pub lines: usize,
+    pub truncate: Truncate,
+}
+
+/// How text that does not fit its lines ends (see [`View::lines`], [`View::truncate`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Truncate {
+    /// "A long title…"
+    Ellipsis,
+    /// The last line fades out towards its right edge, like titles in a sidebar.
+    Fade,
+}
+
+/// Mouse pointer shape over a view (see [`View::cursor`]); the runner shows it on desktop
+/// and on the web, touch screens ignore it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Cursor {
+    #[default]
+    Default,
+    /// A hand: something to click.
+    Pointer,
+    /// An I-beam: editable or selectable text.
+    Text,
+    /// A left–right arrow: a vertical divider that can be dragged.
+    ResizeH,
+    /// An up–down arrow: a horizontal divider that can be dragged.
+    ResizeV,
+    Grab,
+    Grabbing,
+    NotAllowed,
 }
 
 /// Decoded picture, cheap to clone. Create it once (not inside `view`) and keep it in
@@ -377,6 +424,19 @@ impl<S> View<S> {
         self.style.padding = [x, y, x, y];
         self
     }
+    /// Left and right only; top and bottom keep what was set before, so
+    /// `.padding_h(8.0).padding_v(4.0)` gives both.
+    pub fn padding_h(mut self, x: f32) -> Self {
+        self.style.padding[0] = x;
+        self.style.padding[2] = x;
+        self
+    }
+    /// Top and bottom only; left and right keep what was set before.
+    pub fn padding_v(mut self, y: f32) -> Self {
+        self.style.padding[1] = y;
+        self.style.padding[3] = y;
+        self
+    }
     /// left, top, right, bottom
     pub fn padding_ltrb(mut self, l: f32, t: f32, r: f32, b: f32) -> Self {
         self.style.padding = [l, t, r, b];
@@ -403,6 +463,38 @@ impl<S> View<S> {
     }
     pub fn fill(self) -> Self {
         self.fill_width().fill_height()
+    }
+    /// Never wider than `w`, whatever the parent offers: `.fill_width().max_width(720.0)` is a
+    /// reading column that stops growing on a wide window (center it in a `zstack`).
+    pub fn max_width(mut self, w: f32) -> Self {
+        self.style.max.0 = w.max(0.0);
+        self
+    }
+    /// Never narrower than `w`, even if that overflows the parent.
+    pub fn min_width(mut self, w: f32) -> Self {
+        self.style.min.0 = w.max(0.0);
+        self
+    }
+    pub fn max_height(mut self, h: f32) -> Self {
+        self.style.max.1 = h.max(0.0);
+        self
+    }
+    pub fn min_height(mut self, h: f32) -> Self {
+        self.style.min.1 = h.max(0.0);
+        self
+    }
+    /// When this view's size changes it glides there with a spring, and its content is cut
+    /// to the moving edge instead of being squeezed. Collapse a panel by setting its size
+    /// to 0 and back; keep the view in the tree while it is hidden so it can grow back:
+    ///
+    /// ```ignore
+    /// sidebar(s).width(if s.sidebar { 280.0 } else { 0.0 }).animate()
+    /// ```
+    ///
+    /// Sizes set by `.fill*()` follow the parent (window resizes) without animating.
+    pub fn animate(mut self) -> Self {
+        self.style.animate = true;
+        self
     }
     /// Position inside a parent `zstack` (horizontal, vertical).
     pub fn place(mut self, x: Align, y: Align) -> Self {
@@ -453,6 +545,13 @@ impl<S> View<S> {
     }
     pub fn glass_with(mut self, glass: Glass) -> Self {
         self.style.glass = Some(glass);
+        self
+    }
+    /// Cuts the children to this view's rounded shape (`.radius()`): a list in a rounded
+    /// panel, a photo in a card. Clips nest. Text is cut to the rectangle only, which is
+    /// invisible unless glyphs reach into a corner.
+    pub fn clip(mut self) -> Self {
+        self.style.clip = true;
         self
     }
     pub fn opacity(mut self, o: f32) -> Self {
@@ -508,6 +607,23 @@ impl<S> View<S> {
         }
         self
     }
+    /// Text only: at most `n` lines; what does not fit ends with "…" (or fades, see
+    /// [`View::truncate`]). The view never grows taller than `n` lines.
+    pub fn lines(mut self, n: usize) -> Self {
+        if let Kind::Text(t) = &mut self.kind {
+            t.lines = n;
+        }
+        self
+    }
+    /// Text only: how a text cut by `.lines()` ends; on its own it limits text to one line.
+    /// `text(title).truncate(Truncate::Fade)` is a sidebar title that fades at the edge.
+    pub fn truncate(mut self, how: Truncate) -> Self {
+        if let Kind::Text(t) = &mut self.kind {
+            t.truncate = how;
+            t.lines = t.lines.max(1);
+        }
+        self
+    }
     /// Center lines of multi-line text.
     pub fn centered(mut self) -> Self {
         if let Kind::Text(t) = &mut self.kind {
@@ -517,6 +633,19 @@ impl<S> View<S> {
     }
 
     // ---- behavior ----
+    /// Lays `color` over the background while the pointer is over the view (fades in and
+    /// out in about a tenth of a second). Mouse only; touch has no hover.
+    /// `.hover(Color::WHITE.alpha(0.06))` is a typical list-row highlight.
+    pub fn hover(mut self, color: Color) -> Self {
+        self.style.hover = Some(color);
+        self
+    }
+    /// Pointer shape over this view. Tappable views show `Cursor::Pointer` and text fields
+    /// `Cursor::Text` without being told; `.cursor(Cursor::Default)` turns that off.
+    pub fn cursor(mut self, c: Cursor) -> Self {
+        self.style.cursor = Some(c);
+        self
+    }
     /// Makes the view tappable, with a springy press animation.
     pub fn on_tap(mut self, f: impl Fn(&mut S) + 'static) -> Self {
         self.on_tap = Some(Box::new(f));
@@ -616,11 +745,21 @@ pub fn text<S>(content: impl Into<String>) -> View<S> {
         size: 17.0,
         weight: Weight::Regular,
         center: false,
+        lines: 0,
+        truncate: Truncate::Ellipsis,
     }))
 }
 /// Text made of differently styled runs (bold, italic, code, colored) that wrap together.
 pub fn rich_text<S>(spans: Vec<Span>) -> View<S> {
-    View::new(Kind::Text(TextData { spans, content: String::new(), size: 17.0, weight: Weight::Regular, center: false }))
+    View::new(Kind::Text(TextData {
+        spans,
+        content: String::new(),
+        size: 17.0,
+        weight: Weight::Regular,
+        center: false,
+        lines: 0,
+        truncate: Truncate::Ellipsis,
+    }))
 }
 /// Flexible empty space inside a stack.
 pub fn spacer<S>() -> View<S> {
@@ -640,6 +779,7 @@ pub fn button<S>(label: impl Into<String>, on_tap: impl Fn(&mut S) + 'static) ->
         .background(Color::BLUE)
         .color(Color::WHITE)
         .radius(14.0)
+        .hover(Color::WHITE.alpha(0.14))
         .on_tap(on_tap)
 }
 /// A picture. It keeps its aspect ratio; when both sides are set it fills the box and

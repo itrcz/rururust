@@ -2,8 +2,8 @@
 
 use crate::view::Span;
 use cosmic_text::{
-    fontdb, Align as TextAlign, Attrs, Buffer, CacheKeyFlags, Color as TextColor, Family, FontSystem, Metrics, Shaping,
-    Weight,
+    fontdb, Align as TextAlign, Attrs, Buffer, CacheKeyFlags, Color as TextColor, Ellipsize, EllipsizeHeightLimit,
+    Family, FontSystem, Metrics, Shaping, Weight,
 };
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -65,7 +65,7 @@ impl TextSystem {
         TextSystem { fonts, entries: HashMap::new(), lists: HashMap::new(), frame: 0 }
     }
 
-    fn key(spec: &TextSpec, width: Option<f32>) -> u64 {
+    fn key(spec: &TextSpec, width: Option<f32>, ellipsis: usize) -> u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         spec.text.hash(&mut h);
         for s in spec.spans {
@@ -77,11 +77,14 @@ impl TextSystem {
         spec.weight.hash(&mut h);
         spec.center.hash(&mut h);
         width.map(f32::to_bits).hash(&mut h);
+        ellipsis.hash(&mut h);
         h.finish()
     }
 
-    fn entry(&mut self, spec: &TextSpec, width: Option<f32>) -> (u64, (f32, f32)) {
-        let key = Self::key(spec, width);
+    /// Shapes (or finds) the text wrapped at `width`; `ellipsis` > 0 cuts it to that many
+    /// lines ending with "…".
+    fn entry(&mut self, spec: &TextSpec, width: Option<f32>, ellipsis: usize) -> (u64, (f32, f32)) {
+        let key = Self::key(spec, width, ellipsis);
         let frame = self.frame;
         if let Some(e) = self.entries.get_mut(&key) {
             e.used = frame;
@@ -90,6 +93,9 @@ impl TextSystem {
         let line_h = (spec.size * 1.3).round();
         let mut buffer = Buffer::new(&mut self.fonts, Metrics::new(spec.size, line_h));
         buffer.set_size(width, None);
+        if ellipsis > 0 && width.is_some() {
+            buffer.set_ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(ellipsis)));
+        }
         let attrs = Attrs::new().family(Family::SansSerif).weight(Weight(spec.weight));
         let align = (spec.center && width.is_some()).then_some(TextAlign::Center);
         if spec.spans.is_empty() {
@@ -129,11 +135,47 @@ impl TextSystem {
 
     /// Returns a cache key for the shaped text and its size, wrapping at `max_w` if needed.
     pub(crate) fn measure(&mut self, spec: &TextSpec, max_w: Option<f32>) -> (u64, (f32, f32)) {
-        let natural = self.entry(spec, None);
+        let natural = self.entry(spec, None, 0);
         match max_w {
-            Some(w) if natural.1 .0 > w + 0.5 => self.entry(spec, Some(w.floor().max(1.0))),
+            Some(w) if natural.1 .0 > w + 0.5 => self.entry(spec, Some(w.floor().max(1.0)), 0),
             _ => natural,
         }
+    }
+
+    /// Like `measure`, but at most `lines` lines tall. Returns the key, the size it takes
+    /// and whether something was cut. With `fade` the text is not shortened: the caller
+    /// clips it to the returned size and fades the last line out.
+    pub(crate) fn measure_lines(
+        &mut self,
+        spec: &TextSpec,
+        max_w: Option<f32>,
+        lines: usize,
+        fade: bool,
+    ) -> (u64, (f32, f32), bool) {
+        let line_h = (spec.size * 1.3).round();
+        let max_h = lines as f32 * line_h;
+        let natural = self.entry(spec, None, 0);
+        let w = match max_w {
+            Some(w) if natural.1 .0 > w + 0.5 => w.floor().max(1.0),
+            // Fits on its lines (an explicit newline can still make too many of them).
+            _ => {
+                let cut = natural.1 .1 > max_h + 0.5;
+                if cut && !fade {
+                    let e = self.entry(spec, Some(natural.1 .0.ceil().max(1.0)), lines);
+                    return (e.0, e.1, true);
+                }
+                return (natural.0, (natural.1 .0, natural.1 .1.min(max_h)), cut);
+            }
+        };
+        if !fade {
+            let (key, size) = self.entry(spec, Some(w), lines);
+            return (key, (size.0.min(w), size.1.min(max_h)), true);
+        }
+        // One line: keep it unwrapped and let it run under the fade. More lines: wrap, and
+        // the last one shown fades if more text follows.
+        let (key, size) = if lines == 1 && natural.1 .1 <= line_h + 0.5 { natural } else { self.entry(spec, Some(w), 0) };
+        let cut = size.0 > w + 0.5 || size.1 > max_h + 0.5;
+        (key, (size.0.min(w), size.1.min(max_h)), cut)
     }
 
     /// X offset of the caret placed before byte `index` of a single-line text.

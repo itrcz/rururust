@@ -45,10 +45,11 @@ pub use task::{link, set_spawner, set_waker, spawn, Link, Task};
 pub use task::sleep;
 pub use text::TextSystem;
 pub use types::{Color, Rect};
-pub use ui::{after, DrawList, KeyInput, Ui, WheelPhase, WindowRequest};
+pub use ui::{after, Cmd, DrawList, KeyInput, Quad, TextCmd, Ui, WheelPhase, WindowRequest};
 pub use view::{
     button, hstack, icon, image, list, modal, picker, rect, scroll, sheet, slider, snackbar, spacer, tab_bar, text,
-    text_field, toggle, vstack, zstack, Align, Children, Dim, Fill, Glass, Image, Indicator, Shadow, View, Weight,
+    text_field, toggle, vstack, zstack, Align, Children, Cursor, Dim, Fill, Glass, Image, Indicator, Shadow, Truncate,
+    View, Weight,
 };
 pub use view::{drawer, rich_text, Env, SizeClass, Span, ViewFn};
 #[cfg(feature = "markdown")]
@@ -61,7 +62,8 @@ pub mod prelude {
     pub use crate::{App, Titlebar};
     pub use crate::{
         after, button, hstack, icon, image, list, modal, picker, rect, scroll, sheet, slider, snackbar, spacer,
-        tab_bar, text, text_field, toggle, vstack, zstack, Align, Color, Fill, Glass, Image, Indicator, View, Weight,
+        tab_bar, text, text_field, toggle, vstack, zstack, Align, Color, Cursor, Fill, Glass, Image, Indicator, Truncate,
+        View, Weight,
     };
     #[cfg(feature = "markdown")]
     pub use crate::{markdown, markdown_with};

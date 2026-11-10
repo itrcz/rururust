@@ -571,26 +571,51 @@ impl Renderer {
                 self.text_renderers.push(TextRenderer::new(&mut self.atlas, &self.device, Default::default(), None));
             }
             let entries = &text.entries;
-            let areas = b.texts.iter().filter_map(|t| {
-                let e = entries.get(&t.key)?;
+            let areas = b.texts.iter().flat_map(|t| {
+                let e = entries.get(&t.key);
                 let c = t.color;
                 let to8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                Some(TextArea {
-                    buffer: &e.buffer,
-                    left: t.pos.0 * scale,
-                    top: t.pos.1 * scale,
-                    // Animated scale is snapped to 1/16 steps: otherwise every frame of a
-                    // press or menu animation rasterizes each glyph at a brand-new size and
-                    // floods the glyph atlas.
-                    scale: (t.scale * 16.0).round() / 16.0 * scale,
-                    bounds: TextBounds {
-                        left: (t.clip.x * scale).floor() as i32,
-                        top: (t.clip.y * scale).floor() as i32,
-                        right: ((t.clip.x + t.clip.w) * scale).ceil() as i32,
-                        bottom: ((t.clip.y + t.clip.h) * scale).ceil() as i32,
-                    },
-                    default_color: glyphon::Color::rgba(to8(c.r), to8(c.g), to8(c.b), to8(c.a)),
-                    custom_glyphs: &[],
+                let px = |r: &Rect| TextBounds {
+                    left: (r.x * scale).floor() as i32,
+                    top: (r.y * scale).floor() as i32,
+                    right: ((r.x + r.w) * scale).ceil() as i32,
+                    bottom: ((r.y + r.h) * scale).ceil() as i32,
+                };
+                // Glyphon has no per-pixel alpha, so a fade is the same text drawn again in
+                // thin vertical strips, each clipped to its strip and a little fainter.
+                let mut parts: Vec<(TextBounds, f32)> = Vec::new();
+                match t.fade {
+                    None => parts.push((px(&t.clip), 1.0)),
+                    Some(f) => {
+                        // Pixel edges shared by neighbouring parts, so no row or column is drawn twice.
+                        let clip = px(&t.clip);
+                        let top = ((f.y * scale).round() as i32).clamp(clip.top, clip.bottom);
+                        let left = ((f.x * scale).round() as i32).clamp(clip.left, clip.right);
+                        let right = (((f.x + f.w) * scale).round() as i32).clamp(left, clip.right);
+                        let line = TextBounds { top, bottom: ((f.y + f.h) * scale).ceil().min(clip.bottom as f32) as i32, ..clip };
+                        parts.push((TextBounds { bottom: top, ..clip }, 1.0));
+                        parts.push((TextBounds { right: left, ..line }, 1.0));
+                        let n = ((right - left) / 2).clamp(1, 24);
+                        for k in 0..n {
+                            let (l, r) = (left + (right - left) * k / n, left + (right - left) * (k + 1) / n);
+                            let a = 1.0 - (k as f32 + 0.5) / n as f32;
+                            parts.push((TextBounds { left: l, right: r, ..line }, a * a * (3.0 - 2.0 * a)));
+                        }
+                    }
+                }
+                parts.into_iter().filter(|(b, _)| b.right > b.left && b.bottom > b.top).filter_map(move |(bounds, a)| {
+                    Some(TextArea {
+                        buffer: &e?.buffer,
+                        left: t.pos.0 * scale,
+                        top: t.pos.1 * scale,
+                        // Animated scale is snapped to 1/16 steps: otherwise every frame of a
+                        // press or menu animation rasterizes each glyph at a brand-new size and
+                        // floods the glyph atlas.
+                        scale: (t.scale * 16.0).round() / 16.0 * scale,
+                        bounds,
+                        default_color: glyphon::Color::rgba(to8(c.r), to8(c.g), to8(c.b), to8(c.a * a)),
+                        custom_glyphs: &[],
+                    })
                 })
             });
             let ok = self.text_renderers[used_text]

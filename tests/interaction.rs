@@ -532,3 +532,223 @@ fn window_drag_asks_the_window_to_move_but_not_through_buttons() {
     ui.pointer_down((100.0, 10.0), true);
     assert!(ui.requests.is_empty());
 }
+
+// ---- clip, truncate, hover, size limits, animate, padding
+
+fn quads(ui: &Ui<impl Sized>, color: Color) -> Vec<[f32; 4]> {
+    ui.list
+        .cmds
+        .iter()
+        .filter_map(|c| match c {
+            ruru::Cmd::Quad(q) if q.c0 == [color.r, color.g, color.b, color.a] && q.p0[3] == 0.0 => Some(q.rect),
+            _ => None,
+        })
+        .collect()
+}
+
+fn texts(ui: &Ui<impl Sized>) -> Vec<&ruru::TextCmd> {
+    ui.list.cmds.iter().filter_map(|c| if let ruru::Cmd::Text(t) = c { Some(t) } else { None }).collect()
+}
+
+#[test]
+fn clip_cuts_hits_to_the_rounded_shape() {
+    // A circle of 200 pt with a tappable square bigger than itself inside.
+    let mut ui = Ui::new(0, |_: &i32| {
+        zstack(zstack(rect().size(400.0, 400.0).background(Color::RED).on_tap(|n: &mut i32| *n += 1)).size(200.0, 200.0).radius(100.0).clip())
+            .place(Align::Start, Align::Start)
+    });
+    ui.frame((400.0, 400.0));
+    for (pos, hits) in [((100.0, 100.0), 1), ((8.0, 8.0), 1), ((190.0, 100.0), 2), ((300.0, 100.0), 2)] {
+        ui.pointer_down(pos, false);
+        ui.pointer_up(pos);
+        assert_eq!(ui.state, hits, "tap at {pos:?}");
+    }
+    // The child's quad carries the circle as its clip.
+    let q = ui.list.cmds.iter().find_map(|c| if let ruru::Cmd::Quad(q) = c { Some(*q) } else { None }).unwrap();
+    assert_eq!(q.clip, [0.0, 0.0, 200.0, 200.0]);
+    assert_eq!(q.p1[2], 100.0);
+}
+
+#[test]
+fn nested_clips_intersect() {
+    let mut ui = Ui::new((), |_: &()| {
+        zstack(zstack(zstack(rect().size(300.0, 300.0).background(Color::RED)).size(200.0, 50.0).radius(10.0).clip())
+            .size(100.0, 100.0)
+            .radius(30.0)
+            .clip())
+        .place(Align::Start, Align::Start)
+    });
+    ui.frame((400.0, 400.0));
+    let q = ui.list.cmds.iter().find_map(|c| if let ruru::Cmd::Quad(q) = c { Some(*q) } else { None }).unwrap();
+    // 200x50 centered in 100x100 → x -50..150, y 25..75; cut to the outer box.
+    assert_eq!(q.clip, [0.0, 25.0, 100.0, 50.0]);
+}
+
+const LONG: &str = "A very long chat title that will never fit into a narrow sidebar row";
+
+#[test]
+fn lines_and_truncate_keep_the_height() {
+    let measure = |make: fn() -> View<()>| {
+        let mut ui = Ui::new((), move |_: &()| vstack(make().width(120.0)).place(Align::Start, Align::Start));
+        ui.frame((400.0, 400.0));
+        let t = texts(&ui)[0];
+        (t.size, t.fade.is_some())
+    };
+    let short = measure(|| text("Short"));
+    let wrapped = measure(|| text(LONG));
+    let ellipsis = measure(|| text(LONG).lines(1));
+    let fade = measure(|| text(LONG).truncate(Truncate::Fade));
+    let two = measure(|| text(LONG).lines(2));
+    assert!(wrapped.0 .1 > short.0 .1 * 2.5, "{wrapped:?}");
+    assert_eq!(ellipsis.0 .1, short.0 .1);
+    assert_eq!(fade.0 .1, short.0 .1);
+    assert_eq!(two.0 .1, short.0 .1 * 2.0);
+    assert!(ellipsis.0 .0 <= 120.0 && fade.0 .0 <= 120.0);
+    assert!(fade.1 && !ellipsis.1 && !short.1);
+    // Text that fits does not fade.
+    assert!(!measure(|| text("Short").truncate(Truncate::Fade)).1);
+}
+
+struct H {
+    taps: i32,
+}
+
+fn hover_ui() -> Ui<H> {
+    let mut ui = Ui::new(H { taps: 0 }, |_: &H| {
+        vstack((
+            button("tap", |s: &mut H| s.taps += 1).size(200.0, 100.0),
+            rect().size(200.0, 100.0).background(Color::GRAY).hover(Color::RED),
+            text_field("", "type", |_: &mut H, _| {}).width(200.0),
+            rect().size(200.0, 100.0).hover(Color::GREEN).cursor(Cursor::ResizeH),
+        ))
+        .place(Align::Start, Align::Start)
+    });
+    ui.frame((400.0, 600.0));
+    ui
+}
+
+#[test]
+fn hover_redraws_only_when_the_target_changes() {
+    let mut ui = hover_ui();
+    assert!(!ui.pointer_move((300.0, 50.0)), "nothing under the mouse");
+    assert!(ui.pointer_move((100.0, 50.0)), "onto the button");
+    assert_eq!(ui.cursor, Cursor::Pointer);
+    assert!(!ui.pointer_move((120.0, 60.0)), "same button: no frame");
+    assert!(ui.pointer_move((100.0, 150.0)), "onto the hover row");
+    assert_eq!(ui.cursor, Cursor::Default);
+    // The highlight fades in over a few frames and then rests.
+    ui.frame((400.0, 600.0));
+    assert!(ui.animating);
+    let mut seen_partial = false;
+    for _ in 0..400 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        ui.frame((400.0, 600.0));
+        if quads(&ui, Color::RED.alpha(0.5)).is_empty() && ui.list.cmds.iter().any(|c| matches!(c, ruru::Cmd::Quad(q) if q.c0[0] == 1.0 && q.c0[3] > 0.05 && q.c0[3] < 0.95)) {
+            seen_partial = true;
+        }
+        if !ui.animating {
+            break;
+        }
+    }
+    assert!(seen_partial, "fades in");
+    assert!(!ui.animating, "settles");
+    assert_eq!(quads(&ui, Color::RED).len(), 1, "fully shown");
+    let field_y = 200.0 + 10.0;
+    assert!(ui.pointer_move((100.0, field_y)));
+    assert_eq!(ui.cursor, Cursor::Text);
+    assert!(ui.pointer_move((100.0, 300.0)));
+    assert_eq!(ui.cursor, Cursor::ResizeH);
+    assert!(ui.pointer_leave());
+    assert_eq!(ui.cursor, Cursor::Default);
+    assert!(!ui.pointer_leave());
+}
+
+#[test]
+fn touch_does_not_hover() {
+    let mut ui = hover_ui();
+    ui.pointer_down((100.0, 150.0), true);
+    assert!(!ui.pointer_move((100.0, 152.0)));
+    ui.pointer_up((100.0, 152.0));
+    ui.frame((400.0, 600.0));
+    assert!(!ui.animating);
+}
+
+#[test]
+fn max_and_min_width_limit_the_size() {
+    let mut ui = Ui::new((), |_: &()| {
+        vstack((
+            rect().fill_width().height(10.0).max_width(100.0).background(Color::RED),
+            rect().width(20.0).height(10.0).min_width(50.0).background(Color::GREEN),
+            text(LONG).max_width(150.0).background(Color::BLUE),
+            rect().fill().max_height(30.0).min_height(5.0).background(Color::GRAY),
+        ))
+        .fill()
+    });
+    ui.frame((400.0, 400.0));
+    assert_eq!(quads(&ui, Color::RED)[0][2], 100.0);
+    assert_eq!(quads(&ui, Color::GREEN)[0][2], 50.0);
+    let blue = quads(&ui, Color::BLUE)[0];
+    assert!(blue[2] <= 150.0 && blue[3] > 40.0, "text wraps at its max width: {blue:?}");
+    assert_eq!(quads(&ui, Color::GRAY)[0][3], 30.0);
+}
+
+#[test]
+fn padding_sides_combine() {
+    let mut ui = Ui::new((), |_: &()| {
+        zstack(text("hi").padding_h(8.0).padding_v(4.0).background(Color::RED)).place(Align::Start, Align::Start)
+    });
+    ui.frame((400.0, 400.0));
+    let bg = quads(&ui, Color::RED)[0];
+    let t = texts(&ui)[0];
+    assert_eq!((t.pos.0 - bg[0], t.pos.1 - bg[1]), (8.0, 4.0));
+    assert_eq!(bg[2] - t.size.0, 16.0);
+    assert_eq!(bg[3] - t.size.1, 8.0);
+}
+
+#[test]
+fn animate_glides_to_the_new_size_and_settles() {
+    let mut ui = Ui::new(true, |open: &bool| {
+        hstack((
+            vstack(text(LONG).background(Color::BLUE)).width(if *open { 300.0 } else { 0.0 }).background(Color::RED).animate(),
+            rect().fill().background(Color::GREEN),
+        ))
+        .fill()
+    });
+    let size = (800.0, 400.0);
+    ui.frame(size);
+    assert!(!ui.animating, "no animation on first appearance");
+    assert_eq!(quads(&ui, Color::RED)[0][2], 300.0);
+    let content_w = quads(&ui, Color::BLUE)[0][2];
+    ui.state = false;
+    let mut widths = Vec::new();
+    for _ in 0..500 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        ui.frame(size);
+        let w = quads(&ui, Color::RED).first().map_or(0.0, |q| q[2]);
+        widths.push(w);
+        // The neighbour takes the space as it frees up.
+        let green = quads(&ui, Color::GREEN)[0];
+        assert!((green[0] - w).abs() < 0.01 && (green[2] - (800.0 - w)).abs() < 0.01);
+        // The content keeps its width and is cut, not squeezed.
+        if let Some(b) = quads(&ui, Color::BLUE).first() {
+            assert_eq!(b[2], content_w);
+        }
+        if !ui.animating {
+            break;
+        }
+    }
+    assert!(widths.iter().any(|w| *w > 20.0 && *w < 280.0), "passes through the middle: {widths:?}");
+    assert!(widths.windows(2).all(|p| p[1] <= p[0] + 0.01), "shrinks monotonically");
+    assert_eq!(*widths.last().unwrap(), 0.0);
+    assert!(!ui.animating);
+    // And back.
+    ui.state = true;
+    for _ in 0..500 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        ui.frame(size);
+        if !ui.animating {
+            break;
+        }
+    }
+    assert_eq!(quads(&ui, Color::RED)[0][2], 300.0);
+}
