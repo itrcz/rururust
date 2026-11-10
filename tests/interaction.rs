@@ -1,5 +1,6 @@
 use ruru::prelude::*;
 use ruru::{KeyInput, Ui};
+use ruru::{menu, MenuItem, Placement, Shortcut};
 
 struct S {
     n: i32,
@@ -1458,4 +1459,288 @@ fn markdown_copies_as_plain_text_and_its_links_are_live() {
     let para = r[1];
     click(&mut ui, (para.0 + para.2 * 0.45, para.1 + para.3 * 0.5));
     assert_eq!(ui.state, vec!["https://example.com".to_string()]);
+}
+
+// ---------------------------------------------------------------- popovers, menus, tooltips
+
+#[derive(Default)]
+struct M {
+    log: Vec<&'static str>,
+    pop: bool,
+    effort: f32,
+    under: u32,
+    sec: u32,
+    draft: String,
+    k: u32,
+}
+
+fn menus_view(s: &M) -> View<M> {
+    let items = vec![
+        MenuItem::action("Rename", |s: &mut M| s.log.push("rename")).shortcut("⌘R"),
+        MenuItem::action("Pin", |s: &mut M| s.log.push("pin")).disabled(),
+        MenuItem::separator(),
+        MenuItem::submenu(
+            "Copy",
+            vec![MenuItem::action("Link", |s: &mut M| s.log.push("link")), MenuItem::action("Text", |s: &mut M| s.log.push("text"))],
+        ),
+        MenuItem::action("Archive", |s: &mut M| s.log.push("archive")),
+    ];
+    zstack((
+        // Everything else lies on this: a click that leaks through counts here.
+        rect().fill().on_tap(|s: &mut M| s.under += 1).on_secondary(|s: &mut M| s.sec += 1),
+        rect().size(40.0, 30.0).menu(menu(items)).place(Align::Start, Align::Start),
+        rect()
+            .size(30.0, 30.0)
+            .on_tap(|s: &mut M| s.pop = true)
+            .popover(
+                s.pop,
+                Placement::bottom(),
+                |s: &mut M| s.pop = false,
+                vstack(slider(s.effort, |s: &mut M, v| s.effort = v).steps(5)).width(200.0).padding(10.0),
+            )
+            .place(Align::End, Align::End),
+        rect().size(30.0, 30.0).tooltip("Back").place(Align::End, Align::Start),
+        text_field(s.draft.as_str(), "", |s: &mut M, v| s.draft = v).width(150.0).place(Align::Start, Align::End),
+        rect().size(50.0, 30.0).context_menu(menu(vec![MenuItem::action("Ctx", |s: &mut M| s.log.push("ctx"))])),
+    ))
+    .fill()
+    .shortcut(Shortcut::cmd('k'), |s: &mut M| s.k += 1)
+    .shortcut(Shortcut::key('/'), |s: &mut M| s.k += 10)
+    .shortcut(Shortcut::cmd('a'), |s: &mut M| s.k += 100)
+}
+
+const W: (f32, f32) = (400.0, 400.0);
+
+fn menus() -> Ui<M> {
+    let mut ui = Ui::new(M::default(), menus_view);
+    ui.frame(W);
+    ui
+}
+
+/// Runs frames until the animations are over (layers fade in for ~120 ms).
+fn settle(ui: &mut Ui<M>) {
+    for _ in 0..60 {
+        std::thread::sleep(std::time::Duration::from_millis(12));
+        ui.frame(W);
+        if !ui.animating {
+            break;
+        }
+    }
+}
+
+fn tap(ui: &mut Ui<M>, at: (f32, f32)) {
+    ui.pointer_down(at, false);
+    ui.pointer_up(at);
+    ui.frame(W);
+}
+
+// The menu opens under its 40×30 anchor at (8, 36): panel padding 5, rows 28, separator 11.
+const RENAME: (f32, f32) = (100.0, 55.0);
+const PIN: (f32, f32) = (100.0, 83.0);
+const COPY: (f32, f32) = (100.0, 122.0);
+const ARCHIVE: (f32, f32) = (100.0, 150.0);
+// The submenu opens to the right of Copy, its first row level with it.
+const LINK: (f32, f32) = (270.0, 122.0);
+
+fn open_menu(ui: &mut Ui<M>) {
+    tap(ui, (20.0, 15.0));
+    settle(ui);
+}
+
+#[test]
+fn menu_opens_on_tap_picks_and_closes() {
+    let mut ui = menus();
+    open_menu(&mut ui);
+    tap(&mut ui, PIN); // disabled: nothing, the menu stays
+    assert!(ui.state.log.is_empty());
+    tap(&mut ui, RENAME);
+    assert_eq!(ui.state.log, ["rename"]);
+    settle(&mut ui);
+    tap(&mut ui, RENAME); // closed: the click lands on what is underneath
+    assert_eq!(ui.state.under, 1);
+    assert_eq!(ui.state.log, ["rename"]);
+}
+
+#[test]
+fn click_outside_closes_without_reaching_below() {
+    let mut ui = menus();
+    open_menu(&mut ui);
+    tap(&mut ui, (300.0, 300.0));
+    assert_eq!(ui.state.under, 0, "the closing click must not leak through");
+    settle(&mut ui);
+    tap(&mut ui, RENAME);
+    assert_eq!(ui.state.under, 1);
+    assert!(ui.state.log.is_empty());
+}
+
+#[test]
+fn menu_hover_highlights_and_enter_picks() {
+    let mut ui = menus();
+    open_menu(&mut ui);
+    ui.pointer_move(ARCHIVE);
+    ui.frame(W);
+    assert!(ui.key(KeyInput::Enter));
+    assert_eq!(ui.state.log, ["archive"]);
+}
+
+#[test]
+fn menu_keyboard_skips_disabled_and_walks_submenus() {
+    let mut ui = menus();
+    open_menu(&mut ui);
+    ui.key(KeyInput::Down); // Rename
+    ui.key(KeyInput::Down); // Pin is disabled, the separator is skipped: Copy
+    ui.frame(W);
+    ui.key(KeyInput::Right); // opens Copy with its first row lit
+    settle(&mut ui);
+    ui.key(KeyInput::Left); // back to the parent
+    ui.frame(W);
+    ui.key(KeyInput::Enter); // Copy again, from Enter
+    settle(&mut ui);
+    ui.key(KeyInput::Down); // Text
+    ui.frame(W);
+    ui.key(KeyInput::Enter);
+    assert_eq!(ui.state.log, ["text"]);
+    ui.frame(W);
+    assert!(!ui.key(KeyInput::Escape), "the menu is closed");
+}
+
+#[test]
+fn submenu_opens_on_hover_and_escape_closes_level_by_level() {
+    let mut ui = menus();
+    open_menu(&mut ui);
+    ui.pointer_move(COPY);
+    settle(&mut ui);
+    ui.pointer_move(LINK);
+    ui.frame(W);
+    ui.key(KeyInput::Escape); // closes the submenu only
+    settle(&mut ui);
+    tap(&mut ui, LINK);
+    assert!(ui.state.log.is_empty() && ui.state.under == 0, "the submenu was closed, the menu was not");
+    // The menu (still open) closes with Escape.
+    settle(&mut ui);
+    ui.key(KeyInput::Escape);
+    settle(&mut ui);
+    tap(&mut ui, RENAME);
+    assert_eq!(ui.state.under, 1);
+    // Clicking the submenu row opens it too.
+    open_menu(&mut ui);
+    tap(&mut ui, COPY);
+    settle(&mut ui);
+    tap(&mut ui, LINK);
+    assert_eq!(ui.state.log, ["link"]);
+}
+
+#[test]
+fn popover_flips_above_and_stays_in_the_window() {
+    let mut ui = menus();
+    tap(&mut ui, (385.0, 385.0));
+    assert!(ui.state.pop);
+    settle(&mut ui);
+    // No room below the anchor at the bottom edge: it opens above (y 316..364). Centered on
+    // the anchor it would cross the right edge; it is slid in to x 192..392, so the slider's
+    // value range is 216..368.
+    ui.pointer_down((380.0, 340.0), false);
+    ui.pointer_up((380.0, 340.0));
+    assert_eq!(ui.state.effort, 1.0);
+    ui.pointer_down((292.0 + 15.0, 340.0), false); // 0.6 snaps to the stop at 0.5
+    ui.pointer_up((292.0 + 15.0, 340.0));
+    assert_eq!(ui.state.effort, 0.5);
+    ui.frame(W);
+    assert!(ui.key(KeyInput::Escape));
+    assert!(!ui.state.pop);
+    assert_eq!(ui.state.under, 0);
+}
+
+#[test]
+fn popover_click_outside_calls_dismiss_only() {
+    let mut ui = menus();
+    tap(&mut ui, (385.0, 385.0));
+    settle(&mut ui);
+    tap(&mut ui, (100.0, 200.0));
+    assert!(!ui.state.pop);
+    assert_eq!(ui.state.under, 0);
+}
+
+#[test]
+fn steps_snap_the_slider() {
+    let mut ui = Ui::new(0.0f32, |v: &f32| zstack(slider(*v, |s: &mut f32, v| *s = v).steps(3).width(228.0)).fill());
+    ui.frame(W);
+    // Value range 200 wide starting at x 100 + 14.
+    for (x, want) in [(120.0, 0.0), (200.0, 0.5), (240.0, 0.5), (300.0, 1.0)] {
+        ui.pointer_down((x, 200.0), false);
+        ui.pointer_up((x, 200.0));
+        assert_eq!(ui.state, want, "at x {x}");
+    }
+}
+
+fn text_cmds(ui: &Ui<M>) -> usize {
+    ui.list.cmds.iter().filter(|c| matches!(c, ruru::Cmd::Text(_))).count()
+}
+
+#[test]
+fn tooltip_waits_for_the_mouse_to_rest() {
+    let mut ui = menus();
+    let before = text_cmds(&ui);
+    ui.pointer_move((385.0, 15.0));
+    ui.frame(W);
+    assert_eq!(text_cmds(&ui), before, "not yet");
+    assert!(!ui.animating, "waiting costs no frames");
+    let wake = ui.wake_in.expect("a timer for the tooltip");
+    assert!(wake > 0.4 && wake < 0.52, "wake in {wake}");
+    std::thread::sleep(std::time::Duration::from_secs_f32(wake));
+    ui.frame(W);
+    assert_eq!(text_cmds(&ui), before + 1, "shown");
+    settle(&mut ui);
+    // It takes no input: a click under it reaches the view below.
+    ui.pointer_move((370.0, 45.0));
+    ui.frame(W);
+    tap(&mut ui, (370.0, 45.0));
+    assert_eq!(ui.state.under, 1);
+    settle(&mut ui);
+    assert_eq!(text_cmds(&ui), before, "gone once the mouse left");
+    // A click on the view hides it too.
+    ui.pointer_move((385.0, 15.0));
+    ui.frame(W);
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    ui.frame(W);
+    assert_eq!(text_cmds(&ui), before + 1, "right after another one it shows at once");
+    tap(&mut ui, (385.0, 15.0));
+    settle(&mut ui);
+    assert_eq!(text_cmds(&ui), before);
+}
+
+#[test]
+fn shortcuts_fire_but_leave_text_keys_to_a_field() {
+    use ruru::ShortcutKey::Char;
+    let mut ui = menus();
+    let cmd = ruru::Mods { command: true, ..Default::default() };
+    ui.set_modifiers(cmd);
+    assert!(ui.key_shortcut(Char('K')));
+    assert!(ui.key_shortcut(Char('a')));
+    ui.set_modifiers(ruru::Mods::default());
+    assert!(ui.key_shortcut(Char('/')));
+    assert!(!ui.key_shortcut(Char('k')), "plain K is not bound");
+    assert_eq!(ui.state.k, 111);
+    tap(&mut ui, (75.0, 380.0)); // focus the field
+    assert!(ui.has_focus());
+    assert!(!ui.key_shortcut(Char('/')), "typing");
+    ui.set_modifiers(cmd);
+    assert!(!ui.key_shortcut(Char('a')), "select all in the field");
+    assert!(ui.key_shortcut(Char('k')));
+    assert_eq!(ui.state.k, 112);
+}
+
+#[test]
+fn secondary_click_opens_the_context_menu_at_the_pointer() {
+    let mut ui = menus();
+    assert!(ui.secondary_click((200.0, 250.0)));
+    assert_eq!(ui.state.sec, 1, "plain on_secondary");
+    ui.frame(W);
+    assert!(ui.secondary_click((190.0, 190.0)));
+    settle(&mut ui);
+    // Opens right below the pointer: its first row is at y 197..225.
+    tap(&mut ui, (250.0, 210.0));
+    assert_eq!(ui.state.log, ["ctx"]);
+    assert_eq!(ui.state.under, 0);
+    assert_eq!(ui.state.sec, 1);
 }

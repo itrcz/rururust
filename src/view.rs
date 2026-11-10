@@ -4,6 +4,7 @@
 //! changes. Event handlers are closures that mutate `&mut S`.
 
 use crate::types::Color;
+use crate::ui::popup::{MenuItem, MenuStyle, Placement, Shortcut};
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -474,7 +475,33 @@ pub(crate) enum Kind<S> {
     List { count: usize, row_h: f32, row: Box<dyn Fn(usize) -> View<S>> },
     Overlay { open: bool, mode: OverlayMode, child: Box<View<S>>, on_dismiss: Option<Box<dyn Fn(&mut S)>> },
     Toggle(bool, Box<dyn Fn(&mut S, bool)>),
-    Slider(f32, Box<dyn Fn(&mut S, f32)>),
+    /// Value, number of stops (0 = continuous), handler.
+    Slider(f32, u32, Box<dyn Fn(&mut S, f32)>),
+    Menu { items: Vec<MenuItem<S>>, style: Rc<MenuStyle> },
+}
+
+/// How an attached popover opens and closes.
+pub(crate) enum Opens<S> {
+    /// The app holds the flag; a click outside or Escape calls the handler.
+    State(bool, Rc<dyn Fn(&mut S)>),
+    /// The framework opens it on a tap on the anchor (`.menu()`).
+    Tap,
+    /// The framework opens it at the pointer on a secondary click (`.context_menu()`).
+    Context,
+}
+
+pub(crate) struct Pop<S> {
+    pub opens: Opens<S>,
+    pub placement: Placement,
+    pub content: Box<View<S>>,
+}
+
+/// Rarely used attachments, boxed so that a plain view stays small.
+pub(crate) struct Extras<S> {
+    pub pop: Option<Pop<S>>,
+    pub tip: Option<Box<View<S>>>,
+    pub shortcuts: Vec<(Shortcut, Box<dyn Fn(&mut S)>)>,
+    pub secondary: Option<Box<dyn Fn(&mut S)>>,
 }
 
 /// A node of the UI tree, generic over the app state `S`.
@@ -484,11 +511,16 @@ pub struct View<S> {
     pub(crate) on_tap: Option<Box<dyn Fn(&mut S)>>,
     pub(crate) on_link: Option<Rc<dyn Fn(&mut S, &str)>>,
     pub(crate) key: Option<u64>,
+    pub(crate) extra: Option<Box<Extras<S>>>,
 }
 
 impl<S> View<S> {
-    fn new(kind: Kind<S>) -> Self {
-        View { kind, style: Style::default(), on_tap: None, on_link: None, key: None }
+    pub(crate) fn new(kind: Kind<S>) -> Self {
+        View { kind, style: Style::default(), on_tap: None, on_link: None, key: None, extra: None }
+    }
+
+    fn extras(&mut self) -> &mut Extras<S> {
+        self.extra.get_or_insert_with(|| Box::new(Extras { pop: None, tip: None, shortcuts: Vec::new(), secondary: None }))
     }
 
     // ---- layout ----
@@ -808,6 +840,100 @@ impl<S> View<S> {
         self.on_link = Some(Rc::new(f));
         self
     }
+    /// Slider only: snaps to `n` evenly spaced stops (both ends included) and marks them with
+    /// dots: `slider(s.effort, |s, v| s.effort = v).steps(5)` gives 0, 0.25, … 1.
+    pub fn steps(mut self, n: u32) -> Self {
+        if let Kind::Slider(v, steps, _) = &mut self.kind {
+            *steps = if n >= 2 { n } else { 0 };
+            if *steps > 0 {
+                *v = super::ui::popup::snap(*v, *steps);
+            }
+        }
+        self
+    }
+    /// Menu only (see [`menu`]): its look, and that of its submenus.
+    pub fn menu_style(mut self, style: MenuStyle) -> Self {
+        if let Kind::Menu { style: s, .. } = &mut self.kind {
+            *s = Rc::new(style);
+        }
+        self
+    }
+
+    // ---- popovers, menus, tooltips, shortcuts ----
+    /// Shows `content` in a floating layer next to this view while `open` is true. It sits above
+    /// everything, keeps out of the window edges (flipping to the other side when there is no
+    /// room) and fades in. A click outside it or Escape calls `on_dismiss`; that first click only
+    /// closes it, it never reaches what is underneath. Give the content a width.
+    ///
+    /// ```ignore
+    /// button("Effort", |s| s.pop = true)
+    ///     .popover(s.pop, Placement::top(), |s| s.pop = false, vstack((title, slider(..).steps(5))).width(260.0))
+    /// ```
+    pub fn popover(
+        mut self,
+        open: bool,
+        placement: Placement,
+        on_dismiss: impl Fn(&mut S) + 'static,
+        content: View<S>,
+    ) -> Self {
+        self.extras().pop = Some(Pop { opens: Opens::State(open, Rc::new(on_dismiss)), placement, content: Box::new(content) });
+        self
+    }
+    /// A tap on this view opens `content` (usually a [`menu`]) below it; choosing an item, a
+    /// click outside or Escape closes it. The framework keeps the open state, so no flag is
+    /// needed. One attached popover per view: the last of `.popover`, `.menu`, `.context_menu` wins.
+    ///
+    /// ```ignore
+    /// button("…", |_| {}).menu(menu(vec![MenuItem::action("Rename", |s: &mut App| s.rename())]))
+    /// ```
+    pub fn menu(self, content: View<S>) -> Self {
+        self.menu_at(Placement::bottom().start(), content)
+    }
+    /// [`menu`](View::menu) on another side, e.g. `Placement::top().start()` above an avatar.
+    pub fn menu_at(mut self, placement: Placement, content: View<S>) -> Self {
+        self.extras().pop = Some(Pop { opens: Opens::Tap, placement, content: Box::new(content) });
+        self
+    }
+    /// A secondary (right) click on this view opens `content` at the pointer.
+    pub fn context_menu(mut self, content: View<S>) -> Self {
+        let placement = Placement::bottom().start().gap(2.0);
+        self.extras().pop = Some(Pop { opens: Opens::Context, placement, content: Box::new(content) });
+        self
+    }
+    /// Runs `f` on a secondary (right) click on this view.
+    pub fn on_secondary(mut self, f: impl Fn(&mut S) + 'static) -> Self {
+        self.extras().secondary = Some(Box::new(f));
+        self
+    }
+    /// A small label shown under this view after the mouse rests on it for half a second;
+    /// it never takes clicks. Moving on to a neighbour while one is visible shows the next
+    /// one at once.
+    pub fn tooltip(self, label: impl Into<String>) -> Self {
+        let tip = tip_view(label.into(), None);
+        self.tooltip_with(tip)
+    }
+    /// A tooltip with a key hint in a chip, like "Back ⌘[".
+    pub fn tooltip_shortcut(self, label: impl Into<String>, keys: impl Into<String>) -> Self {
+        let tip = tip_view(label.into(), Some(keys.into()));
+        self.tooltip_with(tip)
+    }
+    /// A tooltip made of any view (style it yourself: background, padding, radius).
+    pub fn tooltip_with(mut self, content: View<S>) -> Self {
+        self.extras().tip = Some(Box::new(content));
+        self
+    }
+    /// Runs `f` when the key combination is pressed while this view is on screen, wherever the
+    /// focus is; put app-wide ones on the root. In a text field, combinations that edit text
+    /// (plain keys, Cmd+A/C/V/X/Z/Y) go to the field instead.
+    ///
+    /// ```ignore
+    /// root.shortcut(Shortcut::cmd('k'), |s| s.palette = true)
+    /// ```
+    pub fn shortcut(mut self, keys: Shortcut, f: impl Fn(&mut S) + 'static) -> Self {
+        self.extras().shortcuts.push((keys, Box::new(f)));
+        self
+    }
+
     /// Stable identity for animation/scroll state when siblings are reordered.
     pub fn key(mut self, k: impl Hash) -> Self {
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1013,7 +1139,41 @@ pub fn tab_bar<S, T: AsRef<str>>(labels: &[T], selected: usize, on_select: impl 
 pub fn toggle<S>(on: bool, on_change: impl Fn(&mut S, bool) + 'static) -> View<S> {
     View::new(Kind::Toggle(on, Box::new(on_change)))
 }
-/// Slider with `value` in 0..=1. Fills the available width.
+/// Slider with `value` in 0..=1. Fills the available width. [`steps`](View::steps) makes it snap.
 pub fn slider<S>(value: f32, on_change: impl Fn(&mut S, f32) + 'static) -> View<S> {
-    View::new(Kind::Slider(value.clamp(0.0, 1.0), Box::new(on_change))).fill_width()
+    View::new(Kind::Slider(value.clamp(0.0, 1.0), 0, Box::new(on_change))).fill_width()
+}
+/// A menu panel: rows with icons, shortcuts, hints, separators, section titles and submenus,
+/// highlighted under the mouse and driven by ↑↓ ←→ Enter Esc. Open it with
+/// [`View::menu`] / [`View::context_menu`], or put it in a [`View::popover`]; choosing an item
+/// runs it and closes the popover. Restyle it with [`View::menu_style`].
+///
+/// ```ignore
+/// menu(vec![
+///     MenuItem::action("Rename", |s: &mut App| s.rename()).icon(&pencil).shortcut("⌥⌘R"),
+///     MenuItem::separator(),
+///     MenuItem::submenu("Copy", vec![MenuItem::action("Link", |s| s.copy_link())]),
+/// ])
+/// ```
+pub fn menu<S>(items: Vec<MenuItem<S>>) -> View<S> {
+    View::new(Kind::Menu { items, style: Rc::new(MenuStyle::default()) })
+}
+
+/// The default tooltip: a dark plate with the label and an optional key chip.
+fn tip_view<S>(label: String, keys: Option<String>) -> View<S> {
+    let label = text(label).font_size(12.0).weight(Weight::Medium);
+    let row = match keys {
+        Some(k) => hstack((
+            label,
+            text(k).font_size(11.0).weight(Weight::Medium).padding_xy(5.0, 1.5).background(Color::WHITE.alpha(0.14)).radius(5.0),
+        ))
+        .spacing(7.0),
+        None => hstack(label),
+    };
+    row.padding_xy(9.0, 5.0)
+        .background(Color::hex(0x2C2C2E))
+        .border(0.5, Color::WHITE.alpha(0.12))
+        .radius(9.0)
+        .shadow(Color::BLACK.alpha(0.3), 14.0, 4.0)
+        .color(Color::WHITE.alpha(0.92))
 }

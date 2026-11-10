@@ -4,6 +4,7 @@ use crate::render::Renderer;
 use crate::types::Color;
 use crate::ui::{KeyInput, Ui, WheelPhase, WindowRequest};
 use crate::view::{Cursor, Mods, ViewFn};
+use crate::ShortcutKey;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -497,18 +498,7 @@ impl<S: 'static> Runner<S> {
     /// A key press with Cmd/Ctrl held: editing shortcuts (by the letter of the layout, or by
     /// its position for layouts without Latin letters, like Russian).
     fn shortcut(&mut self, logical: &Key, physical: PhysicalKey) -> bool {
-        let ch = match logical {
-            Key::Character(c) if c.is_ascii() => c.to_ascii_lowercase().chars().next(),
-            _ => match physical {
-                PhysicalKey::Code(KeyCode::KeyA) => Some('a'),
-                PhysicalKey::Code(KeyCode::KeyC) => Some('c'),
-                PhysicalKey::Code(KeyCode::KeyV) => Some('v'),
-                PhysicalKey::Code(KeyCode::KeyX) => Some('x'),
-                PhysicalKey::Code(KeyCode::KeyY) => Some('y'),
-                PhysicalKey::Code(KeyCode::KeyZ) => Some('z'),
-                _ => None,
-            },
-        };
+        let ch = key_char(logical, physical);
         let ui = &mut self.app.ui;
         match ch {
             Some('a') => ui.key(KeyInput::SelectAll),
@@ -721,6 +711,10 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
                 ElementState::Pressed => ui.pointer_down(self.cursor, false),
                 ElementState::Released => ui.pointer_up(self.cursor),
             },
+            // Context menus open on the press, as on macOS.
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Right, .. } => {
+                ui.secondary_click(self.cursor)
+            }
             WindowEvent::MouseWheel { delta, phase, .. } => {
                 let (dy, precise) = match delta {
                     MouseScrollDelta::LineDelta(_, y) => (y * 48.0, false),
@@ -757,7 +751,12 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
                     _ => None,
                 };
                 let command = self.mods.control_key() || self.mods.super_key();
+                let sk = match named {
+                    Some(k) => Some(ShortcutKey::Named(k)),
+                    None => key_char(&event.logical_key, event.physical_key).map(ShortcutKey::Char),
+                };
                 match (named, &event.text) {
+                    _ if sk.is_some_and(|k| self.app.ui.key_shortcut(k)) => true,
                     (Some(k), _) => self.nav_key(k),
                     _ if command => self.shortcut(&event.logical_key, event.physical_key),
                     (None, Some(text)) => self.app.ui.text_input(text),
@@ -790,4 +789,38 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
             }
         }
     }
+}
+
+/// The character of a key for shortcuts: by the letter of the layout, or by its position for
+/// layouts without Latin letters (Russian), so Cmd+K is the same key everywhere.
+fn key_char(logical: &Key, physical: PhysicalKey) -> Option<char> {
+    if let Key::Character(c) = logical {
+        if c.is_ascii() {
+            return c.to_ascii_lowercase().chars().next();
+        }
+    }
+    let PhysicalKey::Code(code) = physical else { return None };
+    let letters = [
+        KeyCode::KeyA, KeyCode::KeyB, KeyCode::KeyC, KeyCode::KeyD, KeyCode::KeyE, KeyCode::KeyF, KeyCode::KeyG,
+        KeyCode::KeyH, KeyCode::KeyI, KeyCode::KeyJ, KeyCode::KeyK, KeyCode::KeyL, KeyCode::KeyM, KeyCode::KeyN,
+        KeyCode::KeyO, KeyCode::KeyP, KeyCode::KeyQ, KeyCode::KeyR, KeyCode::KeyS, KeyCode::KeyT, KeyCode::KeyU,
+        KeyCode::KeyV, KeyCode::KeyW, KeyCode::KeyX, KeyCode::KeyY, KeyCode::KeyZ,
+    ];
+    if let Some(i) = letters.iter().position(|k| *k == code) {
+        return Some((b'a' + i as u8) as char);
+    }
+    Some(match code {
+        KeyCode::BracketLeft => '[',
+        KeyCode::BracketRight => ']',
+        KeyCode::Comma => ',',
+        KeyCode::Period => '.',
+        KeyCode::Slash => '/',
+        KeyCode::Semicolon => ';',
+        KeyCode::Quote => '\'',
+        KeyCode::Backquote => '`',
+        KeyCode::Minus => '-',
+        KeyCode::Equal => '=',
+        KeyCode::Backslash => '\\',
+        _ => return None,
+    })
 }

@@ -15,6 +15,10 @@ pub(crate) struct Lx<'a> {
     /// Set by a stack for a `.flex()` child just before laying it out: the axis along which
     /// the child takes its share, so it fills it without knowing its parent.
     pub along: Option<Axis>,
+    /// The view whose framework-managed menu is open (`Ui::open_menu`).
+    pub menu: Option<u64>,
+    /// The view whose tooltip shows.
+    pub tip: Option<u64>,
 }
 
 impl Lx<'_> {
@@ -41,7 +45,7 @@ const SLOT_H: u8 = 11;
 const SLOT_LAST_W: u8 = 12;
 const SLOT_LAST_H: u8 = 13;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(crate) struct LNode {
     /// Offset from the parent's top-left corner.
     pub pos: (f32, f32),
@@ -60,6 +64,9 @@ pub(crate) struct LNode {
     /// Number of text views in the subtree, rows of a lazy list not counted. Text selection
     /// numbers them in tree order, which paint (with sticky children last) cannot see.
     pub tn: u32,
+    /// The attached popover's content and the tooltip, when they are shown (or fading out).
+    pub pop: Option<Box<LNode>>,
+    pub tip: Option<Box<LNode>>,
 }
 
 pub(crate) const TOGGLE: (f32, f32) = (51.0, 31.0);
@@ -184,6 +191,7 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
         }
         Kind::Toggle(..) => TOGGLE,
         Kind::Slider(..) => (inner.0.unwrap_or(200.0), SLIDER_H),
+        Kind::Menu { items, style } => crate::ui::popup::layout_menu(items, style, lx, id, &mut node),
         Kind::List { count, row_h, .. } => {
             // Rows are built during paint (only the visible ones); here we just need the
             // total height: measured rows as measured, the rest at the estimate.
@@ -351,5 +359,32 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
         }
         _ => {}
     }
+    if let Some(x) = &v.extra {
+        layout_attached(x, lx, id, &mut node);
+    }
     node
+}
+
+/// A popover or tooltip is laid out right after its anchor, at its natural size, but only
+/// while it is open or still fading out.
+fn layout_attached<S>(x: &crate::view::Extras<S>, lx: &mut Lx, id: u64, node: &mut LNode) {
+    use crate::ui::popup::{pop_id, tip_id, SLOT_FADE};
+    use crate::view::Opens;
+    let fading = |lx: &Lx, lid: u64| lx.springs.get(&(lid, SLOT_FADE)).is_some_and(|s| s.x > 0.004);
+    if let Some(p) = &x.pop {
+        let open = match &p.opens {
+            Opens::State(open, _) => *open,
+            _ => lx.menu == Some(id),
+        };
+        let pid = pop_id(id);
+        if open || fading(lx, pid) {
+            node.pop = Some(Box::new(layout(&p.content, (None, None), lx, pid)));
+        }
+    }
+    if let Some(t) = &x.tip {
+        let tid = tip_id(id);
+        if lx.tip == Some(id) || fading(lx, tid) {
+            node.tip = Some(Box::new(layout(t, (None, None), lx, tid)));
+        }
+    }
 }

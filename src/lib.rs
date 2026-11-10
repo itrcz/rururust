@@ -51,7 +51,8 @@ pub use view::{
     text_field, toggle, vstack, zstack, Align, Children, Cursor, Dim, Fill, Glass, Image, Indicator, Shadow, Truncate,
     View, Weight,
 };
-pub use view::{drawer, rich_text, Env, Mods, SizeClass, Span, ViewFn};
+pub use view::{drawer, menu, rich_text, Env, Mods, SizeClass, Span, ViewFn};
+pub use ui::popup::{MenuItem, MenuStyle, Placement, Shortcut, ShortcutKey, Side};
 #[cfg(feature = "markdown")]
 mod markdown;
 #[cfg(feature = "markdown")]
@@ -68,6 +69,7 @@ pub mod prelude {
     #[cfg(feature = "markdown")]
     pub use crate::{markdown, markdown_styled, markdown_with, MarkdownStyle};
     pub use crate::{drawer, rich_text, Env, SizeClass, Span};
+    pub use crate::{menu, MenuItem, MenuStyle, Placement, Shortcut};
     pub use crate::{link, spawn, Link, Task};
     #[cfg(any(not(target_arch = "wasm32"), feature = "app"))]
     pub use crate::sleep;

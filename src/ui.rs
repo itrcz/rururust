@@ -16,6 +16,10 @@ use web_time::Instant;
 pub(crate) mod edit;
 #[path = "select.rs"]
 pub(crate) mod select;
+#[path = "popup.rs"]
+pub(crate) mod popup;
+
+use popup::{Dismiss, Layer, LayerCtx, MenuNav, MenuState, Shortcut, TIP_DELAY};
 
 // ---------------------------------------------------------------- draw list
 
@@ -192,8 +196,8 @@ pub fn after<S: 'static>(seconds: f32, f: impl FnOnce(&mut S) + 'static) {
 enum Action<S> {
     Tap(Box<dyn Fn(&mut S)>),
     Toggle(bool, Box<dyn Fn(&mut S, bool)>),
-    /// x of value 0, width of the value range (screen space)
-    Slider(f32, f32, Box<dyn Fn(&mut S, f32)>),
+    /// x of value 0, width of the value range (screen space), number of stops (0 = smooth)
+    Slider(f32, f32, u32, Box<dyn Fn(&mut S, f32)>),
     Scroll { refresh: Option<Box<dyn Fn(&mut S)>> },
     /// Covers everything below an overlay; a tap on it dismisses the overlay.
     Block(Option<Box<dyn Fn(&mut S)>>),
@@ -212,6 +216,15 @@ enum Action<S> {
     Select { area: u64 },
     /// A link in rich text (`Span::link`).
     Link(Box<select::LinkHit<S>>),
+    /// Everything outside an open popover: a press closes it and goes no further.
+    Outside(Dismiss<S>),
+    /// A menu row: run the action, then close the popover it is in.
+    MenuPick(Box<dyn Fn(&mut S)>, Option<Dismiss<S>>),
+    /// A submenu row: (menu id, row) opens it.
+    SubMenu(u64, usize),
+    /// Secondary click: run the handler, or (`None`) open the context menu of view `.1`.
+    /// Ignored by the primary button.
+    Secondary(Option<Box<dyn Fn(&mut S)>>, u64),
 }
 
 /// Something the UI asks of the window it lives in. The core knows nothing about windows:
@@ -262,6 +275,16 @@ struct Menu<S> {
     fg: Color,
 }
 
+/// The view with a tooltip under the mouse.
+struct TipState {
+    id: u64,
+    since: Instant,
+    /// Seconds to wait (0 right after another tooltip was shown).
+    delay: f32,
+    /// Hidden by a click until the mouse moves to another view.
+    hidden: bool,
+}
+
 /// Seconds between two presses that make a double click.
 const DOUBLE_CLICK: f32 = 0.4;
 
@@ -304,12 +327,15 @@ struct Zone {
     cursor: Option<Cursor>,
     /// An overlay's backdrop: nothing underneath is hovered.
     blocks: bool,
+    /// The view has a tooltip.
+    tip: bool,
 }
 
-/// The views under `pos`, topmost first, and the pointer shape to show there.
-fn hover_at(zones: &[Zone], pos: Option<(f32, f32)>) -> (Vec<u64>, Cursor) {
-    let (mut ids, mut cursor) = (Vec::new(), None);
-    let Some(pos) = pos else { return (ids, Cursor::Default) };
+/// The views under `pos`, topmost first, the pointer shape to show there and the topmost
+/// view with a tooltip.
+fn hover_at(zones: &[Zone], pos: Option<(f32, f32)>) -> (Vec<u64>, Cursor, Option<u64>) {
+    let (mut ids, mut cursor, mut tip) = (Vec::new(), None, None);
+    let Some(pos) = pos else { return (ids, Cursor::Default, None) };
     for z in zones.iter().rev() {
         if !inside(&z.rect, &z.round, pos) {
             continue;
@@ -319,8 +345,11 @@ fn hover_at(zones: &[Zone], pos: Option<(f32, f32)>) -> (Vec<u64>, Cursor) {
         }
         ids.push(z.id);
         cursor = cursor.or(z.cursor);
+        if z.tip && tip.is_none() {
+            tip = Some(z.id);
+        }
     }
-    (ids, cursor.unwrap_or_default())
+    (ids, cursor.unwrap_or_default(), tip)
 }
 
 #[derive(Default)]
@@ -411,6 +440,21 @@ struct Painter<'a, S> {
     tbase: u32,
     /// Lazy-list rows being painted, outermost first.
     path: Vec<(u64, usize)>,
+    /// The window, for placing layers.
+    screen: Rect,
+    /// Popovers, submenus and tooltips to paint after the tree.
+    layers: Vec<Layer<S>>,
+    /// The layer being painted (default: the tree).
+    layer: LayerCtx<S>,
+    menu_state: &'a mut HashMap<u64, MenuState>,
+    menu_nav: &'a mut Vec<MenuNav>,
+    shortcuts: &'a mut Vec<(Shortcut, Box<dyn Fn(&mut S)>)>,
+    /// The view whose `.menu()` / `.context_menu()` is open was painted.
+    managed_seen: bool,
+    /// Where the open context menu was asked for.
+    ctx_at: (f32, f32),
+    /// The view whose tooltip shows.
+    tip: Option<u64>,
 }
 
 impl<S> Painter<'_, S> {
@@ -419,7 +463,7 @@ impl<S> Painter<'_, S> {
     }
 
     fn zone(&mut self, xf: &Xf, id: u64, rect: Rect, cursor: Option<Cursor>) {
-        self.zones.push(Zone { id, rect: rect.intersect(&xf.clip), round: (xf.clip, xf.clip_r), cursor, blocks: false });
+        self.zones.push(Zone { id, rect: rect.intersect(&xf.clip), round: (xf.clip, xf.clip_r), cursor, blocks: false, tip: false });
     }
 
     fn label(&mut self, xf: &Xf, key: u64, pos: (f32, f32), size: (f32, f32), color: Color) {
@@ -507,12 +551,12 @@ impl<S> Painter<'_, S> {
         self.spin |= spinning;
     }
 
-    fn paint_menu(&mut self, m: Menu<S>, size: (f32, f32)) {
+    fn paint_picker_menu(&mut self, m: Menu<S>, size: (f32, f32)) {
         const ROW: f32 = 44.0;
         let screen = Rect::new(0.0, 0.0, size.0, size.1);
         // Anything outside the menu closes it.
         self.hits.push(Hit { id: m.id ^ 0xD15, rect: screen, round: NO_ROUND, action: Action::Dismiss });
-        self.zones.push(Zone { id: m.id ^ 0xD15, rect: screen, round: NO_ROUND, cursor: None, blocks: true });
+        self.zones.push(Zone { id: m.id ^ 0xD15, rect: screen, round: NO_ROUND, cursor: None, blocks: true, tip: false });
         let spec = |text| TextSpec { spans: &[], text, size: FIELD_FONT, weight: 400, center: false, ..Default::default() };
         let rows: Vec<(u64, (f32, f32))> = m.options.iter().map(|o| self.text.measure(&spec(o), None)).collect();
         let (check, check_size) = self.text.measure(&TextSpec { weight: 600, ..spec("✓") }, None);
@@ -554,7 +598,7 @@ impl<S> Painter<'_, S> {
                 self.label(&xf, check, (cx, row.y + (ROW - check_size.1) * 0.5), check_size, m.fg);
             }
             self.hits.push(Hit { id: rid, rect: xf.rect(row), round: NO_ROUND, action: Action::Pick(i, m.on_select.clone()) });
-            self.zones.push(Zone { id: rid, rect: xf.rect(row), round: NO_ROUND, cursor: Some(Cursor::Pointer), blocks: false });
+            self.zones.push(Zone { id: rid, rect: xf.rect(row), round: NO_ROUND, cursor: Some(Cursor::Pointer), blocks: false, tip: false });
         }
     }
 
@@ -644,7 +688,13 @@ impl<S> Painter<'_, S> {
         }
     }
 
-    fn paint_node(&mut self, v: View<S>, ln: &LNode, origin: (f32, f32), mut xf: Xf, id: u64) {
+    fn paint_node(&mut self, mut v: View<S>, ln: &LNode, origin: (f32, f32), mut xf: Xf, id: u64) {
+        let mut extra = v.extra.take().map(|b| *b);
+        // Shortcuts count while their view is in the tree, on screen or not.
+        if let Some(x) = &mut extra {
+            self.shortcuts.append(&mut x.shortcuts);
+        }
+        let tap_menu = extra.as_ref().is_some_and(|x| matches!(x.pop, Some(crate::view::Pop { opens: crate::view::Opens::Tap, .. })));
         let pin = self.sticky.take();
         let tbase = std::mem::take(&mut self.tbase);
         let st = v.style;
@@ -655,7 +705,7 @@ impl<S> Painter<'_, S> {
         }
 
         // Press feedback: a quick, quiet dim with a barely-there squeeze. No bounce.
-        if v.on_tap.is_some() {
+        if v.on_tap.is_some() || tap_menu {
             let p = self.crisp(id, 0, if self.pressed == Some(id) { 1.0 } else { 0.0 });
             let k = 1.0 - 0.02 * p;
             let (cx, cy) = (r.x + r.w * 0.5, r.y + r.h * 0.5);
@@ -689,7 +739,7 @@ impl<S> Painter<'_, S> {
         let cursor = st.cursor.or(match &v.kind {
             Kind::TextField(_) => Some(Cursor::Text),
             Kind::Toggle(..) | Kind::Slider(..) | Kind::Tabs { .. } | Kind::Picker { .. } => Some(Cursor::Pointer),
-            _ if v.on_tap.is_some() => Some(Cursor::Pointer),
+            _ if v.on_tap.is_some() || tap_menu => Some(Cursor::Pointer),
             _ => None,
         });
         if cursor.is_some() || st.hover.is_some() {
@@ -712,6 +762,9 @@ impl<S> Painter<'_, S> {
         }
         if let Some(f) = v.on_tap {
             self.hit(&xf, id, sr, Action::Tap(f));
+        }
+        if let Some(x) = extra {
+            self.attach(x, ln, &xf, id, sr);
         }
 
         let pad = st.padding;
@@ -737,7 +790,7 @@ impl<S> Painter<'_, S> {
                     let cid = child_id(id, i, rv.key);
                     let saved_row = self.tctx.row;
                     self.enter_row(id, i, count);
-                    let mut lx = Lx { text: self.text, springs: self.springs, frame: self.frame, along: None };
+                    let mut lx = Lx { text: self.text, springs: self.springs, frame: self.frame, along: None, menu: self.open_menu, tip: self.tip };
                     let n = layout(&rv, (Some(r.w), None), &mut lx, cid);
                     if known.is_nan() || (n.size.1 - known).abs() > 0.5 {
                         if let Some(slot) = self.text.lists.get_mut(&id).and_then(|c| c.heights.get_mut(i)) {
@@ -975,7 +1028,8 @@ impl<S> Painter<'_, S> {
                 self.fill(&xf, knob, knob.h * 0.5, Fill::Solid(Color::WHITE), None);
                 self.hit(&xf, id, sr.inflate(6.0), Action::Toggle(on, f));
             }
-            Kind::Slider(value, f) => {
+            Kind::Menu { items, style } => self.paint_menu(items, style, ln, r, xf, id),
+            Kind::Slider(value, steps, f) => {
                 let p = self.spring(id, 2, if self.pressed == Some(id) { 1.0 } else { 0.0 });
                 let knob_d = SLIDER_H;
                 let range = (r.w - knob_d).max(1.0);
@@ -985,12 +1039,18 @@ impl<S> Painter<'_, S> {
                 self.fill(&xf, track, 3.0, Fill::Solid(Color::rgba(0.47, 0.47, 0.5, 0.36)), None);
                 let filled = Rect::new(r.x, cy - 3.0, kx - r.x + knob_d * 0.5, 6.0);
                 self.fill(&xf, filled, 3.0, Fill::Solid(Color::BLUE), None);
+                for k in 0..steps {
+                    let x = r.x + knob_d * 0.5 + range * k as f32 / (steps - 1) as f32;
+                    let on = x <= kx + knob_d * 0.5;
+                    let c = if on { Color::WHITE.alpha(0.6) } else { xf.fg.alpha(0.35) };
+                    self.fill(&xf, Rect::new(x - 2.0, cy - 2.0, 4.0, 4.0), 2.0, Fill::Solid(c), None);
+                }
                 let d = knob_d * (1.0 + 0.12 * p);
                 let knob = Rect::new(kx + (knob_d - d) * 0.5, cy - d * 0.5, d, d);
                 self.shadow(&xf, knob, d * 0.5, Shadow { color: Color::BLACK.alpha(0.28), blur: 10.0, y: 3.0 }, false);
                 self.fill(&xf, knob, d * 0.5, Fill::Solid(Color::WHITE), None);
                 let x0 = (r.x + knob_d * 0.5) * xf.s + xf.tx;
-                self.hit(&xf, id, sr.inflate(8.0), Action::Slider(x0, range * xf.s, f));
+                self.hit(&xf, id, sr.inflate(8.0), Action::Slider(x0, range * xf.s, steps, f));
             }
         }
     }
@@ -1027,6 +1087,17 @@ pub struct Ui<S> {
     /// Window size of the last frame, for building the view outside a frame (copying).
     size: (f32, f32),
     open_menu: Option<u64>,
+    /// Where the open context menu was asked for.
+    ctx_at: (f32, f32),
+    menu_state: HashMap<u64, MenuState>,
+    /// Menus on screen in the last frame, innermost last.
+    menu_nav: Vec<MenuNav>,
+    /// `.shortcut()`s of the last frame.
+    shortcuts: Vec<(Shortcut, Box<dyn Fn(&mut S)>)>,
+    /// The view with a tooltip the mouse rests on.
+    tip: Option<TipState>,
+    /// Last time a tooltip was on screen: the next one shows without delay.
+    tip_seen: Option<Instant>,
     started: Instant,
     timers: Vec<(Instant, Box<dyn FnOnce(&mut S)>)>,
     /// Seconds until the UI wants another frame even without input (caret blink).
@@ -1073,6 +1144,12 @@ impl<S: 'static> Ui<S> {
             sel: select::SelState::default(),
             size: (0.0, 0.0),
             open_menu: None,
+            ctx_at: (0.0, 0.0),
+            menu_state: HashMap::new(),
+            menu_nav: Vec::new(),
+            shortcuts: Vec::new(),
+            tip: None,
+            tip_seen: None,
             started: Instant::now(),
             timers: Vec::new(),
             wake_in: None,
@@ -1190,7 +1267,14 @@ impl<S: 'static> Ui<S> {
         self.size = size;
 
         let view = (self.view_fn)(&self.state, &self.env());
-        let mut lx = Lx { text: &mut self.text, springs: &mut self.springs, frame: self.frame, along: None };
+        // A tooltip shows once the mouse has rested long enough; until then a timer, not frames.
+        let tip_left = self.tip.as_ref().filter(|t| !t.hidden).map(|t| t.delay - (now - t.since).as_secs_f32());
+        let tip_show = self.tip.as_ref().filter(|_| tip_left.is_some_and(|l| l <= 0.0)).map(|t| t.id);
+        let tip_wake = tip_left.filter(|&l| l > 0.0);
+        if tip_show.is_some() {
+            self.tip_seen = Some(now);
+        }
+        let mut lx = Lx { text: &mut self.text, springs: &mut self.springs, frame: self.frame, along: None, menu: self.open_menu, tip: tip_show };
         let root = layout(&view, (Some(size.0), Some(size.1)), &mut lx, 1);
         self.list.cmds.clear();
         self.list.images.clear();
@@ -1198,6 +1282,8 @@ impl<S: 'static> Ui<S> {
         self.zones.clear();
         self.sel.texts.clear();
         self.sel.areas.clear();
+        self.menu_nav.clear();
+        self.shortcuts.clear();
         let paint_sel = self.sel.for_paint();
         let blink = self.ed.blink_at.map_or(0.0, |t| (now - t).as_secs_f32());
         let fg = if self.background.luminance() < 0.5 { Color::WHITE } else { Color::BLACK };
@@ -1239,11 +1325,22 @@ impl<S: 'static> Ui<S> {
             tctx: select::TextCtx::default(),
             tbase: 0,
             path: Vec::new(),
+            screen: Rect::new(0.0, 0.0, size.0, size.1),
+            layers: Vec::new(),
+            layer: LayerCtx::default(),
+            menu_state: &mut self.menu_state,
+            menu_nav: &mut self.menu_nav,
+            shortcuts: &mut self.shortcuts,
+            managed_seen: false,
+            ctx_at: self.ctx_at,
+            tip: tip_show,
         };
         p.paint(view, &root, (0.0, 0.0), xf, 1);
+        p.paint_layers();
         match p.menu.take() {
-            Some(menu) => p.paint_menu(menu, size),
-            None => self.open_menu = None, // its picker is gone
+            Some(menu) => p.paint_picker_menu(menu, size),
+            None if !p.managed_seen => self.open_menu = None, // its picker or anchor is gone
+            None => {}
         }
         let (paint_wake, spin, relayout) = (p.wake, p.spin, p.relayout);
         if p.sel.is_some_and(|s| s.stale) {
@@ -1258,7 +1355,7 @@ impl<S: 'static> Ui<S> {
             }
         }
         let timer_wake = self.timers.iter().map(|t| t.0.saturating_duration_since(now).as_secs_f32()).reduce(f32::min);
-        self.wake_in = [self.focus.filter(|_| self.ed.blinks()).map(|_| 0.5 - blink % 0.5), paint_wake, scroll_wake, timer_wake]
+        self.wake_in = [self.focus.filter(|_| self.ed.blinks()).map(|_| 0.5 - blink % 0.5), paint_wake, scroll_wake, timer_wake, tip_wake]
             .into_iter()
             .flatten()
             .reduce(f32::min)
@@ -1270,6 +1367,7 @@ impl<S: 'static> Ui<S> {
 
         // The layout may have moved under a resting mouse: hover what is there now.
         let rehover = self.update_hover();
+        self.menu_state.retain(|_, m| m.used == frame);
         self.springs.retain(|_, s| s.used == frame);
         self.scrolls.retain(|_, s| s.used == frame);
         self.text.end_frame();
@@ -1322,12 +1420,14 @@ impl<S: 'static> Ui<S> {
     fn hit(&self, pos: (f32, f32), scroll: bool) -> Option<usize> {
         self.hits
             .iter()
-            .rposition(|h| h.contains(pos) && matches!(h.action, Action::Scroll { .. }) == scroll)
+            .rposition(|h| {
+                h.contains(pos) && matches!(h.action, Action::Scroll { .. }) == scroll && !matches!(h.action, Action::Secondary(..))
+            })
     }
 
     fn slide(&mut self, i: usize, x: f32) {
-        if let Action::Slider(x0, range, f) = &self.hits[i].action {
-            f(&mut self.state, ((x - x0) / range).clamp(0.0, 1.0));
+        if let Action::Slider(x0, range, steps, f) = &self.hits[i].action {
+            f(&mut self.state, popup::snap(((x - x0) / range).clamp(0.0, 1.0), *steps));
         }
     }
 
@@ -1349,8 +1449,17 @@ impl<S: 'static> Ui<S> {
                 s.vel = 0.0; // catch a coasting list
             }
         }
+        if let Some(t) = &mut self.tip {
+            t.hidden = true; // a click hides the tooltip until the mouse moves on
+        }
         let hit = self.hit(pos, false);
         self.ptr.pressed = hit.map(|i| self.hits[i].id);
+        if let Some(Action::Outside(d)) = hit.map(|i| &self.hits[i].action) {
+            // macOS: the click that closes a popover does nothing else.
+            let d = d.clone();
+            self.run_dismiss(d);
+            return true;
+        }
         self.focus = None;
         if let Some(i) = hit {
             if matches!(self.hits[i].action, Action::DragWindow) && !touch {
@@ -1382,8 +1491,16 @@ impl<S: 'static> Ui<S> {
 
     /// Recomputes what is under the mouse; true if that changed (a frame is needed).
     fn update_hover(&mut self) -> bool {
-        let (ids, cursor) = hover_at(&self.zones, self.mouse);
+        let (ids, cursor, tip) = hover_at(&self.zones, self.mouse);
         self.cursor = cursor;
+        match (tip, &self.tip) {
+            (Some(id), Some(t)) if t.id == id => {}
+            (Some(id), _) => {
+                let warm = self.tip_seen.is_some_and(|t| t.elapsed().as_secs_f32() < 0.4);
+                self.tip = Some(TipState { id, since: Instant::now(), delay: if warm { 0.0 } else { TIP_DELAY }, hidden: false });
+            }
+            (None, _) => self.tip = None,
+        }
         if ids == self.hovered {
             return false;
         }
@@ -1409,7 +1526,11 @@ impl<S: 'static> Ui<S> {
         } else {
             self.ptr.touch = false;
             self.mouse = Some(pos);
-            self.update_hover()
+            let changed = self.update_hover();
+            if changed {
+                self.menu_hover();
+            }
+            changed
         };
         // Touch: a vertical drag inside a scroll view scrolls it and cancels the tap.
         if let Some(sid) = self.ptr.drag_scroll {
@@ -1478,28 +1599,47 @@ impl<S: 'static> Ui<S> {
         }
         if let (Some(id), Some(i)) = (pressed, self.hit(pos, false)) {
             if self.hits[i].id == id {
-                match &self.hits[i].action {
-                    Action::Tap(f) => f(&mut self.state),
-                    Action::Toggle(on, f) => f(&mut self.state, !on),
-                    Action::OpenMenu => {
-                        self.springs.remove(&(id, 4)); // replay the opening animation
-                        self.open_menu = Some(id);
-                    }
-                    Action::Dismiss => self.open_menu = None,
-                    Action::Block(Some(f)) => f(&mut self.state),
-                    Action::Pick(index, f) => {
-                        f(&mut self.state, *index);
-                        self.open_menu = None;
-                    }
-                    Action::Link(_) => {
-                        self.sel.sel = None;
-                        self.open_link(i);
-                    }
-                    _ => {}
-                }
+                self.activate(i);
             }
         }
         true
+    }
+
+    /// Does what a click on hit `i` does.
+    fn activate(&mut self, i: usize) {
+        let id = self.hits[i].id;
+        match &self.hits[i].action {
+            Action::Tap(f) => f(&mut self.state),
+            Action::Toggle(on, f) => f(&mut self.state, !on),
+            Action::OpenMenu => {
+                self.springs.remove(&(id, 4)); // replay the opening animation
+                self.springs.remove(&(popup::pop_id(id), popup::SLOT_FADE));
+                self.open_menu = Some(id);
+            }
+            Action::Dismiss => self.open_menu = None,
+            Action::Block(Some(f)) => f(&mut self.state),
+            Action::Pick(index, f) => {
+                f(&mut self.state, *index);
+                self.open_menu = None;
+            }
+            Action::MenuPick(f, d) => {
+                let d = d.clone();
+                f(&mut self.state);
+                if let Some(d) = d {
+                    self.run_dismiss(d);
+                }
+            }
+            &Action::SubMenu(menu, row) => {
+                let st = self.menu_state.entry(menu).or_default();
+                st.hl = Some(row);
+                st.sub = Some(row);
+            }
+            Action::Link(_) => {
+                self.sel.sel = None;
+                self.open_link(i);
+            }
+            _ => {}
+        }
     }
 
     /// True while a text field has keyboard focus.
@@ -1518,7 +1658,14 @@ impl<S: 'static> Ui<S> {
     /// Editing / navigation key; Shift and the other modifiers come from
     /// [`set_modifiers`](Self::set_modifiers). Returns true if it was used.
     pub fn key(&mut self, key: KeyInput) -> bool {
+        if let Some(used) = self.menu_key(key) {
+            return used;
+        }
         match key {
+            KeyInput::Escape if self.dismiss_top() => {
+                self.blur();
+                true
+            }
             KeyInput::Escape => self.open_menu.take().is_some() | self.blur() | self.sel_key(key),
             KeyInput::Enter if self.open_menu.is_some() => {
                 self.open_menu = None;
@@ -1541,7 +1688,7 @@ impl<S: 'static> Ui<S> {
                 continue;
             }
             match &h.action {
-                Action::Block(_) => return false,
+                Action::Block(_) | Action::Outside(_) => return false,
                 Action::Scroll { .. } => {}
                 _ => continue,
             }
