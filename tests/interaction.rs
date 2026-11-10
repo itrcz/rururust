@@ -267,3 +267,139 @@ fn after_runs_later_on_the_state() {
     ui.frame((200.0, 200.0));
     assert_eq!(ui.state, 7);
 }
+
+// ---------------------------------------------------------------- background → state
+
+fn blank() -> Ui<Vec<u32>> {
+    Ui::new(Vec::new(), |_: &Vec<u32>| rect().fill())
+}
+
+/// Pumps until `done` holds or a second passes.
+fn pump_until(ui: &mut Ui<Vec<u32>>, done: impl Fn(&Vec<u32>) -> bool) {
+    let start = std::time::Instant::now();
+    while !done(&ui.state) && start.elapsed() < std::time::Duration::from_secs(1) {
+        ui.pump();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn link_delivers_from_another_thread() {
+    let mut ui = blank();
+    let link = ruru::link::<Vec<u32>>();
+    std::thread::spawn(move || link.send(|s| s.push(42))).join().unwrap();
+    assert_eq!(ui.state, Vec::<u32>::new(), "nothing applies before a pump");
+    assert!(ui.pump());
+    assert_eq!(ui.state, vec![42]);
+    assert!(!ui.pump(), "the queue is drained");
+}
+
+#[test]
+fn a_burst_of_sends_wakes_the_loop_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let mut ui = blank();
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let w = wakes.clone();
+    ruru::set_waker(move || {
+        w.fetch_add(1, Ordering::SeqCst);
+    });
+    let link = ruru::link::<Vec<u32>>();
+    for i in 0..1000 {
+        link.send(move |s| s.push(i));
+    }
+    assert_eq!(wakes.load(Ordering::SeqCst), 1);
+    ui.pump();
+    assert_eq!(ui.state.len(), 1000);
+    link.send(|s| s.push(0));
+    assert_eq!(wakes.load(Ordering::SeqCst), 2, "a pump re-arms the waker");
+}
+
+#[test]
+fn link_keeps_order() {
+    let mut ui = blank();
+    let link = ruru::link::<Vec<u32>>();
+    let l2 = link.clone();
+    std::thread::spawn(move || {
+        for i in 0..50 {
+            l2.send(move |s| s.push(i));
+        }
+    })
+    .join()
+    .unwrap();
+    for i in 50..100 {
+        link.send(move |s| s.push(i));
+    }
+    ui.frame((100.0, 100.0)); // the frame pumps too
+    assert_eq!(ui.state, (0..100).collect::<Vec<_>>());
+}
+
+#[test]
+fn spawned_stream_arrives_whole() {
+    let mut ui = blank();
+    let task = ruru::spawn(|link: Link<Vec<u32>>| async move {
+        for i in 0..100 {
+            link.send(move |s| s.push(i));
+            if i % 10 == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    });
+    pump_until(&mut ui, |s| s.len() == 100);
+    assert_eq!(ui.state, (0..100).collect::<Vec<_>>());
+    drop(task);
+}
+
+#[test]
+fn cancel_discards_queued_updates() {
+    let mut ui = blank();
+    let (sent_tx, sent_rx) = std::sync::mpsc::channel();
+    let task = ruru::spawn(move |link: Link<Vec<u32>>| async move {
+        link.send(|s| s.push(1));
+        sent_tx.send(()).unwrap();
+    });
+    sent_rx.recv().unwrap();
+    task.cancel();
+    assert!(!ui.pump());
+    assert!(ui.state.is_empty());
+
+    let (sent_tx, sent_rx) = std::sync::mpsc::channel();
+    let task = ruru::spawn(move |link: Link<Vec<u32>>| async move {
+        link.send(|s| s.push(2));
+        sent_tx.send(()).unwrap();
+    });
+    sent_rx.recv().unwrap();
+    drop(task);
+    ui.frame((100.0, 100.0));
+    assert!(ui.state.is_empty());
+
+    // Detached tasks run on after the handle is gone.
+    let (sent_tx, sent_rx) = std::sync::mpsc::channel();
+    ruru::spawn(move |link: Link<Vec<u32>>| async move {
+        link.send(|s| s.push(3));
+        sent_tx.send(()).unwrap();
+    })
+    .detach();
+    sent_rx.recv().unwrap();
+    assert!(ui.pump());
+    assert_eq!(ui.state, vec![3]);
+}
+
+#[test]
+fn worker_sees_cancellation() {
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let task = ruru::spawn(move |link: Link<Vec<u32>>| async move {
+        started_tx.send(link.cancelled()).unwrap();
+        go_rx.recv().unwrap();
+        seen_tx.send(link.cancelled()).unwrap();
+        link.send(|s| s.push(9)); // ignored
+    });
+    assert!(!started_rx.recv().unwrap(), "not cancelled while running");
+    task.cancel();
+    go_tx.send(()).unwrap();
+    assert!(seen_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap());
+    let mut ui = blank();
+    assert!(!ui.pump());
+}

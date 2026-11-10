@@ -889,6 +889,8 @@ impl<S: 'static> Ui<S> {
 
     /// Builds, lays out and paints one frame for a window of `size` points.
     pub fn frame(&mut self, size: (f32, f32)) {
+        // Updates sent through `Link`s from background work.
+        self.pump();
         let now = Instant::now();
         let dt = match self.last_frame {
             Some(t) if self.animating || self.wake_in.is_some() => (now - t).as_secs_f32().min(1.0 / 20.0),
