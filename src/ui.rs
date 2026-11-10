@@ -193,6 +193,19 @@ enum Action<S> {
     OpenMenu,
     Dismiss,
     Pick(usize, Rc<dyn Fn(&mut S, usize)>),
+    /// `.window_drag()` area: a press moves the window.
+    DragWindow,
+}
+
+/// Something the UI asks of the window it lives in. The core knows nothing about windows:
+/// the runner drains [`Ui::requests`] after each event and carries them out (or ignores them
+/// where they make no sense, like on the web).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowRequest {
+    /// Start moving the window with the pressed pointer (a press on `.window_drag()`).
+    DragWindow,
+    /// Zoom / maximize or restore the window (a double click on `.window_drag()`).
+    Zoom,
 }
 
 /// Keys the UI understands besides typed text.
@@ -232,6 +245,9 @@ fn floor_char(s: &str, i: usize) -> usize {
     i
 }
 
+/// Seconds between two presses that make a double click.
+const DOUBLE_CLICK: f32 = 0.4;
+
 struct Hit<S> {
     id: u64,
     rect: Rect,
@@ -247,6 +263,8 @@ struct Pointer {
     drag_scroll: Option<u64>,
     dragging: bool,
     last_move: Option<Instant>,
+    /// Time and place of the last press on a window-drag area, to spot a double click.
+    drag_down: Option<(Instant, (f32, f32))>,
 }
 
 // ---------------------------------------------------------------- painter
@@ -501,6 +519,10 @@ impl<S> Painter<'_, S> {
             _ => {}
         }
 
+        // Before the tap: a view that is both draggable and tappable keeps its tap.
+        if st.drag {
+            self.hits.push(Hit { id: id ^ 0xD6A9, rect: sr.intersect(&xf.clip), action: Action::DragWindow });
+        }
         if let Some(f) = v.on_tap {
             self.hits.push(Hit { id, rect: sr.intersect(&xf.clip), action: Action::Tap(f) });
         }
@@ -853,6 +875,12 @@ pub struct Ui<S> {
     /// CPU time of the last frame in milliseconds (build + layout + paint + GPU encode),
     /// reported by the runner; shown next to the FPS.
     pub frame_ms: f32,
+    /// Window requests raised by input (`.window_drag()`); the runner drains them.
+    pub requests: Vec<WindowRequest>,
+    /// Passed to the view as [`Env::titlebar`]; set by the runner.
+    pub titlebar: f32,
+    /// Passed to the view as [`Env::window_buttons`]; set by the runner.
+    pub window_buttons: f32,
     fps: f32,
     fps_label: String,
     fps_label_at: Option<Instant>,
@@ -883,6 +911,9 @@ impl<S: 'static> Ui<S> {
             wake_in: None,
             show_fps: false,
             frame_ms: 0.0,
+            requests: Vec::new(),
+            titlebar: 0.0,
+            window_buttons: 0.0,
             fps: 0.0,
             fps_label: String::new(),
             fps_label_at: None,
@@ -980,7 +1011,12 @@ impl<S: 'static> Ui<S> {
             }
         }
 
-        let view = (self.view_fn)(&self.state, &Env { width: size.0, height: size.1 });
+        let view = (self.view_fn)(&self.state, &Env {
+            width: size.0,
+            height: size.1,
+            titlebar: self.titlebar,
+            window_buttons: self.window_buttons,
+        });
         let root = layout(&view, (Some(size.0), Some(size.1)), &mut self.text, 1);
         self.list.cmds.clear();
         self.list.images.clear();
@@ -1115,6 +1151,18 @@ impl<S: 'static> Ui<S> {
         self.ptr.pressed = hit.map(|i| self.hits[i].id);
         self.focus = None;
         if let Some(i) = hit {
+            if matches!(self.hits[i].action, Action::DragWindow) && !touch {
+                let now = Instant::now();
+                let double = self.ptr.drag_down.take().is_some_and(|(t, p)| {
+                    (now - t).as_secs_f32() < DOUBLE_CLICK && (p.0 - pos.0).abs() < 4.0 && (p.1 - pos.1).abs() < 4.0
+                });
+                if double {
+                    self.requests.push(WindowRequest::Zoom);
+                } else {
+                    self.ptr.drag_down = Some((now, pos));
+                    self.requests.push(WindowRequest::DragWindow);
+                }
+            }
             self.slide(i, pos.0);
             if let Action::Field { key, x0, scale, .. } = &self.hits[i].action {
                 self.focus = Some(self.hits[i].id);

@@ -52,6 +52,10 @@ required-features = ["app", "svg", "markdown", "headless"]
 name = "stress"
 required-features = ["headless"]
 
+[[example]]
+name = "window"
+required-features = ["app"]
+
 [[test]]
 name = "interaction"
 

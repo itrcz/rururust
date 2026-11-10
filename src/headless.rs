@@ -1,6 +1,7 @@
 //! Off-screen rendering to PNG: screenshots, visual tests, CI.
 
 use crate::render::Renderer;
+use crate::types::Color;
 use crate::ui::Ui;
 use std::path::Path;
 
@@ -43,7 +44,8 @@ pub fn render_png_after<S: 'static>(
     for i in 0..frames.max(1) {
         before(ui, i);
         ui.frame((width as f32, height as f32));
-        renderer.render(&view, (pw, ph), scale, &ui.list, &mut ui.text, ui.background);
+        // A PNG has no desktop behind it: the background is drawn opaque, as before.
+        renderer.render(&view, (pw, ph), scale, &ui.list, &mut ui.text, Color { a: 1.0, ..ui.background });
     }
 
     let row = (pw * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);

@@ -613,7 +613,10 @@ impl Renderer {
             None => (target, &self.quad_bind_plain),
         };
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        let clear = wgpu::Color { r: clear.r as f64, g: clear.g as f64, b: clear.b as f64, a: 1.0 };
+        // Everything is blended premultiplied, so the clear is too: a translucent background
+        // over a transparent window then tints the desktop instead of brightening it.
+        let a = clear.a.clamp(0.0, 1.0) as f64;
+        let clear = wgpu::Color { r: clear.r as f64 * a, g: clear.g as f64 * a, b: clear.b as f64 * a, a };
         let mut load = wgpu::LoadOp::Clear(clear);
         let mut i = 0;
         while i < batches.len() {

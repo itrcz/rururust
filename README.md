@@ -58,6 +58,7 @@ cargo install wasm-bindgen-cli --version 0.2.130 --locked   # версия ка�
 | Адаптивность | `fn view(s: &S, env: &Env)`; `env.class()` → `Phone` / `Tablet` / `Desktop` |
 | Время | `after(seconds, |s: &mut S| ...)` — таймер на состоянии (скрыть снекбар, закончить обновление) |
 | Фон | `spawn(|link| async move {..})` → `Task` (drop = отмена), `link.send(|s| ..)` из любого потока, `sleep(секунды).await` |
+| Окно (десктоп) | `App::transparent(true)`, `App::blur(true)` — размытый рабочий стол за окном (macOS; где нет — просто прозрачно), `.background(цвет с альфой)` — тонировка; `App::titlebar(Titlebar::Overlay)` — контент под заголовком, светофор на месте, отступы в `env.titlebar` / `env.window_buttons`; `.window_drag()` — область таскает окно, двойной клик — zoom. Пример: `examples/window.rs` |
 | Отладка | `App::show_fps(true)`, `ruru::headless::render_png` |
 
 Модель: состояние `S` → `view(&S)` → дерево → layout → draw list → GPU. Обработчики — замыкания

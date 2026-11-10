@@ -2,7 +2,7 @@
 
 use crate::render::Renderer;
 use crate::types::Color;
-use crate::ui::{KeyInput, Ui, WheelPhase};
+use crate::ui::{KeyInput, Ui, WheelPhase, WindowRequest};
 use crate::view::ViewFn;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -14,16 +14,46 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
+/// Who draws the window's title bar.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Titlebar {
+    /// The system's title bar above the content.
+    #[default]
+    Standard,
+    /// The content fills the whole window and runs under a transparent title bar; the window
+    /// buttons stay where they are (macOS traffic lights). The view learns the zone from
+    /// [`Env::titlebar`](crate::Env::titlebar) and [`Env::window_buttons`](crate::Env::window_buttons)
+    /// and moves the window with [`View::window_drag`](crate::View::window_drag).
+    /// Elsewhere for now: the standard title bar, and both insets are 0.
+    Overlay,
+}
+
+// AppKit's title bar is 28 pt tall; the traffic lights end at about 70 pt, plus a gap.
+#[cfg(target_os = "macos")]
+const MAC_TITLEBAR: f32 = 28.0;
+#[cfg(target_os = "macos")]
+const MAC_BUTTONS: f32 = 78.0;
+
 pub struct App<S> {
     ui: Ui<S>,
     title: String,
     size: (f32, f32),
+    transparent: bool,
+    blur: bool,
+    titlebar: Titlebar,
 }
 
 impl<S: 'static> App<S> {
     /// `view` is called with the current state whenever the UI needs to be rebuilt.
     pub fn new<M>(state: S, view: impl ViewFn<S, M>) -> Self {
-        App { ui: Ui::new(state, view), title: "ruru".into(), size: (420.0, 760.0) }
+        App {
+            ui: Ui::new(state, view),
+            title: "ruru".into(),
+            size: (420.0, 760.0),
+            transparent: false,
+            blur: false,
+            titlebar: Titlebar::Standard,
+        }
     }
     pub fn title(mut self, t: impl Into<String>) -> Self {
         self.title = t.into();
@@ -35,8 +65,33 @@ impl<S: 'static> App<S> {
         self
     }
     /// Window clear color; also picks the default text color (light on dark, dark on light).
+    /// With [`transparent`](Self::transparent) its alpha tints what is behind the window;
+    /// otherwise alpha is ignored.
     pub fn background(mut self, c: Color) -> Self {
         self.ui.background = c;
+        self
+    }
+
+    /// A window with an alpha channel: where the view and the background leave alpha below 1,
+    /// the desktop shows through. Desktop only; on the web the canvas stays opaque.
+    pub fn transparent(mut self, on: bool) -> Self {
+        self.transparent = on;
+        self
+    }
+
+    /// Blurs the desktop behind the window (implies [`transparent`](Self::transparent)).
+    /// macOS: the system window-background blur; Windows: acrylic / blur-behind where the OS has
+    /// it; Linux: KDE's blur protocol. Where the platform has none it is just transparent, so give
+    /// [`background`](Self::background) enough alpha to stay readable without it.
+    pub fn blur(mut self, on: bool) -> Self {
+        self.blur = on;
+        self.transparent |= on;
+        self
+    }
+
+    /// Who draws the title bar; see [`Titlebar`].
+    pub fn titlebar(mut self, t: Titlebar) -> Self {
+        self.titlebar = t;
         self
     }
 
@@ -67,6 +122,7 @@ impl<S: 'static> App<S> {
             cursor: (0.0, 0.0),
             command: false,
             wake_at: None,
+            transparent: false,
         };
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -162,7 +218,7 @@ struct Gfx {
     renderer: Renderer,
 }
 
-async fn init_gfx(window: Arc<Window>) -> Gfx {
+async fn init_gfx(window: Arc<Window>, transparent: bool) -> Gfx {
     // In the browser `navigator.gpu` can exist without a usable adapter (some Safari
     // configurations); this probes it and falls back to WebGL2 instead of failing.
     let instance =
@@ -195,6 +251,15 @@ async fn init_gfx(window: Arc<Window>) -> Gfx {
         .expect("surface not supported by adapter");
     config.format = format;
     config.present_mode = wgpu::PresentMode::AutoVsync;
+    if transparent {
+        // The renderer writes premultiplied color. Metal lists only `PostMultiplied`, but that just
+        // marks the CAMetalLayer non-opaque, and CoreAnimation composites it premultiplied.
+        use wgpu::CompositeAlphaMode as M;
+        let modes = &caps.alpha_modes;
+        if let Some(m) = [M::PreMultiplied, M::PostMultiplied, M::Inherit].into_iter().find(|m| modes.contains(m)) {
+            config.alpha_mode = m;
+        }
+    }
     surface.configure(&device, &config);
     Gfx { surface, config, renderer: Renderer::new(device, queue, format) }
 }
@@ -208,6 +273,8 @@ struct Runner<S> {
     command: bool,
     /// When the UI asked to be redrawn without input (caret blink).
     wake_at: Option<web_time::Instant>,
+    /// The surface was set up with alpha (`App::transparent` on a desktop).
+    transparent: bool,
 }
 
 impl<S: 'static> Runner<S> {
@@ -226,6 +293,13 @@ impl<S: 'static> Runner<S> {
         }
         let scale = window.scale_factor() as f32;
         let ui = &mut self.app.ui;
+        // In full screen the title bar and its buttons slide away: nothing to make room for.
+        #[cfg(target_os = "macos")]
+        if self.app.titlebar == Titlebar::Overlay {
+            let full = window.fullscreen().is_some();
+            ui.titlebar = if full { 0.0 } else { MAC_TITLEBAR };
+            ui.window_buttons = if full { 0.0 } else { MAC_BUTTONS };
+        }
         let started = web_time::Instant::now();
         ui.frame((size.width as f32 / scale, size.height as f32 / scale));
 
@@ -239,7 +313,8 @@ impl<S: 'static> Runner<S> {
             }
         };
         let view = frame.texture.create_view(&Default::default());
-        gfx.renderer.render(&view, (size.width, size.height), scale, &ui.list, &mut ui.text, ui.background);
+        let clear = if self.transparent { ui.background } else { Color { a: 1.0, ..ui.background } };
+        gfx.renderer.render(&view, (size.width, size.height), scale, &ui.list, &mut ui.text, clear);
         let ms = started.elapsed().as_secs_f32() * 1000.0;
         ui.frame_ms += (ms - ui.frame_ms) * if ui.frame_ms == 0.0 { 1.0 } else { 0.1 };
         window.pre_present_notify();
@@ -283,10 +358,19 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
         if self.window.is_some() {
             return;
         }
+        // A transparent canvas would show the page behind it: keep the web opaque.
+        self.transparent = self.app.transparent && !cfg!(target_arch = "wasm32");
         #[allow(unused_mut)]
         let mut attrs = Window::default_attributes()
             .with_title(self.app.title.clone())
-            .with_inner_size(LogicalSize::new(self.app.size.0 as f64, self.app.size.1 as f64));
+            .with_inner_size(LogicalSize::new(self.app.size.0 as f64, self.app.size.1 as f64))
+            .with_transparent(self.transparent)
+            .with_blur(self.app.blur && self.transparent);
+        #[cfg(target_os = "macos")]
+        if self.app.titlebar == Titlebar::Overlay {
+            use winit::platform::macos::WindowAttributesExtMacOS;
+            attrs = attrs.with_titlebar_transparent(true).with_title_hidden(true).with_fullsize_content_view(true);
+        }
         #[cfg(target_arch = "wasm32")]
         {
             use winit::platform::web::WindowAttributesExtWebSys;
@@ -305,14 +389,14 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
             }
             let (slot, win) = (self.gfx.clone(), window.clone());
             wasm_bindgen_futures::spawn_local(async move {
-                let gfx = init_gfx(win.clone()).await;
+                let gfx = init_gfx(win.clone(), false).await;
                 *slot.borrow_mut() = Some(gfx);
                 win.request_redraw();
             });
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            *self.gfx.borrow_mut() = Some(pollster::block_on(init_gfx(window.clone())));
+            *self.gfx.borrow_mut() = Some(pollster::block_on(init_gfx(window.clone(), self.transparent)));
         }
         window.request_redraw();
         self.window = Some(window);
@@ -386,6 +470,18 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
             }
             _ => false,
         };
+        // Must run while the press is still being handled: AppKit starts the move from the
+        // current mouse-down event.
+        if let Some(w) = &self.window {
+            for r in std::mem::take(&mut self.app.ui.requests) {
+                match r {
+                    WindowRequest::DragWindow => {
+                        let _ = w.drag_window();
+                    }
+                    WindowRequest::Zoom => w.set_maximized(!w.is_maximized()),
+                }
+            }
+        }
         if dirty {
             if let Some(w) = &self.window {
                 w.request_redraw();

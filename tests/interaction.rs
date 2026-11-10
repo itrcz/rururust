@@ -499,3 +499,36 @@ fn stuck_list_follows_a_growing_last_row() {
         assert_eq!(bottom_row(&mut ui), 20, "the view follows the end of the growing row");
     }
 }
+
+#[test]
+fn window_drag_asks_the_window_to_move_but_not_through_buttons() {
+    use ruru::WindowRequest;
+    let mut ui = Ui::new(0u32, |_: &u32, env: &Env| {
+        // The strip is as tall as the title bar zone the runner reports.
+        hstack((spacer(), button("+", |n: &mut u32| *n += 1).size(40.0, 28.0)))
+            .height(env.titlebar)
+            .window_drag()
+    });
+    ui.titlebar = 28.0;
+    ui.frame((400.0, 300.0));
+
+    ui.pointer_down((100.0, 10.0), false);
+    ui.pointer_up((100.0, 10.0));
+    assert_eq!(std::mem::take(&mut ui.requests), vec![WindowRequest::DragWindow]);
+
+    // A second press right away is a double click: zoom instead of a drag.
+    ui.pointer_down((101.0, 10.0), false);
+    ui.pointer_up((101.0, 10.0));
+    assert_eq!(std::mem::take(&mut ui.requests), vec![WindowRequest::Zoom]);
+
+    // The button inside the strip is above it: a tap, not a drag.
+    ui.pointer_down((380.0, 10.0), false);
+    ui.pointer_up((380.0, 10.0));
+    assert!(ui.requests.is_empty());
+    assert_eq!(ui.state, 1);
+
+    // Below the strip nothing is draggable; touches never drag.
+    ui.pointer_down((100.0, 200.0), false);
+    ui.pointer_down((100.0, 10.0), true);
+    assert!(ui.requests.is_empty());
+}

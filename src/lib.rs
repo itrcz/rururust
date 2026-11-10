@@ -37,7 +37,7 @@ mod ui;
 mod view;
 
 #[cfg(feature = "app")]
-pub use app::App;
+pub use app::{App, Titlebar};
 #[cfg(feature = "renderer")]
 pub use render::Renderer;
 pub use task::{link, set_spawner, set_waker, spawn, Link, Task};
@@ -45,7 +45,7 @@ pub use task::{link, set_spawner, set_waker, spawn, Link, Task};
 pub use task::sleep;
 pub use text::TextSystem;
 pub use types::{Color, Rect};
-pub use ui::{after, DrawList, KeyInput, Ui, WheelPhase};
+pub use ui::{after, DrawList, KeyInput, Ui, WheelPhase, WindowRequest};
 pub use view::{
     button, hstack, icon, image, list, modal, picker, rect, scroll, sheet, slider, snackbar, spacer, tab_bar, text,
     text_field, toggle, vstack, zstack, Align, Children, Dim, Fill, Glass, Image, Indicator, Shadow, View, Weight,
@@ -58,7 +58,7 @@ pub use markdown::{markdown, markdown_with};
 
 pub mod prelude {
     #[cfg(feature = "app")]
-    pub use crate::App;
+    pub use crate::{App, Titlebar};
     pub use crate::{
         after, button, hstack, icon, image, list, modal, picker, rect, scroll, sheet, slider, snackbar, spacer,
         tab_bar, text, text_field, toggle, vstack, zstack, Align, Color, Fill, Glass, Image, Indicator, View, Weight,

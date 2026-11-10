@@ -140,6 +140,8 @@ pub(crate) struct Style {
     pub fg: Option<Color>,
     pub place: Option<(Align, Align)>,
     pub sticky: bool,
+    /// Pressing on the view (outside interactive children) moves the window.
+    pub drag: bool,
 }
 
 impl Default for Style {
@@ -157,6 +159,7 @@ impl Default for Style {
             fg: None,
             place: None,
             sticky: false,
+            drag: false,
         }
     }
 }
@@ -201,6 +204,12 @@ pub struct Env {
     /// Window size in points.
     pub width: f32,
     pub height: f32,
+    /// Height of the title bar zone the content is drawn under (`App::titlebar(Titlebar::Overlay)`
+    /// on macOS); 0 when the system draws its own title bar. Put a `.window_drag()` strip here.
+    pub titlebar: f32,
+    /// Width at the leading edge of that zone taken by the window buttons (the macOS traffic
+    /// lights): start your own toolbar buttons after it.
+    pub window_buttons: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -511,6 +520,17 @@ impl<S> View<S> {
     /// Makes the view tappable, with a springy press animation.
     pub fn on_tap(mut self, f: impl Fn(&mut S) + 'static) -> Self {
         self.on_tap = Some(Box::new(f));
+        self
+    }
+    /// Pressing on this view moves the window, as a title bar does; a double click zooms it.
+    /// Buttons and fields inside keep working: they sit above the drag area.
+    /// Has no effect where windows don't move (web, mobile, touch).
+    ///
+    /// ```ignore
+    /// hstack((spacer(), button("New", |s| ..))).height(env.titlebar).window_drag()
+    /// ```
+    pub fn window_drag(mut self) -> Self {
+        self.style.drag = true;
         self
     }
     /// Stable identity for animation/scroll state when siblings are reordered.
