@@ -473,6 +473,10 @@ struct Xf {
     clip_r: f32,
     /// The clip's corners are continuous (`.smooth()`), not circular.
     clip_smooth: bool,
+    /// Corners of the clip that are square although `clip_r` > 0 (bit 0 top left, then
+    /// clockwise): a side panel cut from a rounded one at a divider keeps its outer corners
+    /// round and its inner ones sharp.
+    clip_sq: u8,
     fg: Color,
     /// Device pixels per point, for snapping to the pixel grid; 0 turns snapping off for
     /// what is drawn with it (a knob or lens that swells on a spring: steps would show).
@@ -544,15 +548,25 @@ impl Xf {
         let near = |a: &Rect, b: &Rect| {
             (a.x - b.x).abs() < 0.5 && (a.y - b.y).abs() < 0.5 && (a.w - b.w).abs() < 0.5 && (a.h - b.h).abs() < 0.5
         };
-        (self.clip_r, self.clip_smooth) = if near(&next, &r) {
-            (radius, smooth)
+        let (src, sq, rad, smooth) = if near(&next, &r) {
+            (r, 0, radius, smooth)
         } else if near(&next, &self.clip) {
-            (self.clip_r, self.clip_smooth)
+            (self.clip, self.clip_sq, self.clip_r, self.clip_smooth)
         } else if radius > self.clip_r {
-            (radius, smooth)
+            (r, 0, radius, smooth)
         } else {
-            (self.clip_r, self.clip_smooth)
+            (self.clip, self.clip_sq, self.clip_r, self.clip_smooth)
         };
+        // Only the corners the cut shares with the rounded rect it came from are round.
+        let corners = |a: &Rect| [(a.x, a.y), (a.x + a.w, a.y), (a.x + a.w, a.y + a.h), (a.x, a.y + a.h)];
+        let (a, b) = (corners(&next), corners(&src));
+        let mut sq = sq;
+        for i in 0..4 {
+            if (a[i].0 - b[i].0).abs() >= 0.5 || (a[i].1 - b[i].1).abs() >= 0.5 {
+                sq |= 1 << i;
+            }
+        }
+        (self.clip_r, self.clip_smooth, self.clip_sq) = (rad, smooth, sq);
         self.clip = next;
     }
 }
@@ -837,6 +851,7 @@ impl<S> Painter<'_, S> {
             clip: screen,
             clip_r: 0.0,
             clip_smooth: false,
+            clip_sq: 0,
             fg: m.fg,
             px: self.px,
         };
@@ -891,6 +906,7 @@ impl<S> Painter<'_, S> {
             // A negative radius asks the shader for continuous corners (glass always has them).
             p0: [if self.smooth && kind != KIND_GLASS { -radius * xf.s } else { radius * xf.s }, 0.0, 0.0, kind],
             p1: [0.0, 1.0, if xf.clip_smooth { -xf.clip_r } else { xf.clip_r }, xf.opacity],
+            np: [0.0, 0.0, 0.0, xf.clip_sq as f32],
             ..Zeroable::zeroed()
         }
     }
@@ -1765,6 +1781,7 @@ impl<S: 'static> Ui<S> {
             clip: Rect::new(0.0, 0.0, size.0, size.1),
             clip_r: 0.0,
             clip_smooth: false,
+            clip_sq: 0,
             fg,
             px: self.scale,
         };

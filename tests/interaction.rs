@@ -3033,6 +3033,47 @@ fn settle_split(ui: &mut Ui<Sp>) {
 }
 
 #[test]
+fn split_in_a_rounded_panel_keeps_its_inner_corners_square() {
+    // The side panel is cut from the rounded parent clip at the divider: its outer corners
+    // follow the parent's radius, the two at the divider stay square (also mid-glide).
+    let mut ui = Ui::new(Sp { w: 300.0, closed: false }, |s: &Sp| {
+        let panel = zstack(rect().fill().background(SIDE_IN)).background(SIDE).min_width(200.0).max_width(400.0);
+        split(s.w, |s: &mut Sp, w| s.w = w, panel, rect().fill().background(MAIN))
+            .collapsible(s.closed, 120.0, |s: &mut Sp, c| s.closed = c)
+            .fill()
+            .border(1.0, Color::WHITE)
+            .radius(12.0)
+            .clip()
+    });
+    let side = |ui: &Ui<Sp>| {
+        let c = SIDE;
+        ui.list.cmds.iter().find_map(|q| match q {
+            ruru::Cmd::Quad(q) if q.c0 == [c.r, c.g, c.b, c.a] => Some(*q),
+            _ => None,
+        })
+    };
+    ui.frame((800.0, 400.0));
+    let q = side(&ui).unwrap();
+    assert!(q.p1[2] > 10.0, "rounded clip: {:?}", q.p1);
+    assert_eq!(q.np[3], 6.0, "top right and bottom right square, left corners round");
+    ui.state.closed = true;
+    for _ in 0..3 {
+        std::thread::sleep(std::time::Duration::from_millis(16));
+        ui.frame((800.0, 400.0));
+    }
+    let q = side(&ui).unwrap();
+    assert!(ui.animating, "still gliding");
+    assert_eq!(q.np[3], 6.0, "mid-glide: {:?}", q.clip);
+    // The main area's clip is the parent's own: all four corners round.
+    let m = MAIN;
+    let main = ui.list.cmds.iter().find_map(|q| match q {
+        ruru::Cmd::Quad(q) if q.c0 == [m.r, m.g, m.b, m.a] => Some(*q),
+        _ => None,
+    });
+    assert_eq!(main.unwrap().np[3], 0.0);
+}
+
+#[test]
 fn split_drag_resizes_one_to_one_within_min_and_max() {
     let mut ui = split_ui(false);
     assert_eq!(quads(&ui, SIDE)[0], [0.0, 0.0, 300.0, 400.0]);

@@ -63,7 +63,8 @@ fn vs(@builtin(vertex_index) vi: u32, in: Instance) -> VOut {
     let b = in.n1 * s;
     o.n0 = vec4f(a.xy + a.zw * 0.5, a.zw * 0.5);
     o.n1 = vec4f(b.xy + b.zw * 0.5, b.zw * 0.5);
-    o.np = in.np * s;
+    // w: the clip's square corners (a bit mask), not a length.
+    o.np = vec4f(in.np.xyz * s, in.np.w);
     return o;
 }
 
@@ -237,7 +238,12 @@ fn fs(in: VOut) -> @location(0) vec4f {
     // lines up with that view's own background and border.
     var dc = sd_round_box(in.xy - in.clip.xy, in.clip.zw, 0.0);
     if in.p1.z != 0.0 {
-        dc = sd_shape(in.xy - in.clip.xy, in.clip.zw, abs(in.p1.z), in.p1.z < 0.0);
+        // A corner flagged square in np.w (bit 0 top left, then clockwise) has no radius; the
+        // distance near a corner depends only on that corner, so one radius per quadrant does.
+        let cq = in.xy - in.clip.xy;
+        let bit = select(select(1u, 2u, cq.x > 0.0), select(8u, 4u, cq.x > 0.0), cq.y > 0.0);
+        let cr = select(abs(in.p1.z), 0.0, (u32(in.np.w + 0.5) & bit) != 0u);
+        dc = sd_shape(cq, in.clip.zw, cr, in.p1.z < 0.0);
     }
     let clip = clamp(0.5 - dc, 0.0, 1.0);
     let alpha = clip * in.p1.w;
