@@ -2278,3 +2278,60 @@ fn animate_snaps_without_size_judder() {
     assert!(widths.windows(2).all(|p| p[1] <= p[0] + 1e-3), "no step back: {widths:?}");
     assert_eq!(*widths.last().unwrap(), 0.0);
 }
+
+fn clipped_menu_view(s: &M) -> View<M> {
+    let items = || {
+        vec![
+            MenuItem::action("One", |s: &mut M| s.log.push("one")),
+            MenuItem::action("Two", |s: &mut M| s.log.push("two")),
+            MenuItem::action("Three", |s: &mut M| s.log.push("three")),
+        ]
+    };
+    zstack((
+        rect()
+            .size(30.0, 30.0)
+            .on_tap(|s: &mut M| s.pop = true)
+            .popover(
+                s.pop,
+                Placement::bottom().start(),
+                |s: &mut M| s.pop = false,
+                zstack(scroll(menu(items()).width(200.0)))
+                    .height(80.0)
+                    .clip()
+                    .glass_with(Glass::dark())
+                    .background(Color::BLACK.alpha(0.5))
+                    .border(0.5, Color::WHITE.alpha(0.2))
+                    .radius(12.0)
+                    .shadow(Color::BLACK.alpha(0.4), 20.0, 6.0),
+            )
+            .place(Align::Start, Align::Start),
+        rect().size(30.0, 30.0).menu(zstack(scroll(menu(items()))).height(80.0).clip()).place(Align::End, Align::Start),
+    ))
+    .fill()
+}
+
+#[test]
+fn menu_inside_scroll_and_clip_still_hovers() {
+    let lit = Color::WHITE.alpha(0.09);
+    for (anchor, x) in [((15.0, 15.0), 60.0), ((385.0, 15.0), 340.0)] {
+        let mut ui = Ui::new(M::default(), clipped_menu_view);
+        ui.frame(W);
+        tap(&mut ui, anchor);
+        settle(&mut ui);
+        assert!(quads(&ui, lit).is_empty());
+        // Below the 30 pt anchor with a gap of 6: rows start 5 below the panel top, 28 high.
+        ui.pointer_move((x, 36.0 + 5.0 + 28.0 + 14.0));
+        ui.frame(W);
+        assert_eq!(quads(&ui, lit).len(), 1, "the row under the mouse is lit (anchor {anchor:?})");
+        assert!(ui.key(KeyInput::Enter));
+        assert_eq!(ui.state.log, ["two"]);
+        // The mouse rests while the menu grows in under it: the row it ends up on is lit.
+        let mut ui = Ui::new(M::default(), clipped_menu_view);
+        ui.frame(W);
+        tap(&mut ui, anchor);
+        ui.pointer_move((x, 68.0)); // on Two while the panel is scaled, on One once it is not
+        settle(&mut ui);
+        assert!(ui.key(KeyInput::Enter));
+        assert_eq!(ui.state.log, ["one"], "anchor {anchor:?}");
+    }
+}

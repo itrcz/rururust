@@ -1630,6 +1630,10 @@ impl<S: 'static> Ui<S> {
 
         // The layout may have moved under a resting mouse: hover what is there now.
         let rehover = self.update_hover();
+        if rehover {
+            // A menu that moved or grew in under a resting mouse lights the row now under it.
+            self.menu_hover();
+        }
         self.menu_state.retain(|_, m| m.used == frame);
         self.springs.retain(|_, s| s.used == frame);
         self.scrolls.retain(|_, s| s.used == frame);
