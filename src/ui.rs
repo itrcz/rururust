@@ -1472,6 +1472,7 @@ impl<S: 'static> Ui<S> {
     /// their colors and sizes from it; modifiers on a view still win.
     pub fn set_theme(&mut self, theme: Theme) {
         if *self.look.theme != theme {
+            self.text.set_fonts(&theme.font, &theme.mono);
             self.look = Rc::new(Look::new(Rc::new(theme)));
         }
     }

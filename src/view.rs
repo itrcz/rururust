@@ -368,6 +368,8 @@ pub struct Span {
     pub icon: Option<Image>,
     /// Where the run links to; see [`Span::link`].
     pub link: Option<String>,
+    /// OpenType features of this run on top of the text's; see [`Span::feature`].
+    pub features: Vec<([u8; 4], u32)>,
 }
 
 impl Span {
@@ -419,6 +421,15 @@ impl Span {
     pub fn link(mut self, url: impl Into<String>) -> Self {
         self.link = Some(url.into());
         self
+    }
+    /// An OpenType feature for this run: `Span::new("1/2").feature(*b"frac", 1)`.
+    pub fn feature(mut self, tag: [u8; 4], value: u32) -> Self {
+        self.features.push((tag, value));
+        self
+    }
+    /// Digits of equal width (`tnum`): counters and times that change in place do not jiggle.
+    pub fn tabular(self) -> Self {
+        self.feature(*b"tnum", 1)
     }
 }
 
@@ -491,6 +502,8 @@ pub(crate) struct TextData {
     pub line_height: f32,
     /// Extra space between letters, in em.
     pub tracking: f32,
+    /// OpenType features of the whole text (spans add their own).
+    pub features: Vec<([u8; 4], u32)>,
     /// Theme text style for what no modifier set (`set`: `T_*` bits).
     pub role: TextRole,
     pub set: u8,
@@ -956,25 +969,47 @@ impl<S> View<S> {
             t.set = T_SIZE | T_WEIGHT | T_LH | T_TRACK;
         }
         if let Kind::TextField(f) = &mut self.kind {
-            (f.size, f.line_height, f.sized) = (ts.size, ts.line_height, true);
+            (f.size, f.line_height, f.tracking) = (ts.size, ts.line_height, ts.tracking);
+            (f.sized, f.lh_set, f.track_set) = (true, true, true);
         }
         self
     }
-    /// Text only: line height as a multiple of the font size (1.3 unless set). Reading text
-    /// usually wants 1.4–1.6: `text(body).font_size(14.0).line_height(1.625)`.
+    /// Text and text fields: line height as a multiple of the font size (1.3 unless set).
+    /// Reading text usually wants 1.4–1.6: `text(body).font_size(14.0).line_height(1.625)`;
+    /// a multi-line field grows by `round(size × k)` per row.
     pub fn line_height(mut self, k: f32) -> Self {
         if let Kind::Text(t) = &mut self.kind {
             t.line_height = k.max(0.5);
             t.set |= T_LH;
         }
+        if let Kind::TextField(f) = &mut self.kind {
+            (f.line_height, f.lh_set) = (k.max(0.5), true);
+        }
         self
     }
-    /// Text only: extra space between letters in em (0.01 = 1 % of the font size);
-    /// negative tightens. Small text often reads better a little looser.
+    /// Text and text fields: extra space between letters in em (0.01 = 1 % of the font
+    /// size); negative tightens. Small text often reads better a little looser.
     pub fn letter_spacing(mut self, em: f32) -> Self {
         if let Kind::Text(t) = &mut self.kind {
             t.tracking = em;
             t.set |= T_TRACK;
+        }
+        if let Kind::TextField(f) = &mut self.kind {
+            (f.tracking, f.track_set) = (em, true);
+        }
+        self
+    }
+    /// Text only: digits of equal width (OpenType `tnum`), so a counter, a timer or a column
+    /// of numbers does not jiggle as the digits change: `text(format!("{n}")).tabular()`.
+    pub fn tabular(self) -> Self {
+        self.font_feature(*b"tnum", 1)
+    }
+    /// Text only: turns an OpenType feature on (1), off (0) or picks an alternate (n):
+    /// `.font_feature(*b"ss01", 1)`, `.font_feature(*b"liga", 0)`. Fonts without it ignore it.
+    pub fn font_feature(mut self, tag: [u8; 4], value: u32) -> Self {
+        if let Kind::Text(t) = &mut self.kind {
+            t.features.retain(|f| f.0 != tag);
+            t.features.push((tag, value));
         }
         self
     }
@@ -1293,6 +1328,7 @@ pub fn text<S>(content: impl Into<String>) -> View<S> {
         truncate: Truncate::Ellipsis,
         line_height: crate::text::LINE_HEIGHT,
         tracking: 0.0,
+        features: Vec::new(),
         role: TextRole::Body,
         set: 0,
     }))
@@ -1309,6 +1345,7 @@ pub fn rich_text<S>(spans: Vec<Span>) -> View<S> {
         truncate: Truncate::Ellipsis,
         line_height: crate::text::LINE_HEIGHT,
         tracking: 0.0,
+        features: Vec::new(),
         role: TextRole::Body,
         set: 0,
     }))

@@ -38,6 +38,33 @@ pub struct Theme {
     pub menu: Option<MenuStyle>,
     /// The look of every `slider` that has no `.slider_style()`; `None` derives it.
     pub slider: Option<SliderStyle>,
+    /// Typeface of all text; set it with [`Theme::font`], which also fits the headings' tracking.
+    pub font: Font,
+    /// Typeface of code (`Span::code`, code blocks).
+    pub mono: Font,
+}
+
+/// Which typeface the text uses ([`Theme::font`], [`Theme::mono`]).
+///
+/// A font that is not there (any system font on the web, a name the machine lacks) quietly
+/// falls back to the bundled one, so the layout never depends on it being found.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum Font {
+    /// The fonts compiled in: Inter (text) and JetBrains Mono (code, with the `markdown`
+    /// feature). The same pixels on every platform and the web.
+    #[default]
+    Bundled,
+    /// The platform's UI font: San Francisco on macOS (and SF Mono for code), Segoe UI
+    /// Variable / Segoe UI on Windows (Cascadia Mono / Consolas), a common sans on Linux
+    /// (Cantarell, Ubuntu, Noto Sans, DejaVu Sans…).
+    ///
+    /// On macOS the system font is a variable font with an optical-size axis that the
+    /// shaper does not drive: every size is drawn with the 28 pt (display) design. Letter
+    /// spacing is opened up to AppKit's line widths (within ~0.5 %), but the x-height stays
+    /// ~3.5 % lower and stems a little lighter than in a native app.
+    System,
+    /// A family by name, among the system fonts: `Font::Named("Helvetica Neue".into())`.
+    Named(String),
 }
 
 /// Semantic colors. Built-in widgets use them; read them in your own views through
@@ -188,6 +215,20 @@ const fn ts(size: f32, weight: Weight) -> TextStyle {
     TextStyle { size, line_height: 1.3, weight, tracking: 0.0 }
 }
 
+/// A heading style: Inter at large sizes wants tighter tracking (its Display cut, which
+/// the bundled font does not have).
+fn heading(size: f32, weight: Weight) -> TextStyle {
+    TextStyle { tracking: inter_tracking(size), ..ts(size, weight) }
+}
+
+/// Letter spacing (em) that Inter's designer recommends for a size ("dynamic metrics":
+/// `-0.0223 + 0.185·e^(-0.1745·size)`): about +0.5 % at 11 pt, 0 at 12, -1.3 % at 17,
+/// -1.8 % at 22, -2.2 % from 34 up. The theme applies it to titles (20 pt and up); use it
+/// for your own large text: `.letter_spacing(inter_tracking(48.0))`.
+pub fn inter_tracking(size: f32) -> f32 {
+    -0.0223 + 0.185 * (-0.1745 * size).exp()
+}
+
 const GRAY_FILL: Color = Color::hex(0x787880);
 
 impl Theme {
@@ -221,8 +262,8 @@ impl Theme {
             space: [2.0, 4.0, 8.0, 12.0, 16.0, 24.0, 32.0],
             radius: Radii { xs: 4.0, s: 6.0, m: 8.0, l: 12.0, xl: 22.0 },
             text: TypeScale {
-                large_title: ts(34.0, Weight::Bold),
-                title: ts(22.0, Weight::Bold),
+                large_title: heading(34.0, Weight::Bold),
+                title: heading(22.0, Weight::Bold),
                 headline: ts(17.0, Weight::Semibold),
                 body: ts(17.0, Weight::Regular),
                 subhead: ts(15.0, Weight::Regular),
@@ -267,6 +308,8 @@ impl Theme {
             glass_menu: Glass::frosted(),
             menu: None,
             slider: None,
+            font: Font::Bundled,
+            mono: Font::Bundled,
         }
     }
 
@@ -324,6 +367,23 @@ impl Theme {
         self.color.selection = c.alpha(self.color.selection.a);
         self.color.focus = c.alpha(self.color.focus.a);
         self.control.toggle_on = None;
+        self
+    }
+
+    /// The same theme in another typeface: `Theme::dark().font(Font::System)`. Title tracking
+    /// is tuned for Inter, so with any other font it goes back to the font's own (0).
+    pub fn font(mut self, f: Font) -> Theme {
+        let bundled = f == Font::Bundled;
+        for st in [&mut self.text.large_title, &mut self.text.title] {
+            st.tracking = if bundled { inter_tracking(st.size) } else { 0.0 };
+        }
+        self.font = f;
+        self
+    }
+
+    /// The same theme with another typeface for code.
+    pub fn mono(mut self, f: Font) -> Theme {
+        self.mono = f;
         self
     }
 

@@ -29,6 +29,11 @@ pub(crate) struct Field<S> {
     /// Set by `.font_size()`: the theme's body size does not replace it.
     pub sized: bool,
     pub line_height: f32,
+    /// Letter spacing in em.
+    pub tracking: f32,
+    /// Set by `.line_height()` / `.letter_spacing()`: the theme does not replace them.
+    pub lh_set: bool,
+    pub track_set: bool,
     /// 1 = single-line; more = grows with its text up to this many rows, then scrolls.
     pub max_lines: usize,
     /// No ring of its own: the app draws the container.
@@ -48,6 +53,9 @@ impl<S> Field<S> {
             size: body.size,
             sized: false,
             line_height: body.line_height,
+            tracking: body.tracking,
+            lh_set: false,
+            track_set: false,
             max_lines: 1,
             plain: false,
             placeholder_color: None,
@@ -58,7 +66,12 @@ impl<S> Field<S> {
         if !self.sized {
             self.size = body.size;
         }
-        self.line_height = body.line_height;
+        if !self.lh_set {
+            self.line_height = body.line_height;
+        }
+        if !self.track_set {
+            self.tracking = body.tracking;
+        }
     }
 }
 
@@ -128,8 +141,8 @@ fn line_h(size: f32, k: f32) -> f32 {
     (size * k).round() // as text.rs lays out lines
 }
 
-fn spec(text: &str, size: f32, line_height: f32) -> TextSpec<'_> {
-    TextSpec { spans: &[], text, size, weight: 400, center: false, line_height, ..Default::default() }
+fn spec(text: &str, size: f32, line_height: f32, tracking: f32) -> TextSpec<'_> {
+    TextSpec { spans: &[], text, size, weight: 400, center: false, line_height, tracking, ..Default::default() }
 }
 
 fn wrap_at(multi: bool, w: f32) -> Option<f32> {
@@ -141,7 +154,7 @@ fn wrap_at(multi: bool, w: f32) -> Option<f32> {
 pub(crate) fn layout_field<S>(f: &Field<S>, width: Option<f32>, ts: &mut TextSystem, node: &mut LNode) -> (f32, f32) {
     let w = width.unwrap_or(220.0);
     let lh = line_h(f.size, f.line_height);
-    let (key, size) = ts.measure(&spec(&f.value, f.size, f.line_height), wrap_at(f.max_lines > 1, w));
+    let (key, size) = ts.measure(&spec(&f.value, f.size, f.line_height, f.tracking), wrap_at(f.max_lines > 1, w));
     node.text = key;
     let rows = ((size.1 / lh).round() as usize).clamp(1, f.max_lines.max(1));
     (w, rows as f32 * lh)
@@ -155,6 +168,7 @@ pub(crate) struct FieldHit<S> {
     wrap: Option<f32>,
     size: f32,
     line_height: f32,
+    tracking: f32,
     multi: bool,
     /// Visible text height and full text height (local points).
     view_h: f32,
@@ -320,7 +334,7 @@ impl<S: 'static> Ui<S> {
     /// the text key plus the press position in text coordinates.
     fn shaped(&mut self, i: usize, pos: (f32, f32)) -> (u64, (f32, f32)) {
         let Action::Field(h) = &self.hits[i].action else { return (0, (0.0, 0.0)) };
-        let key = self.text.measure(&spec(&h.value, h.size, h.line_height), h.wrap).0;
+        let key = self.text.measure(&spec(&h.value, h.size, h.line_height, h.tracking), h.wrap).0;
         (key, ((pos.0 - h.origin.0) / h.scale, (pos.1 - h.origin.1) / h.scale))
     }
 
@@ -483,7 +497,7 @@ impl<S: 'static> Ui<S> {
         let m = self.ed.mods;
         let word = m.alt || m.command;
         let (c, sel) = (self.ed.caret, self.ed.range());
-        let key_v = self.text.measure(&spec(&value, h.size, h.line_height), h.wrap).0;
+        let key_v = self.text.measure(&spec(&value, h.size, h.line_height, h.tracking), h.wrap).0;
         use KeyInput as K;
         if !matches!(key, K::Up | K::Down) {
             self.ed.goal_x = None;
@@ -594,7 +608,7 @@ impl<S> Painter<'_, S> {
         let inner = Rect::new(r.x + pad[0], r.y + pad[1], (r.w - pad[0] - pad[2]).max(0.0), (r.h - pad[1] - pad[3]).max(0.0));
         let multi = f.max_lines > 1;
         let wrap = wrap_at(multi, inner.w);
-        let (key_v, size_v) = self.text.measure(&spec(&f.value, f.size, f.line_height), wrap);
+        let (key_v, size_v) = self.text.measure(&spec(&f.value, f.size, f.line_height, f.tracking), wrap);
         let lh = line_h(f.size, f.line_height);
         let content_h = size_v.1.max(lh);
 
@@ -620,7 +634,7 @@ impl<S> Painter<'_, S> {
             Some((p, cur)) => {
                 let c = ed.caret;
                 let shown = format!("{}{}{}", &f.value[..c], p, &f.value[c..]);
-                let (k, s) = self.text.measure(&spec(&shown, f.size, f.line_height), wrap);
+                let (k, s) = self.text.measure(&spec(&shown, f.size, f.line_height, f.tracking), wrap);
                 (k, s, c + cur.map_or(p.len(), |x| x.0.min(p.len())), Some(c..c + p.len()))
             }
             None => (key_v, size_v, ed.caret, None),
@@ -660,7 +674,7 @@ impl<S> Painter<'_, S> {
             }
         }
         if f.value.is_empty() && pre.is_none() {
-            let (key_p, size_p) = self.text.measure(&spec(&f.placeholder, f.size, f.line_height), wrap);
+            let (key_p, size_p) = self.text.measure(&spec(&f.placeholder, f.size, f.line_height, f.tracking), wrap);
             let color = f.placeholder_color.unwrap_or(xf.fg.alpha(xf.fg.a * 0.4));
             self.label(&cxf, key_p, origin, size_p, color);
         } else {
@@ -691,6 +705,7 @@ impl<S> Painter<'_, S> {
                 wrap,
                 size: f.size,
                 line_height: f.line_height,
+                tracking: f.tracking,
                 multi,
                 view_h: inner.h,
                 content_h,

@@ -3,7 +3,7 @@
 use crate::view::Span;
 use cosmic_text::{
     fontdb, Align as TextAlign, Attrs, AttrsList, Buffer, BufferLine, CacheKeyFlags, Color as TextColor, Ellipsize,
-    EllipsizeHeightLimit, Family, FontSystem, LayoutLine, LineEnding, Metrics, ShapeBuffer, Shaping, Weight,
+    EllipsizeHeightLimit, Family, FeatureTag, FontFeatures, FontSystem, LayoutLine, LineEnding, Metrics, ShapeBuffer, Shaping, Weight,
 };
 use crate::types::Rect;
 use std::collections::HashMap;
@@ -14,6 +14,60 @@ use unicode_segmentation::UnicodeSegmentation;
 static INTER: &[u8] = include_bytes!("../assets/Inter.ttf");
 #[cfg(feature = "markdown")]
 static MONO: &[u8] = include_bytes!("../assets/JetBrainsMono.ttf");
+
+const BUNDLED_SANS: &str = "Inter";
+#[cfg(feature = "markdown")]
+const BUNDLED_MONO: Option<&str> = Some("JetBrains Mono");
+#[cfg(not(feature = "markdown"))]
+const BUNDLED_MONO: Option<&str> = None;
+
+/// The platform's UI font, best first. macOS lists its variable San Francisco as "System
+/// Font" (SFNS.ttf), with ".SF NS" as another name; an installed SF Pro comes first.
+#[cfg(target_os = "macos")]
+const SYSTEM_SANS: &[&str] = &["SF Pro Text", "SF Pro", "System Font", ".SF NS", "Helvetica Neue"];
+#[cfg(target_os = "macos")]
+const SYSTEM_MONO: &[&str] = &["SF Mono", ".SF NS Mono", "Menlo"];
+#[cfg(target_os = "windows")]
+const SYSTEM_SANS: &[&str] = &["Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI"];
+#[cfg(target_os = "windows")]
+const SYSTEM_MONO: &[&str] = &["Cascadia Mono", "Consolas"];
+#[cfg(target_os = "ios")]
+const SYSTEM_SANS: &[&str] = &["System Font", ".SF UI Text", ".SF NS"];
+#[cfg(target_os = "ios")]
+const SYSTEM_MONO: &[&str] = &["SF Mono", "Menlo", "Courier"];
+#[cfg(target_os = "android")]
+const SYSTEM_SANS: &[&str] = &["Roboto", "Google Sans Text", "Noto Sans"];
+#[cfg(target_os = "android")]
+const SYSTEM_MONO: &[&str] = &["Droid Sans Mono", "Roboto Mono", "Noto Sans Mono"];
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "ios", target_os = "android")))]
+const SYSTEM_SANS: &[&str] = &["Cantarell", "Ubuntu", "Noto Sans", "DejaVu Sans", "Liberation Sans"];
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "ios", target_os = "android")))]
+const SYSTEM_MONO: &[&str] = &["Ubuntu Mono", "Noto Sans Mono", "DejaVu Sans Mono", "Liberation Mono"];
+
+/// Names of the variable San Francisco (SFNS.ttf) that macOS ships.
+const SF_VARIABLE: &[&str] = &["System Font", ".SF NS"];
+
+/// Letter spacing (em) that brings the variable San Francisco, drawn at its default 28 pt
+/// optical size (cosmic-text varies only the weight), to the advance widths AppKit gets at
+/// `size` (optical size = point size, plus Apple's tracking table). Measured with CoreText
+/// on a mixed Latin/Cyrillic sentence, macOS 26: regular weight, semibold needs ~0.006 less.
+/// What it cannot fix: the 28 pt design has a lower x-height (0.508 em against 0.526 at
+/// text sizes) and slightly lighter stems.
+fn sf_tracking(size: f32, weight: u16) -> f32 {
+    const T: [(f32, f32); 13] = [
+        (11.0, 0.066), (12.0, 0.060), (13.0, 0.054), (14.0, 0.049), (15.0, 0.044), (16.0, 0.040), (17.0, 0.035),
+        (18.0, 0.033), (20.0, 0.023), (22.0, 0.016), (24.0, 0.0134), (28.0, 0.0132), (34.0, 0.0107),
+    ];
+    let at = match T.iter().position(|&(s, _)| s >= size) {
+        Some(0) => T[0].1,
+        None => T[T.len() - 1].1,
+        Some(i) => {
+            let ((s0, t0), (s1, t1)) = (T[i - 1], T[i]);
+            t0 + (t1 - t0) * (size - s0) / (s1 - s0)
+        }
+    };
+    at - 0.006 * (weight as f32 - 400.0) / 200.0
+}
 
 /// Measured row heights of one lazy list.
 #[derive(Default)]
@@ -113,6 +167,13 @@ pub struct TextSystem {
     budget: usize,
     /// Glyph outlines are hinted (only at scale < 2; see `set_scale`).
     hint: bool,
+    /// The typefaces asked for (text, code); see `set_fonts`.
+    fonts_set: (crate::theme::Font, crate::theme::Font),
+    /// What code falls back to when no font for it is bundled.
+    default_mono: String,
+    /// Text is in macOS's variable San Francisco, whose optical size the shaper leaves at
+    /// its 28 pt design: spacing is opened up to what AppKit draws (see `sf_tracking`).
+    optical: bool,
 }
 
 /// Default line height, as a multiple of the font size.
@@ -137,6 +198,8 @@ pub(crate) struct TextSpec<'a> {
     pub line_height: f32,
     /// Letter spacing in em.
     pub tracking: f32,
+    /// OpenType features (`tnum`, `ss01`…) with their values.
+    pub features: &'a [([u8; 4], u32)],
     /// Id of the node showing the text, 0 if none. When its text changes (streaming,
     /// typing), the previous shaping is reused for the paragraphs that stayed the same.
     pub owner: u64,
@@ -144,7 +207,7 @@ pub(crate) struct TextSpec<'a> {
 
 impl Default for TextSpec<'_> {
     fn default() -> Self {
-        TextSpec { spans: &[], text: "", size: 17.0, weight: 400, center: false, line_height: LINE_HEIGHT, tracking: 0.0, owner: 0 }
+        TextSpec { spans: &[], text: "", size: 17.0, weight: 400, center: false, line_height: LINE_HEIGHT, tracking: 0.0, features: &[], owner: 0 }
     }
 }
 
@@ -170,6 +233,15 @@ const SLOT_BITS: u64 = 3;
 
 fn split_key(key: u64) -> (u64, usize) {
     (key & !SLOT_BITS, (key & SLOT_BITS) as usize)
+}
+
+/// The text's features with a run's on top (a later setting of a tag wins in HarfBuzz).
+fn features(base: &[([u8; 4], u32)], run: &[([u8; 4], u32)]) -> FontFeatures {
+    let mut f = FontFeatures::new();
+    for (tag, v) in base.iter().chain(run) {
+        f.set(FeatureTag::new(tag), *v);
+    }
+    f
 }
 
 /// Lays `buffer` out as `v` describes. Shaping is kept: only wrapping is redone, and only
@@ -237,13 +309,14 @@ impl TextSystem {
         };
         #[cfg(target_arch = "wasm32")]
         let mut fonts = FontSystem::new_with_fonts([source]);
-        fonts.db_mut().set_sans_serif_family("Inter");
+        fonts.db_mut().set_sans_serif_family(BUNDLED_SANS);
         #[cfg(feature = "markdown")]
-        {
-            fonts.db_mut().load_font_source(fontdb::Source::Binary(std::sync::Arc::new(MONO)));
-            fonts.db_mut().set_monospace_family("JetBrains Mono");
+        fonts.db_mut().load_font_source(fontdb::Source::Binary(std::sync::Arc::new(MONO)));
+        if let Some(m) = BUNDLED_MONO {
+            fonts.db_mut().set_monospace_family(m);
         }
         TextSystem {
+            default_mono: fonts.db().family_name(&Family::Monospace).to_string(),
             fonts,
             entries: HashMap::new(),
             owners: HashMap::new(),
@@ -255,7 +328,50 @@ impl TextSystem {
             frame: 1,
             budget: CACHE_BUDGET,
             hint: true,
+            fonts_set: Default::default(),
+            optical: false,
         }
+    }
+
+    /// Uses these typefaces for text and code from now on; shaped text is dropped when they
+    /// change. A font that is not installed (or any system font on the web) leaves the
+    /// bundled one.
+    pub(crate) fn set_fonts(&mut self, text: &crate::theme::Font, mono: &crate::theme::Font) {
+        if (text, mono) == (&self.fonts_set.0, &self.fonts_set.1) {
+            return;
+        }
+        self.fonts_set = (text.clone(), mono.clone());
+        let sans = self.family(text, SYSTEM_SANS).unwrap_or(BUNDLED_SANS);
+        self.optical = SF_VARIABLE.contains(&sans);
+        let sans = sans.to_string();
+        self.fonts.db_mut().set_sans_serif_family(sans);
+        let mono = self.family(mono, SYSTEM_MONO).or(BUNDLED_MONO).unwrap_or(&self.default_mono).to_string();
+        self.fonts.db_mut().set_monospace_family(mono);
+        self.entries.clear();
+        self.owners.clear();
+        // Shaped runs are cached by text and attributes, which name the generic family only.
+        self.fonts.shape_run_cache = Default::default();
+        // Row heights were measured in the old font; keep them only as estimates.
+        for l in self.lists.values_mut() {
+            l.heights.iter_mut().for_each(|h| *h = f32::NAN);
+            l.width = 0.0;
+        }
+    }
+
+    /// The family `f` names, if it is installed; `None` for `Bundled`.
+    fn family<'a>(&self, f: &'a crate::theme::Font, system: &[&'a str]) -> Option<&'a str> {
+        use crate::theme::Font;
+        let has = |name: &str| self.fonts.db().faces().any(|face| face.families.iter().any(|(n, _)| n == name));
+        match f {
+            Font::Bundled => None,
+            Font::System => system.iter().copied().find(|n| has(n)),
+            Font::Named(n) => has(n).then_some(n.as_str()),
+        }
+    }
+
+    /// The family plain text is set in right now (after fallback).
+    pub fn font_family(&self) -> &str {
+        self.fonts.db().family_name(&Family::SansSerif)
     }
 
     /// Content and style, not width: one entry serves every width the text is shown at.
@@ -267,7 +383,9 @@ impl TextSystem {
             (s.bold, s.italic, s.mono, s.weight, s.size.map(f32::to_bits)).hash(&mut h);
             s.color.map(|c| [c.r.to_bits(), c.g.to_bits(), c.b.to_bits(), c.a.to_bits()]).hash(&mut h);
             (s.background.is_some(), s.icon.is_some(), s.link.is_some()).hash(&mut h);
+            s.features.hash(&mut h);
         }
+        spec.features.hash(&mut h);
         spec.size.to_bits().hash(&mut h);
         (spec.line_height.to_bits(), spec.tracking.to_bits()).hash(&mut h);
         spec.weight.hash(&mut h);
@@ -306,8 +424,14 @@ impl TextSystem {
 
         let flags = if self.hint { CacheKeyFlags::empty() } else { CacheKeyFlags::DISABLE_HINTING };
         let mut attrs = Attrs::new().family(Family::SansSerif).weight(Weight(spec.weight)).cache_key_flags(flags);
-        if spec.tracking != 0.0 {
-            attrs = attrs.letter_spacing(spec.tracking);
+        let optical = self.optical;
+        let track = |size: f32, weight: u16| spec.tracking + if optical { sf_tracking(size, weight) } else { 0.0 };
+        let base_track = track(spec.size, spec.weight);
+        if base_track != 0.0 {
+            attrs = attrs.letter_spacing(base_track);
+        }
+        if !spec.features.is_empty() {
+            attrs = attrs.font_features(features(spec.features, &[]));
         }
         let starts = if spec.spans.is_empty() {
             self.staging.set_text(spec.text, &attrs, Shaping::Advanced, None);
@@ -327,6 +451,13 @@ impl TextSystem {
                 }
                 if s.mono {
                     a = a.family(Family::Monospace);
+                }
+                if optical {
+                    let t = if s.mono { spec.tracking } else { track(s.size.unwrap_or(spec.size), a.weight.0) };
+                    a = a.letter_spacing(t);
+                }
+                if !s.features.is_empty() {
+                    a = a.font_features(features(spec.features, &s.features));
                 }
                 if let Some(c) = s.color {
                     let to8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;

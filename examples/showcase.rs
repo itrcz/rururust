@@ -2,7 +2,7 @@
 //! rearranges itself for phone, tablet and desktop window sizes (resize the window).
 //!
 //!   cargo run --release --example showcase
-//!   cargo run --release --example showcase -- --screenshot shot.png [tab] [frames] [width] [down] [--scale 1] [--light]
+//!   cargo run --release --example showcase -- --screenshot shot.png [tab] [frames] [width] [down] [--scale 1] [--light] [--system-font]
 
 use ruru::prelude::*;
 use ruru::SizeClass;
@@ -237,7 +237,7 @@ fn glass_lab(s: &Demo, t: &Theme) -> View<Demo> {
             .fill_width()
     };
     vstack((
-        text("Glass lab").font_size(22.0).weight(Weight::Bold).fill_width().padding_ltrb(4.0, 0.0, 0.0, 0.0),
+        text("Glass lab").style(t.text.title).fill_width().padding_ltrb(4.0, 0.0, 0.0, 0.0),
         stage,
         card(s, (
             hstack((mode("Dark", true), mode("Light", false))).spacing(10.0).fill_width().padding_xy(16.0, 12.0),
@@ -261,7 +261,7 @@ fn home(s: &Demo, env: &Env) -> View<Demo> {
     vstack((
         vstack((
             text("Good evening").font_size(15.0).color(t.color.text.alpha(0.6)),
-            text("Liquid Glass").font_size(34.0).weight(Weight::Bold),
+            text("Liquid Glass").style(t.text.large_title),
         ))
         .spacing(2.0)
         .align(Align::Start)
@@ -269,7 +269,7 @@ fn home(s: &Demo, env: &Env) -> View<Demo> {
         .padding_ltrb(4.0, 0.0, 0.0, 4.0),
         card(s, (
             text("TAPS").font_size(12.0).weight(Weight::Semibold).color(t.color.text.alpha(0.55)),
-            text(s.count.to_string()).font_size(72.0).weight(Weight::Heavy),
+            text(s.count.to_string()).font_size(72.0).weight(Weight::Heavy).letter_spacing(ruru::inter_tracking(72.0)).tabular(),
             hstack((
                 button("−", |s: &mut Demo| s.count -= 1).background(t.color.text.alpha(0.16)).color(t.color.text),
                 button("Tap me", |s: &mut Demo| s.count += 1).padding_xy(34.0, 13.0),
@@ -415,7 +415,7 @@ fn send(s: &mut Demo) {
 fn gallery(s: &Demo) -> View<Demo> {
     let tile = |i: usize| image(&s.photos[i % s.photos.len()]).fill_width().height(150.0).radius(26.0);
     vstack((
-        text("Gallery").font_size(34.0).weight(Weight::Bold).fill_width(),
+        text("Gallery").style(Theme::default().text.large_title).fill_width(),
         image(&s.photos[0]).fill_width().radius(30.0),
         vstack((0..3).map(|r| hstack((tile(r * 2 + 1), tile(r * 2 + 2))).spacing(12.0).fill_width()).collect::<Vec<_>>())
             .spacing(12.0)
@@ -438,7 +438,7 @@ fn forms(s: &Demo, t: &Theme) -> View<Demo> {
         format!("Hello, {} from {}!", s.name.trim(), CITIES[s.city])
     };
     vstack((
-        text("Forms").font_size(34.0).weight(Weight::Bold).fill_width(),
+        text("Forms").style(t.text.large_title).fill_width(),
         card(s, (
             text(hello).font_size(20.0).weight(Weight::Semibold).centered(),
             field(t, "NAME", text_field(s.name.as_str(), "Your name", |s: &mut Demo, v| s.name = v)),
@@ -633,13 +633,14 @@ fn main() {
             state.tab = num(2, 0) as usize;
             let (frames, width) = (num(3, 1), num(4, 420));
             // Optional: points to scroll down before the shot; `--light` for the light theme;
-            // `--scale 1` for a 1x frame (default 2).
+            // `--scale 1` for a 1x frame (default 2); `--system-font` for the platform's font.
             let down = num(5, 0) as f32;
             let scale = args.iter().position(|a| a == "--scale").and_then(|k| args.get(k + 1)).and_then(|t| t.parse().ok()).unwrap_or(2.0);
             state.light = args.iter().any(|a| a == "--light");
             state.lab_dark = !state.light;
+            let system = args.iter().any(|a| a == "--system-font");
             let mut ui = ruru::Ui::new(state, view);
-            ui.theme_with(theme_of);
+            ui.theme_with(move |s| if system { theme_of(s).font(Font::System) } else { theme_of(s) });
             ui.show_fps = true;
             let wait = |ui: &mut ruru::Ui<Demo>, n: u32| {
                 if n == 1 && down > 0.0 {

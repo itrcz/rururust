@@ -163,6 +163,7 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
                 center: t.center,
                 line_height: t.line_height,
                 tracking: t.tracking,
+                features: &t.features,
                 owner: id,
             };
             if t.lines > 0 {

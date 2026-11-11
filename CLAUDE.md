@@ -28,7 +28,7 @@ cargo check --no-default-features --features "<набор>" --lib  # прове�
 | `src/render.rs` | wgpu: батчи, снимок сцены и пирамида размытия для стекла, текстуры картинок, текст через glyphon |
 | `src/shaders/quad.wgsl` | все фигуры одним инстансным шейдером; `blur.wgsl` — пирамида |
 | `src/theme.rs` | `Theme`: палитра, шкала текста, метрики контролов, тени, пружины; `theme::apply` дописывает их в дерево после `view()` |
-| `src/text.rs` | шейпинг и кэш (cosmic-text); кэш высот строк `list`; геометрия текста: `hit`, `caret`, `range_rects`, `word_at`, `para_at` |
+| `src/text.rs` | шейпинг и кэш (cosmic-text); кэш высот строк `list`; выбор шрифта (`Font`: системный, фолбэк на Inter), OpenType-фичи; геометрия текста: `hit`, `caret`, `range_rects`, `word_at`, `para_at` |
 | `src/edit.rs` | редактор `text_field` (подмодуль `ui`: видит его поля): каретка, выделение, undo, буфер, IME, multiline |
 | `src/popup.rs` | слои поверх дерева (подмодуль `ui`): поповеры, меню с подменю и клавиатурой, контекстное меню, тултипы; `Placement`, `MenuStyle`, шорткаты |
 | `src/task.rs` | канал «фон → состояние»: `Link`, `Task`, `spawn`, `sleep`, `Ui::pump` |

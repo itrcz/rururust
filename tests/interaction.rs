@@ -2762,3 +2762,76 @@ fn scroll_with_max_height_hugs_short_content_and_limits_long() {
     let q = quads(&ui, Color::RED)[0];
     assert_eq!((q[2], q[3]), (120.0, 150.0));
 }
+
+#[test]
+fn text_field_line_height_and_letter_spacing_are_settable() {
+    let mut ui = Ui::new((), |_: &()| {
+        let f = |k: Option<f32>| {
+            let t = text_field("one\ntwo\nthree", "", |_: &mut (), _| {}).multiline().max_lines(5).font_size(14.0).plain();
+            match k {
+                Some(k) => t.line_height(k).letter_spacing(0.05),
+                None => t,
+            }
+        };
+        // Fits one row at 280 pt unless spaced out.
+        let one = |em: f32, c: Color| {
+            zstack(text_field("the quick brown fox jumps over a dog", "", |_: &mut (), _| {}).multiline().max_lines(3).font_size(14.0).plain().letter_spacing(em))
+                .width(280.0)
+                .background(c)
+        };
+        vstack((zstack(f(None)).background(Color::RED), zstack(f(Some(1.625))).background(Color::GREEN), one(0.0, Color::BLUE), one(0.2, Color::GRAY)))
+            .width(300.0)
+            .place(Align::Start, Align::Start)
+    });
+    ui.frame((400.0, 400.0));
+    assert_eq!(quads(&ui, Color::RED)[0][3], 3.0 * (14.0f32 * 1.3).round());
+    assert_eq!(quads(&ui, Color::GREEN)[0][3], 3.0 * (14.0f32 * 1.625).round());
+    assert_eq!(quads(&ui, Color::BLUE)[0][3], 18.0);
+    assert_eq!(quads(&ui, Color::GRAY)[0][3], 36.0, "spaced out, it wraps");
+}
+
+#[test]
+fn tabular_digits_keep_their_width() {
+    let mut ui = Ui::new((), |_: &()| {
+        vstack((
+            text("111"),
+            text("888"),
+            text("111").tabular(),
+            text("888").tabular(),
+            rich_text(vec![Span::new("t "), Span::new("111").tabular()]),
+            rich_text(vec![Span::new("t "), Span::new("888").tabular()]),
+        ))
+        .align(Align::Start)
+        .place(Align::Start, Align::Start)
+    });
+    ui.frame((400.0, 400.0));
+    let w: Vec<f32> = texts(&ui).iter().map(|t| t.size.0).collect();
+    assert!(w[1] - w[0] > 2.0, "proportional ones are narrow: {w:?}");
+    assert_eq!(w[2], w[3], "tabular");
+    assert_eq!(w[4], w[5], "tabular run");
+}
+
+#[test]
+fn theme_picks_the_font_and_falls_back_to_inter() {
+    let mut ui = Ui::new((), |_: &()| zstack(text("Hamburgefonstiv")).place(Align::Start, Align::Start));
+    ui.frame((400.0, 400.0));
+    let inter = texts(&ui)[0].size.0;
+    assert_eq!(ui.text.font_family(), "Inter");
+    ui.set_theme(Theme::dark().font(Font::Named("No Such Font 42".into())));
+    ui.frame((400.0, 400.0));
+    assert_eq!(ui.text.font_family(), "Inter", "a missing font leaves Inter");
+    assert_eq!(texts(&ui)[0].size.0, inter);
+    assert_eq!(ui.theme().text.title.tracking, 0.0, "Inter's title tracking is dropped with another font");
+    assert!(Theme::dark().text.title.tracking < -0.01);
+    ui.set_theme(Theme::dark().font(Font::System));
+    ui.frame((400.0, 400.0));
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(ui.text.font_family(), "System Font");
+        assert!((texts(&ui)[0].size.0 - inter).abs() > 3.0, "re-shaped in SF: {} vs {inter}", texts(&ui)[0].size.0);
+    }
+    ui.set_theme(Theme::dark());
+    ui.frame((400.0, 400.0));
+    assert_eq!(ui.text.font_family(), "Inter");
+    assert_eq!(texts(&ui)[0].size.0, inter);
+}
