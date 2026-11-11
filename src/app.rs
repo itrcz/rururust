@@ -709,7 +709,21 @@ impl<S: 'static> Runner<S> {
 
         let frame = match gfx.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return,
+            // Nothing reaches the screen this time, so the next frame must not be skipped as
+            // "unchanged". Occluded: wgpu (Metal) refuses to acquire while AppKit says the window
+            // is not visible — which is also the case for the very first redraw of a window not
+            // yet on screen; `Occluded(false)` brings the frame back (see `window_event`).
+            // Timeout: retry a frame later rather than spinning.
+            wgpu::CurrentSurfaceTexture::Occluded => {
+                gfx.renderer.invalidate();
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Timeout => {
+                gfx.renderer.invalidate();
+                let next = web_time::Instant::now() + std::time::Duration::from_millis(16);
+                self.wake_at = Some(self.wake_at.map_or(next, |w| w.min(next)));
+                return;
+            }
             _ => {
                 gfx.surface.configure(&gfx.renderer.device, &gfx.config);
                 gfx.renderer.invalidate();
@@ -733,6 +747,9 @@ impl<S: 'static> Runner<S> {
             gfx.config.usage |= wgpu::TextureUsages::COPY_SRC;
             gfx.surface.configure(&gfx.renderer.device, &gfx.config);
             gfx.renderer.invalidate();
+            // The frame just presented went to the old configuration; draw once more into the
+            // new one rather than trust it stayed on screen.
+            window.request_redraw();
         }
         self.wake_at = ui.wake_in.map(|s| web_time::Instant::now() + std::time::Duration::from_secs_f32(s));
         if ui.animating {
@@ -887,6 +904,20 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
                 self.place_buttons(&w);
             }
         }
+        // Anything that may have left the window's pixels stale (first show, resize, scale,
+        // occlusion, appearance) makes the next frame unconditional: `unchanged` compares draw
+        // lists, not what is on screen.
+        if matches!(
+            event,
+            WindowEvent::Resized(_)
+                | WindowEvent::ScaleFactorChanged { .. }
+                | WindowEvent::Occluded(_)
+                | WindowEvent::ThemeChanged(_)
+        ) {
+            if let Some(gfx) = self.gfx.borrow_mut().as_mut() {
+                gfx.renderer.invalidate();
+            }
+        }
         let scale = self.scale();
         let ui = &mut self.app.ui;
         let dirty = match event {
@@ -902,7 +933,7 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
                 self.redraw();
                 false
             }
-            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => true,
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } | WindowEvent::Occluded(false) => true,
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x as f32 / scale, position.y as f32 / scale);
                 ui.pointer_move(self.cursor)
