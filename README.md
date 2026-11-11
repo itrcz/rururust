@@ -59,7 +59,7 @@ cargo install wasm-bindgen-cli --version 0.2.130 --locked   # версия ка�
 | Наведение и курсор | `.hover(цвет)` — подсветка поверх фона, проявляется ~0.1 с; `.cursor(Cursor::Pointer / Text / ResizeH / …)`; `.hover_color(цвет)` — цвет текста и иконок-шаблонов узла под мышью (глиф кнопки белеет), с тем же затуханием; по умолчанию «рука» у нажимаемого и у ссылок, I-beam у поля и у выделяемого текста; `ui.cursor` |
 | Текст | `text`, `rich_text(Vec<Span>)`; `.lines(n)` — не больше n строк с «…», `.truncate(Truncate::Fade)` — затухание к краю (одна строка, если `.lines` не задан); `.line_height(1.6)` — межстрочный в долях кегля (по умолчанию 1.3); `.letter_spacing(0.01)` — разрядка в em |
 | Фрагменты (`Span`) | `.bold()` `.italic()` `.code()` `.color(c)`, `.link(url)`, `.weight(Weight::Semibold)`, `.size(pt)` (строка подрастает), `.background(c)` — скруглённая плашка под фрагментом с полями по бокам, режется по строкам при переносе и не меняет высоту строки; `Span::icon(&img)` — значок в строке размером 1 em, красится цветом фрагмента |
-| Markdown | `markdown(src)` / `markdown_with(src, images)`; `markdown_styled(src, &MarkdownStyle { size: 14.0, line_height: 1.625, strong: Weight::Semibold, code_background: Some(c), ..Default::default() })` — кегль, межстрочный, отступ между блоками, цвет и иконки ссылок (`link_icons`: по префиксу URL), заголовки, inline-код, `code_block`, `table` (`TableStyle`: кегль, поля ячеек, линии между строками, вес шапки, `columns` — доли ширины), `quote`; `Default` = вид `markdown()`; таблицы — колонками |
+| Markdown | `markdown(src)` / `markdown_with(src, images)`; `markdown_styled(src, &MarkdownStyle { size: 14.0, line_height: 1.625, strong: Weight::Semibold, code_background: Some(c), ..MarkdownStyle::from(&*env.theme) })` — кегль, межстрочный, отступ между блоками, цвет и иконки ссылок (`link_icons`: по префиксу URL), заголовки, inline-код, `code_block`, `table` (`TableStyle`: кегль, поля ячеек, линии между строками, вес шапки, `columns` — доли ширины), `quote`; `Default` = вид `markdown()` в тёмной теме; таблицы — колонками |
 | Картинки и иконки | `image(&Image)`, `icon(&Image)` — глиф, красится цветом текста; `Image::decode` (PNG/JPEG), `Image::from_svg` |
 | Контролы | `button` `toggle` `slider` `text_field` `picker` `tab_bar`; `slider(v, f).steps(5)` — прилипает к 5 делениям и рисует точки; `.slider_style(SliderStyle { track_height, track, track_border, fill, knob, knob_size, knob_shadow, tick_size, tick_on, tick_off })` |
 | Поповер | `.popover(open, Placement::top().start(), \|s\| s.open = false, content)` на якоре — слой поверх всего у якоря; переворачивается на другую сторону и сдвигается, чтобы не вылезать за окно; клик мимо только закрывает (не доходит до того, что под ним), Escape тоже; появляется за ~120 мс. `Placement::top/bottom/left/right()` + `.start/center/end()` + `.gap(pt)` + `.margin(pt)` (поле от края окна, 8) + `.offset(dx, dy)` |
@@ -98,6 +98,40 @@ s.reply = Some(spawn(|link: Link<App>| async move {
 
 Кто встраивает `Ui` без `app`, сам вызывает `set_waker` (на UI-потоке, чтобы `send` будил цикл), а на wasm
 ещё и `set_spawner`.
+
+## Тема
+
+Цвета и размеры встроенных виджетов — в одной структуре `Theme` с публичными полями
+(`src/theme.rs`): `color` (bg, surface, raised, popover, text, text_muted, border, divider, accent,
+on_accent, fill, fill_strong, hover, pressed, selection, focus, scrim, link, danger, success, warning),
+`text` (large_title, title, headline, body, subhead, footnote, caption, caption2 — `TextStyle { size,
+line_height, weight, tracking }`), `control` (отступы, радиусы, высоты, кольцо фокуса, скроллбар, тултип),
+`shadow`, `motion` (пружины, задержка тултипа), `space`, `radius`, стекло таб-бара и пикера, `menu` /
+`slider` (`None` — выводятся из палитры).
+
+```rust
+App::new(state, view).theme(Theme::light().accent(Color::hex(0x4D81EF)));      // одна тема
+App::new(state, view).theme_with(|s: &State| if s.dark { Theme::dark() } else { Theme::light() }); // от состояния
+App::new(state, view).theme_auto(Theme::light(), Theme::dark());               // за системой
+ui.set_theme(Theme::light());                                                  // без окна
+
+fn view(s: &State, env: &Env) -> View<State> {
+    let t = &env.theme;
+    vstack((
+        text("Settings").style(t.text.title),                      // кегль, межстрочный, вес, разрядка разом
+        text("Synced").style(t.text.footnote).color(t.color.text_muted),
+        button("Save", save),                                       // accent, on_accent, отступы и радиус — из темы
+        button("Delete", del).background(t.color.danger),           // модификатор на узле всегда побеждает тему
+    ))
+}
+```
+
+`Theme::dark()` — тема по умолчанию, совпадает с прежним видом (системные цвета iOS, контролы «под
+палец»). `.accent(c)` красит кнопки, слайдеры, тумблеры, кольцо фокуса, каретку и выделение. Фон окна —
+`theme.color.bg`, если не задан `App::background`. Свой стиль меню или слайдера от темы:
+`MenuStyle { row_height: 24.0, ..MenuStyle::from(&*env.theme) }`, так же `SliderStyle::from`,
+`MarkdownStyle::from`. Одна тема на окно: поддерево перекрашивают модификаторы. Решение —
+`docs/decisions/005-theme.md`.
 
 ## Брать только часть
 

@@ -2521,3 +2521,131 @@ fn two_shadows_and_an_inset_rim() {
     assert_eq!(q.len(), 2);
     assert_eq!((q[0].p0[3], q[0].c1), (1.0, [0.0, 3.0, 0.0, 0.0]));
 }
+
+// ---- theme (docs/decisions/005-theme.md)
+
+fn near(a: [f32; 4], c: Color) -> bool {
+    (a[0] - c.r).abs() < 0.002 && (a[1] - c.g).abs() < 0.002 && (a[2] - c.b).abs() < 0.002 && (a[3] - c.a).abs() < 0.002
+}
+
+/// Fills (`c0`) and borders of the frame's quads.
+fn fills(ui: &Ui<impl Sized>) -> Vec<([f32; 4], [f32; 4], [f32; 4])> {
+    ui.list.cmds.iter().filter_map(|c| if let ruru::Cmd::Quad(q) = c { Some((q.rect, q.c0, q.border)) } else { None }).collect()
+}
+
+/// Frames until the springs rest (a focus ring fading in).
+fn rest(ui: &mut Ui<impl Sized + 'static>, size: (f32, f32)) {
+    for _ in 0..200 {
+        ui.frame(size);
+        if !ui.animating {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+const PINK_ACCENT: Color = Color::hex(0xE0338A);
+
+struct Themed {
+    on: bool,
+    v: f32,
+    draft: String,
+    dark: bool,
+}
+
+fn themed_view(s: &Themed) -> View<Themed> {
+    vstack((
+        button("Go", |_: &mut Themed| {}),
+        toggle(s.on, |s: &mut Themed, on| s.on = on),
+        slider(s.v, |s: &mut Themed, v| s.v = v).width(200.0),
+        text_field(s.draft.as_str(), "Name", |s: &mut Themed, v| s.draft = v).width(300.0),
+    ))
+    .spacing(10.0)
+    .align(Align::Start)
+    .place(Align::Start, Align::Start)
+}
+
+fn themed() -> Ui<Themed> {
+    Ui::new(Themed { on: true, v: 0.5, draft: "hello".into(), dark: true }, |s: &Themed| zstack(themed_view(s)).fill())
+}
+
+#[test]
+fn accent_reaches_button_toggle_slider_focus_caret_and_selection() {
+    let mut ui = themed();
+    ui.set_theme(Theme::dark().accent(PINK_ACCENT));
+    ui.frame((400.0, 400.0));
+    let q = fills(&ui);
+    let accent: Vec<_> = q.iter().filter(|(_, c, _)| near(*c, PINK_ACCENT)).map(|(r, ..)| *r).collect();
+    // Button background (top-left, first), toggle track (on) and the filled part of the slider.
+    assert!(accent.len() >= 3, "button, toggle and slider take the accent: {accent:?}");
+    assert!(accent.iter().any(|r| r[1] < 1.0 && r[3] > 40.0), "the button at the top");
+    assert!(accent.iter().any(|r| (r[2] - 51.0).abs() < 0.5 && (r[3] - 31.0).abs() < 0.5), "the toggle track");
+    // Focus the field: ring, caret and (after select-all) the selection follow the accent.
+    let field = q.iter().filter(|(r, ..)| (r[2] - 300.0).abs() < 0.5).map(|(r, ..)| *r).last().unwrap();
+    ui.pointer_down((field[0] + 50.0, field[1] + field[3] * 0.5), false);
+    ui.pointer_up((field[0] + 50.0, field[1] + field[3] * 0.5));
+    rest(&mut ui, (400.0, 400.0));
+    let q = fills(&ui);
+    assert!(q.iter().any(|(_, _, b)| near(*b, PINK_ACCENT.alpha(0.55))), "focus ring in the accent");
+    assert!(q.iter().any(|(r, c, _)| near(*c, PINK_ACCENT) && (r[2] - 2.0).abs() < 0.01), "caret in the accent");
+    ui.key(KeyInput::SelectAll);
+    ui.frame((400.0, 400.0));
+    assert!(fills(&ui).iter().any(|(_, c, _)| near(*c, PINK_ACCENT.alpha(0.3))), "selection in the accent");
+}
+
+#[test]
+fn modifiers_on_a_view_beat_the_theme() {
+    let mut t = Theme::dark().accent(PINK_ACCENT);
+    t.text.body.size = 30.0;
+    let mut ui = Ui::new((), |_: &()| {
+        vstack((
+            button("A", |_: &mut ()| {}).background(Color::RED).radius(3.0),
+            button("B", |_: &mut ()| {}).padding_h(0.0),
+            text("big"),
+            text("small").font_size(10.0),
+        ))
+        .align(Align::Start)
+        .place(Align::Start, Align::Start)
+    });
+    ui.set_theme(t.clone());
+    ui.frame((400.0, 400.0));
+    let q = fills(&ui);
+    let a = q.iter().find(|(_, c, _)| near(*c, Color::RED)).expect("explicit background");
+    assert_eq!(ui.list.cmds.iter().find_map(|c| if let ruru::Cmd::Quad(q) = c { Some(q.p0[0]) } else { None }), Some(3.0));
+    let b = q.iter().find(|(_, c, _)| near(*c, PINK_ACCENT)).expect("B keeps the theme's background").0;
+    // `.padding_h()` keeps the theme's vertical padding; the label is the headline style.
+    assert!(b[3] > 2.0 * t.control.button_padding.1 + 17.0 && b[2] < a.0[2], "B: {b:?}, A: {:?}", a.0);
+    let tx = texts(&ui);
+    let (big, small) = (tx[2].size.1, tx[3].size.1);
+    assert!(big > 35.0 && small < 15.0, "body size from the theme, explicit size wins: {big} {small}");
+}
+
+#[test]
+fn switching_the_theme_repaints_the_same_ui() {
+    let mut ui = themed();
+    ui.theme_with(|s: &Themed| if s.dark { Theme::dark() } else { Theme::light() });
+    ui.frame((400.0, 400.0));
+    assert_eq!(ui.clear_color(), Color::BLACK);
+    assert!(fills(&ui).iter().any(|(_, c, _)| near(*c, Theme::dark().color.accent)));
+    assert_eq!(texts(&ui)[0].color, Color::WHITE, "label on the accent");
+    ui.state.dark = false;
+    ui.frame((400.0, 400.0));
+    let light = Theme::light();
+    assert_eq!(ui.clear_color(), Color::WHITE);
+    assert!(fills(&ui).iter().any(|(_, c, _)| near(*c, light.color.accent)), "button in the light accent");
+    assert!(fills(&ui).iter().any(|(_, c, _)| near(*c, light.color.fill)), "field in the light fill");
+    assert_eq!(texts(&ui).last().unwrap().color, Color::BLACK, "field text in the light text color");
+    // An explicit background wins over the theme's.
+    ui.background = Some(Color::hex(0x123456));
+    assert_eq!(ui.clear_color(), Color::hex(0x123456));
+}
+
+#[test]
+fn view_reads_the_theme_from_env() {
+    let mut ui = Ui::new((), |_: &(), env: &Env| text("x").style(env.theme.text.title).color(env.theme.color.danger));
+    ui.set_theme(Theme::light());
+    ui.frame((200.0, 200.0));
+    let t = texts(&ui);
+    assert_eq!(t[0].color, Theme::light().color.danger);
+    assert!(t[0].size.1 > 25.0, "title size: {}", t[0].size.1);
+}

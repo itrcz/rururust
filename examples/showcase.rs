@@ -2,7 +2,7 @@
 //! rearranges itself for phone, tablet and desktop window sizes (resize the window).
 //!
 //!   cargo run --release --example showcase
-//!   cargo run --release --example showcase -- --screenshot shot.png [tab] [frames] [width] [down] [--scale 1]
+//!   cargo run --release --example showcase -- --screenshot shot.png [tab] [frames] [width] [down] [--scale 1] [--light]
 
 use ruru::prelude::*;
 use ruru::SizeClass;
@@ -34,6 +34,8 @@ struct Demo {
     drift: f32,
     /// Glass effect strength slider, 0..=1 (0.5 = the stock material).
     glass: f32,
+    /// Light appearance (the theme follows it, see `theme_of`).
+    light: bool,
     /// Glass lab: dark or light preset, and its three knobs.
     lab_dark: bool,
     lab_blur: f32,
@@ -126,37 +128,52 @@ fn blob(color: Color, d: f32, x: f32, y: f32) -> View<Demo> {
         .place(Align::Start, Align::Start)
 }
 
-fn backdrop(s: &Demo) -> View<Demo> {
-    let t = s.drift;
+fn backdrop(s: &Demo, t: &Theme) -> View<Demo> {
+    let d = s.drift;
     zstack((
-        blob(Color::PINK, 280.0, -80.0 + 220.0 * t, 40.0),
-        blob(Color::BLUE, 320.0, 200.0 - 240.0 * t, 260.0),
-        blob(Color::ORANGE, 200.0, 40.0 + 160.0 * t, 520.0),
-        blob(Color::PURPLE, 180.0, 260.0 - 60.0 * t, -40.0),
+        blob(Color::PINK, 280.0, -80.0 + 220.0 * d, 40.0),
+        blob(Color::BLUE, 320.0, 200.0 - 240.0 * d, 260.0),
+        blob(Color::ORANGE, 200.0, 40.0 + 160.0 * d, 520.0),
+        blob(Color::PURPLE, 180.0, 260.0 - 60.0 * d, -40.0),
     ))
     .fill()
-    .gradient(Color::hex(0x1A1040), Color::hex(0x05060F), 180.0)
+    .gradient(
+        if t.dark { Color::hex(0x1A1040) } else { Color::hex(0xE4E0FF) },
+        if t.dark { Color::hex(0x05060F) } else { Color::hex(0xF8F8FC) },
+        180.0,
+    )
+}
+
+/// The app's theme: the light switch on the Forms page flips it, and every view follows.
+fn theme_of(s: &Demo) -> Theme {
+    if s.light {
+        Theme::light()
+    } else {
+        Theme::dark()
+    }
 }
 
 fn glass(s: &Demo) -> Glass {
-    Glass::regular().strength(s.glass * 2.0)
+    let base = if s.light { Glass::light() } else { Glass::regular() };
+    base.strength(s.glass * 2.0)
 }
 
 fn card(s: &Demo, children: impl ruru::Children<Demo>) -> View<Demo> {
-    vstack(children).fill_width().glass_with(glass(s)).radius(28.0).shadow(Color::BLACK.alpha(0.30), 40.0, 14.0)
+    let shadow = Color::BLACK.alpha(if s.light { 0.12 } else { 0.30 });
+    vstack(children).fill_width().glass_with(glass(s)).radius(28.0).shadow(shadow, 40.0, 14.0)
 }
 
 fn row(glyph: &Image, tint: Color, title: &str, trailing: View<Demo>) -> View<Demo> {
-    let badge = zstack(icon(glyph).size(18.0, 18.0)).size(30.0, 30.0).radius(8.0).background(tint);
+    let badge = zstack(icon(glyph).size(18.0, 18.0)).size(30.0, 30.0).radius(8.0).background(tint).color(Color::WHITE);
     hstack((badge, text(title), spacer(), trailing)).spacing(12.0).fill_width().padding_xy(16.0, 11.0)
 }
 
-fn divider() -> View<Demo> {
-    rect().fill_width().height(0.5).background(Color::WHITE.alpha(0.16))
+fn divider(t: &Theme) -> View<Demo> {
+    rect().fill_width().height(0.5).background(t.color.text.alpha(0.16))
 }
 
-fn slider_row(title: &str, value: String, control: View<Demo>) -> View<Demo> {
-    vstack((hstack((text(title), spacer(), text(value).color(Color::WHITE.alpha(0.6)))).fill_width(), control))
+fn slider_row(t: &Theme, title: &str, value: String, control: View<Demo>) -> View<Demo> {
+    vstack((hstack((text(title), spacer(), text(value).color(t.color.text.alpha(0.6)))).fill_width(), control))
         .spacing(8.0)
         .fill_width()
         .padding_xy(16.0, 12.0)
@@ -167,22 +184,22 @@ fn drop_button(s: &Demo, glyph: &Image, f: impl Fn(&mut Demo) + 'static) -> View
     zstack(icon(glyph)).size(52.0, 52.0).radius(26.0).glass_with(glass(s)).on_tap(f)
 }
 
-fn settings(s: &Demo) -> View<Demo> {
+fn settings(s: &Demo, t: &Theme) -> View<Demo> {
     card(s, (
         row(&s.icons.bolt, Color::BLUE, "Wi-Fi", toggle(s.wifi, |s: &mut Demo, on| s.wifi = on)),
-        divider(),
+        divider(t),
         row(&s.icons.bell, Color::INDIGO, "Focus", toggle(s.focus, |s: &mut Demo, on| s.focus = on)),
-        divider(),
-        slider_row("Drift", format!("{:.0}%", s.drift * 100.0), slider(s.drift, |s: &mut Demo, v| s.drift = v)),
-        divider(),
-        slider_row("Glass strength", format!("{:.0}%", s.glass * 200.0), slider(s.glass, |s: &mut Demo, v| s.glass = v)),
+        divider(t),
+        slider_row(t, "Drift", format!("{:.0}%", s.drift * 100.0), slider(s.drift, |s: &mut Demo, v| s.drift = v)),
+        divider(t),
+        slider_row(t, "Glass strength", format!("{:.0}%", s.glass * 200.0), slider(s.glass, |s: &mut Demo, v| s.glass = v)),
     ))
     .padding_xy(0.0, 4.0)
 }
 
 /// Glass lab: a dark or light pane and a narrow pill over stripes and text, with the
 /// three knobs of `Glass` on sliders.
-fn glass_lab(s: &Demo) -> View<Demo> {
+fn glass_lab(s: &Demo, t: &Theme) -> View<Demo> {
     let preset = if s.lab_dark { Glass::dark() } else { Glass::light() };
     let m = preset.blur(s.lab_blur).distortion(s.lab_distortion).opacity(s.lab_opacity);
     let ink = if s.lab_dark { Color::WHITE } else { Color::BLACK };
@@ -214,19 +231,22 @@ fn glass_lab(s: &Demo) -> View<Demo> {
     .clip();
     let mode = |label: &str, dark: bool| {
         let on = s.lab_dark == dark;
-        button(label, move |s: &mut Demo| s.lab_dark = dark).background(Color::WHITE.alpha(if on { 0.28 } else { 0.08 })).fill_width()
+        button(label, move |s: &mut Demo| s.lab_dark = dark)
+            .background(t.color.text.alpha(if on { 0.28 } else { 0.08 }))
+            .color(t.color.text)
+            .fill_width()
     };
     vstack((
         text("Glass lab").font_size(22.0).weight(Weight::Bold).fill_width().padding_ltrb(4.0, 0.0, 0.0, 0.0),
         stage,
         card(s, (
             hstack((mode("Dark", true), mode("Light", false))).spacing(10.0).fill_width().padding_xy(16.0, 12.0),
-            divider(),
-            slider_row("Blur", format!("{:.0}%", s.lab_blur * 100.0), slider(s.lab_blur, |s: &mut Demo, v| s.lab_blur = v)),
-            divider(),
-            slider_row("Distortion", format!("{:.0}%", s.lab_distortion * 100.0), slider(s.lab_distortion, |s: &mut Demo, v| s.lab_distortion = v)),
-            divider(),
-            slider_row("Opacity", format!("{:.0}%", s.lab_opacity * 100.0), slider(s.lab_opacity, |s: &mut Demo, v| s.lab_opacity = v)),
+            divider(t),
+            slider_row(t, "Blur", format!("{:.0}%", s.lab_blur * 100.0), slider(s.lab_blur, |s: &mut Demo, v| s.lab_blur = v)),
+            divider(t),
+            slider_row(t, "Distortion", format!("{:.0}%", s.lab_distortion * 100.0), slider(s.lab_distortion, |s: &mut Demo, v| s.lab_distortion = v)),
+            divider(t),
+            slider_row(t, "Opacity", format!("{:.0}%", s.lab_opacity * 100.0), slider(s.lab_opacity, |s: &mut Demo, v| s.lab_opacity = v)),
         )),
     ))
     .spacing(12.0)
@@ -237,9 +257,10 @@ fn glass_lab(s: &Demo) -> View<Demo> {
 
 fn home(s: &Demo, env: &Env) -> View<Demo> {
     let i = &s.icons;
+    let t = &*env.theme;
     vstack((
         vstack((
-            text("Good evening").font_size(15.0).color(Color::WHITE.alpha(0.6)),
+            text("Good evening").font_size(15.0).color(t.color.text.alpha(0.6)),
             text("Liquid Glass").font_size(34.0).weight(Weight::Bold),
         ))
         .spacing(2.0)
@@ -247,12 +268,12 @@ fn home(s: &Demo, env: &Env) -> View<Demo> {
         .fill_width()
         .padding_ltrb(4.0, 0.0, 0.0, 4.0),
         card(s, (
-            text("TAPS").font_size(12.0).weight(Weight::Semibold).color(Color::WHITE.alpha(0.55)),
+            text("TAPS").font_size(12.0).weight(Weight::Semibold).color(t.color.text.alpha(0.55)),
             text(s.count.to_string()).font_size(72.0).weight(Weight::Heavy),
             hstack((
-                button("−", |s: &mut Demo| s.count -= 1).background(Color::WHITE.alpha(0.16)),
+                button("−", |s: &mut Demo| s.count -= 1).background(t.color.text.alpha(0.16)).color(t.color.text),
                 button("Tap me", |s: &mut Demo| s.count += 1).padding_xy(34.0, 13.0),
-                button("+", |s: &mut Demo| s.count += 10).background(Color::WHITE.alpha(0.16)),
+                button("+", |s: &mut Demo| s.count += 10).background(t.color.text.alpha(0.16)).color(t.color.text),
             ))
             .spacing(10.0),
         ))
@@ -268,9 +289,9 @@ fn home(s: &Demo, env: &Env) -> View<Demo> {
         ))
         .spacing(7.0)
         .fill_width(),
-        glass_lab(s),
+        glass_lab(s, t),
         // On a desktop the settings live in the right-hand panel instead.
-        if env.class() == SizeClass::Desktop { rect() } else { settings(s) },
+        if env.class() == SizeClass::Desktop { rect() } else { settings(s, t) },
         vstack(
             PALETTE
                 .iter()
@@ -298,27 +319,34 @@ fn home(s: &Demo, env: &Env) -> View<Demo> {
     .spacing(18.0)
 }
 
-fn bubble(material: Glass, m: &Msg, photos: &[Image]) -> View<Demo> {
+fn bubble(material: Glass, style: &Bubbles, m: &Msg, photos: &[Image]) -> View<Demo> {
     if m.me {
-        let body = text(m.text.as_str()).padding_xy(14.0, 10.0).background(Color::BLUE).radius(18.0);
+        let body = text(m.text.as_str()).padding_xy(14.0, 10.0).background(style.mine).color(style.on_mine).radius(18.0);
         hstack((spacer(), body)).fill_width().padding_ltrb(60.0, 5.0, 0.0, 5.0)
     } else {
-        let md = markdown_with(&m.text, |url| {
+        let md = ruru::markdown_styled_with(&m.text, &style.markdown, |url| {
             url.strip_prefix("photo:").and_then(|n| n.parse::<usize>().ok()).and_then(|n| photos.get(n).cloned())
         });
         vstack(vstack(md).fill_width().padding(16.0).glass_with(material).radius(22.0)).fill_width().padding_xy(0.0, 5.0)
     }
 }
 
-fn chat(s: &Demo) -> View<Demo> {
+/// What a chat row needs from the theme; built once per frame and shared by the rows.
+struct Bubbles {
+    mine: Color,
+    on_mine: Color,
+    markdown: MarkdownStyle,
+}
+
+fn chat(s: &Demo, t: &Theme) -> View<Demo> {
     let header = hstack((
         text("Assistant").weight(Weight::Semibold),
         spacer(),
-        text(format!("{} messages", s.messages.len())).font_size(13.0).color(Color::WHITE.alpha(0.6)),
+        text(format!("{} messages", s.messages.len())).font_size(13.0).color(t.color.text.alpha(0.6)),
     ))
     .fill_width()
     .padding_xy(16.0, 12.0)
-    .glass_with(Glass::frosted())
+    .glass_with(t.glass_menu)
     .radius(18.0)
     .sticky();
     // The list builds only the rows on screen; each row is ordinary views (markdown,
@@ -326,9 +354,10 @@ fn chat(s: &Demo) -> View<Demo> {
     // history is one selection: drag across messages, Cmd/Ctrl+C copies them as plain text.
     // Links open in the browser (`.on_link()` would route them to the app instead).
     let (messages, photos, material) = (s.messages.clone(), s.photos.clone(), glass(s));
-    let rows = list(s.messages.len(), 120.0, move |i| bubble(material, &messages[i], &photos))
+    let style = Bubbles { mine: t.color.accent, on_mine: t.color.on_accent, markdown: MarkdownStyle::from(t) };
+    let rows = list(s.messages.len(), 120.0, move |i| bubble(material, &style, &messages[i], &photos))
         .selectable()
-        .selection_color(Color::hex(0x4DA3FF).alpha(0.35));
+        .selection_color(t.color.link.alpha(0.35));
     // The composer draws its own capsule; the field inside is plain. Enter sends,
     // Shift+Enter breaks the line, and the field grows up to six rows.
     let input = hstack((
@@ -337,7 +366,7 @@ fn chat(s: &Demo) -> View<Demo> {
             .on_submit(send)
             .plain()
             .padding_ltrb(14.0, 9.0, 4.0, 9.0),
-        zstack(icon(&s.icons.send)).size(38.0, 38.0).radius(19.0).background(Color::BLUE).on_tap(send),
+        zstack(icon(&s.icons.send)).size(38.0, 38.0).radius(19.0).background(t.color.accent).color(t.color.on_accent).on_tap(send),
     ))
     .align(Align::End)
     .padding(4.0)
@@ -395,14 +424,14 @@ fn gallery(s: &Demo) -> View<Demo> {
     .spacing(18.0)
 }
 
-fn field(label: &str, control: View<Demo>) -> View<Demo> {
-    vstack((text(label).font_size(13.0).weight(Weight::Semibold).color(Color::WHITE.alpha(0.6)), control))
+fn field(t: &Theme, label: &str, control: View<Demo>) -> View<Demo> {
+    vstack((text(label).font_size(13.0).weight(Weight::Semibold).color(t.color.text.alpha(0.6)), control))
         .spacing(6.0)
         .align(Align::Start)
         .fill_width()
 }
 
-fn forms(s: &Demo) -> View<Demo> {
+fn forms(s: &Demo, t: &Theme) -> View<Demo> {
     let hello = if s.name.trim().is_empty() {
         "Type your name below".to_string()
     } else {
@@ -412,10 +441,20 @@ fn forms(s: &Demo) -> View<Demo> {
         text("Forms").font_size(34.0).weight(Weight::Bold).fill_width(),
         card(s, (
             text(hello).font_size(20.0).weight(Weight::Semibold).centered(),
-            field("NAME", text_field(s.name.as_str(), "Your name", |s: &mut Demo, v| s.name = v)),
-            field("NOTES", text_field(s.notes.as_str(), "Notes (Enter starts a new line)", |s: &mut Demo, v| s.notes = v).max_lines(4)),
-            field("CITY", picker(&CITIES, s.city, |s: &mut Demo, i| s.city = i).fill_width()),
+            field(t, "NAME", text_field(s.name.as_str(), "Your name", |s: &mut Demo, v| s.name = v)),
+            field(t, "NOTES", text_field(s.notes.as_str(), "Notes (Enter starts a new line)", |s: &mut Demo, v| s.notes = v).max_lines(4)),
+            field(t, "CITY", picker(&CITIES, s.city, |s: &mut Demo, i| s.city = i).fill_width()),
             button("Clear", |s: &mut Demo| s.name.clear()).fill_width(),
+        ))
+        .spacing(16.0)
+        .padding(20.0),
+        // The whole interface repaints from the theme: built-in controls, and the app's own
+        // colors read from `env.theme`.
+        card(s, (
+            row(&s.icons.bolt, t.color.accent, "Light appearance", toggle(s.light, |s: &mut Demo, on| {
+                s.light = on;
+                s.lab_dark = !on;
+            })),
         ))
         .spacing(16.0)
         .padding(20.0),
@@ -426,7 +465,7 @@ fn forms(s: &Demo) -> View<Demo> {
 
 // ---------------------------------------------------------------- shell
 
-fn nav(s: &Demo) -> View<Demo> {
+fn nav(s: &Demo, t: &Theme) -> View<Demo> {
     let glyphs = [&s.icons.home, &s.icons.chat, &s.icons.photo, &s.icons.form];
     let items: Vec<_> = TABS
         .iter()
@@ -438,8 +477,8 @@ fn nav(s: &Demo) -> View<Demo> {
                 .fill_width()
                 .padding_xy(14.0, 11.0)
                 .radius(12.0)
-                .background(Color::WHITE.alpha(if on { 0.18 } else { 0.0 }))
-                .color(Color::WHITE.alpha(if on { 1.0 } else { 0.7 }))
+                .background(t.color.text.alpha(if on { 0.18 } else { 0.0 }))
+                .color(t.color.text.alpha(if on { 1.0 } else { 0.7 }))
                 .on_tap(move |s: &mut Demo| {
                     s.tab = i;
                     s.drawer = false;
@@ -455,21 +494,21 @@ fn nav(s: &Demo) -> View<Demo> {
     .fill()
 }
 
-fn overlays(s: &Demo) -> Vec<View<Demo>> {
+fn overlays(s: &Demo, t: &Theme) -> Vec<View<Demo>> {
     let panel = |title: &str, body: &str, close: fn(&mut Demo)| {
         vstack((
             text(title).font_size(22.0).weight(Weight::Bold),
-            text(body).font_size(15.0).centered().color(Color::WHITE.alpha(0.75)),
+            text(body).font_size(15.0).centered().color(t.color.text.alpha(0.75)),
             button("Done", close).fill_width(),
         ))
         .spacing(14.0)
         .padding(24.0)
         .fill_width()
-        .glass_with(Glass::frosted())
+        .glass_with(t.glass_menu)
         .radius(30.0)
     };
     vec![
-        drawer(s.drawer, |s: &mut Demo| s.drawer = false, nav(s).glass_with(Glass::frosted())),
+        drawer(s.drawer, |s: &mut Demo| s.drawer = false, nav(s, t).glass_with(t.glass_menu)),
         sheet(
             s.sheet,
             |s: &mut Demo| s.sheet = false,
@@ -485,7 +524,7 @@ fn overlays(s: &Demo) -> Vec<View<Demo>> {
             hstack((icon(&s.icons.bell).size(18.0, 18.0), text(s.toast.clone().unwrap_or_default()).font_size(15.0)))
                 .spacing(10.0)
                 .padding_xy(18.0, 12.0)
-                .glass_with(Glass::frosted())
+                .glass_with(t.glass_menu)
                 .radius(24.0)
                 .shadow(Color::BLACK.alpha(0.35), 24.0, 8.0),
         ),
@@ -494,22 +533,23 @@ fn overlays(s: &Demo) -> Vec<View<Demo>> {
 
 fn view(s: &Demo, env: &Env) -> View<Demo> {
     let class = env.class();
+    let t = &*env.theme;
     let page = match s.tab {
         0 => home(s, env),
         2 => gallery(s),
-        3 => forms(s),
+        3 => forms(s, t),
         _ => rect(),
     };
     let bottom = if class == SizeClass::Phone { 110.0 } else { 24.0 };
     let content = if s.tab == 1 {
-        chat(s).padding_ltrb(0.0, 0.0, 0.0, bottom - 14.0)
+        chat(s, t).padding_ltrb(0.0, 0.0, 0.0, bottom - 14.0)
     } else {
         // Keep text lines readable on wide windows.
         let column = vstack(page.width(env.width.min(620.0) - 36.0)).fill_width();
         scroll(column.padding_ltrb(18.0, 56.0, 18.0, bottom)).key(s.tab)
     };
 
-    let mut layers: Vec<View<Demo>> = vec![backdrop(s)];
+    let mut layers: Vec<View<Demo>> = vec![backdrop(s, t)];
     match class {
         // Phone: one column, floating tab bar, the menu button opens a drawer.
         SizeClass::Phone => {
@@ -530,11 +570,11 @@ fn view(s: &Demo, env: &Env) -> View<Demo> {
         }
         // Tablet and desktop: a sidebar, and on a desktop a settings panel as well.
         _ => {
-            let sidebar = nav(s).width(230.0).glass_with(glass(s)).radius(26.0);
+            let sidebar = nav(s, t).width(230.0).glass_with(glass(s)).radius(26.0);
             let mut columns = vec![sidebar, content];
             if class == SizeClass::Desktop {
                 columns.push(
-                    vstack((text("Inspector").weight(Weight::Semibold).fill_width().padding(6.0), settings(s), spacer()))
+                    vstack((text("Inspector").weight(Weight::Semibold).fill_width().padding(6.0), settings(s, t), spacer()))
                         .spacing(10.0)
                         .width(300.0)
                         .fill_height(),
@@ -543,7 +583,7 @@ fn view(s: &Demo, env: &Env) -> View<Demo> {
             layers.push(hstack(columns).spacing(14.0).padding(14.0).fill());
         }
     }
-    layers.extend(overlays(s));
+    layers.extend(overlays(s, t));
     let menu_inset = if class == SizeClass::Phone { 12.0 } else { 0.0 };
     zstack(layers).fill().padding_ltrb(menu_inset, menu_inset, 0.0, 0.0).padding(0.0)
 }
@@ -557,6 +597,7 @@ impl Demo {
             drift: 0.35,
             glass: 0.5,
             lab_dark: true,
+            light: false,
             lab_blur: 0.3,
             lab_distortion: 0.7,
             lab_opacity: 0.45,
@@ -591,12 +632,14 @@ fn main() {
             let num = |k: usize, d: u32| args.get(i + k).and_then(|t| t.parse().ok()).unwrap_or(d);
             state.tab = num(2, 0) as usize;
             let (frames, width) = (num(3, 1), num(4, 420));
-            // Optional: points to scroll down before the shot; `--light` for the light glass lab;
+            // Optional: points to scroll down before the shot; `--light` for the light theme;
             // `--scale 1` for a 1x frame (default 2).
             let down = num(5, 0) as f32;
             let scale = args.iter().position(|a| a == "--scale").and_then(|k| args.get(k + 1)).and_then(|t| t.parse().ok()).unwrap_or(2.0);
-            state.lab_dark = !args.iter().any(|a| a == "--light");
+            state.light = args.iter().any(|a| a == "--light");
+            state.lab_dark = !state.light;
             let mut ui = ruru::Ui::new(state, view);
+            ui.theme_with(theme_of);
             ui.show_fps = true;
             let wait = |ui: &mut ruru::Ui<Demo>, n: u32| {
                 if n == 1 && down > 0.0 {
@@ -610,5 +653,5 @@ fn main() {
             return;
         }
     }
-    App::new(state, view).title("ruru showcase").size(420.0, 820.0).show_fps(true).run();
+    App::new(state, view).title("ruru showcase").size(420.0, 820.0).theme_with(theme_of).show_fps(true).run();
 }

@@ -27,6 +27,7 @@ cargo check --no-default-features --features "<набор>" --lib  # прове�
 | `src/ui.rs` | `Ui<S>`: кадр, `Painter` (дерево → `DrawList`), пружины, физика скролла, ввод, таймеры |
 | `src/render.rs` | wgpu: батчи, снимок сцены и пирамида размытия для стекла, текстуры картинок, текст через glyphon |
 | `src/shaders/quad.wgsl` | все фигуры одним инстансным шейдером; `blur.wgsl` — пирамида |
+| `src/theme.rs` | `Theme`: палитра, шкала текста, метрики контролов, тени, пружины; `theme::apply` дописывает их в дерево после `view()` |
 | `src/text.rs` | шейпинг и кэш (cosmic-text); кэш высот строк `list`; геометрия текста: `hit`, `caret`, `range_rects`, `word_at`, `para_at` |
 | `src/edit.rs` | редактор `text_field` (подмодуль `ui`: видит его поля): каретка, выделение, undo, буфер, IME, multiline |
 | `src/popup.rs` | слои поверх дерева (подмодуль `ui`): поповеры, меню с подменю и клавиатурой, контекстное меню, тултипы; `Placement`, `MenuStyle`, шорткаты |
@@ -53,6 +54,9 @@ cargo check --no-default-features --features "<набор>" --lib  # прове�
   линза `tab_bar`), рисуется с `Xf { px: 0.0, .. }` без привязки, иначе видны ступеньки.
 - **Новый виджет** = вариант `Kind` + ветка в `layout()` + ветка в `Painter::paint` + конструктор
   + экспорт в `lib.rs`/`prelude` + тест в `tests/interaction.rs` + строка в README.
+- **Новый виджет берёт цвета и размеры из темы** (`Theme`, поле в `Controls`/`Palette`), а не из литералов:
+  узловые стили — через `Role` и `theme::apply`, остальное — `lx.look` / `self.look` в layout и Painter.
+  Явный модификатор всегда побеждает тему.
 - **Ввод** идёт через `Hit`/`Action`, собранные при покраске; порядок в списке = порядок по Z.
 - **Шейдер должен работать в WebGL2**: без storage-буферов, семплинг в ветвлениях только
   `textureSampleLevel`, производные (`dpdx`) — до любых `if`.
