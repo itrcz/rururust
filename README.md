@@ -160,7 +160,8 @@ ruru = { version = "0.1", default-features = false, features = ["app"] }        
 
 Размер. wgpu подключён без своих фич по умолчанию: только фронтенд WGSL и бэкенды платформы — Metal на
 macOS/iOS, DX12 + Vulkan на Windows, Vulkan + GLES на Linux/Android, WebGPU (+ WebGL2 с фичей `webgl`)
-в браузере. Профиль релиза — `lto = "fat"`, `codegen-units = 1`, `strip = true`: showcase ≈ 7,4 МБ
+в браузере. Обычный `--release` собирается быстро; компактный профиль `--profile dist` (его же использует
+`web/build.sh`) — `lto = "fat"`, `codegen-units = 1`, `strip = true`: showcase ≈ 7,4 МБ
 нативно, wasm ≈ 7,9 МБ (≈ 2,9 МБ gzip). Делайте так же в своём приложении — fat LTO против thin
 даёт −23%, `opt-level = "s"` ещё −16% ценой скорости. Минимальная сборка — `default-features = false`
 и только нужное из `app`/`renderer`, `decode`, `svg` (≈ 0,4 МБ: usvg + tiny-skia), `markdown`

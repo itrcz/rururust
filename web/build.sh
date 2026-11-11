@@ -6,7 +6,7 @@
 set -e
 cd "$(dirname "$0")/.."
 EXAMPLE="${1:-showcase}"
-cargo build --release --example "$EXAMPLE" --target wasm32-unknown-unknown
+cargo build --profile dist --example "$EXAMPLE" --target wasm32-unknown-unknown
 wasm-bindgen --target web --no-typescript --out-dir web/pkg \
-  "target/wasm32-unknown-unknown/release/examples/$EXAMPLE.wasm"
+  "target/wasm32-unknown-unknown/dist/examples/$EXAMPLE.wasm"
 ls -lh web/pkg/*.wasm

@@ -97,7 +97,13 @@ required-features = ["app", "svg", "headless"]
 [[test]]
 name = "interaction"
 
+# Everyday build: fast to compile. `cargo run --release --example showcase`
 [profile.release]
+opt-level = 3
+
+# Compact build (and what web/build.sh uses): `cargo build --profile dist` -> target/dist/
+[profile.dist]
+inherits = "release"
 lto = true
 codegen-units = 1
 panic = "abort"
