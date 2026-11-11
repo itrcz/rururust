@@ -2,7 +2,7 @@
 //! rearranges itself for phone, tablet and desktop window sizes (resize the window).
 //!
 //!   cargo run --release --example showcase
-//!   cargo run --release --example showcase -- --screenshot shot.png [tab] [frames] [width]
+//!   cargo run --release --example showcase -- --screenshot shot.png [tab] [frames] [width] [down] [--scale 1]
 
 use ruru::prelude::*;
 use ruru::SizeClass;
@@ -591,8 +591,10 @@ fn main() {
             let num = |k: usize, d: u32| args.get(i + k).and_then(|t| t.parse().ok()).unwrap_or(d);
             state.tab = num(2, 0) as usize;
             let (frames, width) = (num(3, 1), num(4, 420));
-            // Optional: points to scroll down before the shot; `--light` for the light glass lab.
+            // Optional: points to scroll down before the shot; `--light` for the light glass lab;
+            // `--scale 1` for a 1x frame (default 2).
             let down = num(5, 0) as f32;
+            let scale = args.iter().position(|a| a == "--scale").and_then(|k| args.get(k + 1)).and_then(|t| t.parse().ok()).unwrap_or(2.0);
             state.lab_dark = !args.iter().any(|a| a == "--light");
             let mut ui = ruru::Ui::new(state, view);
             ui.show_fps = true;
@@ -604,7 +606,7 @@ fn main() {
                     std::thread::sleep(std::time::Duration::from_millis(16));
                 }
             };
-            ruru::headless::render_png_after(&mut ui, width, 820, 2.0, frames, wait, &args[i + 1]);
+            ruru::headless::render_png_after(&mut ui, width, 820, scale, frames, wait, &args[i + 1]);
             return;
         }
     }
