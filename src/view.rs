@@ -696,6 +696,21 @@ pub(crate) struct Extras<S> {
     pub tip_at: Option<Placement>,
     pub shortcuts: Vec<(Shortcut, Box<dyn Fn(&mut S)>)>,
     pub secondary: Option<Box<dyn Fn(&mut S)>>,
+    /// Makes a two-child `hstack` a [`split`].
+    pub split: Option<Split<S>>,
+}
+
+/// What makes an `hstack` of a panel and a main area a [`split`].
+pub(crate) struct Split<S> {
+    /// The panel's width in points (the app keeps it).
+    pub width: f32,
+    pub on_resize: Rc<dyn Fn(&mut S, f32)>,
+    /// Collapsed now, the width under which a drag collapses it, the handler.
+    pub collapse: Option<(bool, f32, Rc<dyn Fn(&mut S, bool)>)>,
+    /// Width a double click on the divider goes back to.
+    pub reset: Option<f32>,
+    /// The panel is on the right.
+    pub trailing: bool,
 }
 
 /// A node of the UI tree, generic over the app state `S`.
@@ -714,7 +729,7 @@ impl<S> View<S> {
     }
 
     fn extras(&mut self) -> &mut Extras<S> {
-        self.extra.get_or_insert_with(|| Box::new(Extras { pop: None, tip: None, tip_text: None, tip_at: None, shortcuts: Vec::new(), secondary: None }))
+        self.extra.get_or_insert_with(|| Box::new(Extras { pop: None, tip: None, tip_text: None, tip_at: None, shortcuts: Vec::new(), secondary: None, split: None }))
     }
 
     // ---- layout ----
@@ -946,6 +961,31 @@ impl<S> View<S> {
     pub fn indicator_insets(mut self, top: f32, bottom: f32) -> Self {
         if let Kind::Scroll { bar_insets, .. } = &mut self.kind {
             *bar_insets = (top.max(0.0), bottom.max(0.0));
+        }
+        self
+    }
+
+    /// Split only: dragging the divider below `threshold` points collapses the panel (with a
+    /// spring) and calls `on_collapse(true)`; dragging back out past it from the edge opens it
+    /// again (`on_collapse(false)`). The app keeps `collapsed`, so a button can toggle it too.
+    pub fn collapsible(mut self, collapsed: bool, threshold: f32, on_collapse: impl Fn(&mut S, bool) + 'static) -> Self {
+        if let Some(sp) = self.extra.as_mut().and_then(|x| x.split.as_mut()) {
+            sp.collapse = Some((collapsed, threshold, Rc::new(on_collapse)));
+        }
+        self
+    }
+    /// Split only: a double click on the divider brings the panel back to `width` (and opens
+    /// it if collapsed).
+    pub fn reset_width(mut self, width: f32) -> Self {
+        if let Some(sp) = self.extra.as_mut().and_then(|x| x.split.as_mut()) {
+            sp.reset = Some(width);
+        }
+        self
+    }
+    /// Split only: the panel is on the right (an inspector) instead of the left.
+    pub fn trailing(mut self) -> Self {
+        if let Some(sp) = self.extra.as_mut().and_then(|x| x.split.as_mut()) {
+            sp.trailing = true;
         }
         self
     }
@@ -1321,6 +1361,28 @@ pub fn vstack<S>(children: impl Children<S>) -> View<S> {
 /// Children left to right.
 pub fn hstack<S>(children: impl Children<S>) -> View<S> {
     stack(Axis::H, children)
+}
+/// A side panel and a main area with a divider the user drags to resize the panel, like a
+/// sidebar. The app keeps the width: `on_resize` gets every new one while dragging, 1:1 with
+/// the pointer; any other change of `width` (a button, a reset) glides on a spring. The
+/// panel's `.min_width()` / `.max_width()` bound the drag, and its content is laid out at
+/// least that wide, cut rather than squeezed while the panel closes. Over the divider (a
+/// one-point line in the theme's `divider` color, 8 points to grab) the pointer turns into
+/// a resize arrow and the line lights up in `accent`.
+///
+/// ```
+/// # use ruru::prelude::*;
+/// struct S { w: f32, closed: bool }
+/// fn view(s: &S) -> View<S> {
+///     split(s.w, |s: &mut S, w| s.w = w, text("chats").min_width(220.0).max_width(480.0), text("feed"))
+///         .collapsible(s.closed, 120.0, |s: &mut S, c| s.closed = c)
+///         .reset_width(300.0)
+/// }
+/// ```
+pub fn split<S>(width: f32, on_resize: impl Fn(&mut S, f32) + 'static, panel: View<S>, main: View<S>) -> View<S> {
+    let mut v = stack(Axis::H, (panel.fill(), main.fill())).fill();
+    v.extras().split = Some(Split { width, on_resize: Rc::new(on_resize), collapse: None, reset: None, trailing: false });
+    v
 }
 /// Children layered back to front.
 pub fn zstack<S>(children: impl Children<S>) -> View<S> {

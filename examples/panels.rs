@@ -1,7 +1,9 @@
 //! An app shell like a desktop chat client: a rounded panel that cuts its children to its
-//! corners (`.clip()`), a sidebar that slides shut (`.animate()`), chat titles that fade at
-//! the edge (`.truncate()`), hover highlights and pointer shapes, and a reading column that
-//! stops growing on a wide window (`.max_width()`).
+//! corners (`.clip()`), a sidebar behind a draggable divider (`split`: drag to resize between
+//! 220 and 420, drag far left to collapse, back out from the edge to open, double click to
+//! reset; the « button and a narrow window close it with a spring), chat titles that fade at
+//! the edge (`.truncate()`), hover highlights and pointer shapes, a reading column that stops
+//! growing on a wide window (`.max_width()`), and a window minimum size (`App::min_size`).
 //!
 //!   cargo run --release --example panels
 //!   cargo run --release --example panels -- --screenshot out.png [frames] [toggle_at] [mouse_x] [mouse_y] [width]
@@ -13,8 +15,14 @@ use ruru::prelude::*;
 
 struct S {
     sidebar: bool,
+    /// Sidebar width the user dragged to (kept while it is closed).
+    width: f32,
     selected: usize,
 }
+
+const SIDEBAR_W: f32 = 280.0;
+/// Below this window width the sidebar steps aside on its own.
+const NARROW: f32 = 760.0;
 
 const CHATS: [&str; 10] = [
     "Оценить Rust для кроссплатформенного интерфейса с GPU-рендерингом",
@@ -76,7 +84,6 @@ fn sidebar(s: &S) -> View<S> {
     ))
     .align(Align::Start)
     .padding_h(8.0)
-    .width(280.0)
     .fill_height()
 }
 
@@ -123,13 +130,13 @@ fn chat(s: &S) -> View<S> {
     vstack((header, zstack(column).padding(20.0).place(Align::Center, Align::Start).fill_width(), spacer())).fill()
 }
 
-fn view(s: &S, _env: &Env) -> View<S> {
-    let panel = hstack((
-        // Collapses to 0 and back; its content slides under the moving edge.
-        sidebar(s).width(if s.sidebar { 280.0 } else { 0.0 }).background(SIDEBAR).animate(),
-        chat(s),
-    ))
-    .fill()
+fn view(s: &S, env: &Env) -> View<S> {
+    // The sidebar keeps its width while closed; closing and opening glide, dragging is 1:1.
+    let open = s.sidebar && env.width >= NARROW;
+    let panel = split(s.width, |s: &mut S, w| s.width = w, sidebar(s).background(SIDEBAR).min_width(220.0).max_width(420.0), chat(s))
+        .collapsible(!open, 140.0, |s: &mut S, closed| s.sidebar = !closed)
+        .reset_width(SIDEBAR_W)
+        .fill()
     .background(PANEL)
     .radius(14.0)
     .border(1.0, Color::WHITE.alpha(0.08))
@@ -138,7 +145,7 @@ fn view(s: &S, _env: &Env) -> View<S> {
 }
 
 fn main() {
-    let state = S { sidebar: true, selected: 0 };
+    let state = S { sidebar: true, width: SIDEBAR_W, selected: 0 };
     #[cfg(not(target_arch = "wasm32"))]
     {
         let args: Vec<String> = std::env::args().collect();
@@ -164,5 +171,5 @@ fn main() {
             return;
         }
     }
-    App::new(state, view).title("ruru panels").size(1000.0, 640.0).background(Color::hex(0x1C1C1E)).run();
+    App::new(state, view).title("ruru panels").size(1000.0, 640.0).min_size(560.0, 420.0).background(Color::hex(0x1C1C1E)).run();
 }

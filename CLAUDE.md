@@ -54,6 +54,8 @@ cargo check --no-default-features --features "<набор>" --lib  # прове�
   линза `tab_bar`), рисуется с `Xf { px: 0.0, .. }` без привязки, иначе видны ступеньки.
 - **Новый виджет** = вариант `Kind` + ветка в `layout()` + ветка в `Painter::paint` + конструктор
   + экспорт в `lib.rs`/`prelude` + тест в `tests/interaction.rs` + строка в README.
+  Составной виджет поверх стека (как `split` — `hstack` с `Extras::split`) — ветки в `layout()` и
+  paint с guard на `Extras`, обход дерева остаётся стековым (`docs/decisions/007-*`).
 - **Новый виджет берёт цвета и размеры из темы** (`Theme`, поле в `Controls`/`Palette`), а не из литералов:
   узловые стили — через `Role` и `theme::apply`, остальное — `lx.look` / `self.look` в layout и Painter.
   Явный модификатор всегда побеждает тему.

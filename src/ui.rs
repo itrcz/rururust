@@ -1,7 +1,7 @@
 //! Platform-independent core: owns the app state, rebuilds the view tree,
 //! lays it out, paints it into a `DrawList`, and routes pointer input.
 
-use crate::layout::{child_id, layout, spec_in, LNode, Lx};
+use crate::layout::{child_id, layout, spec_in, LNode, Lx, SLOT_SPLIT, SPLIT_LINE};
 use crate::theme::{Look, Theme};
 use crate::text::{TextSpec, TextSystem};
 use crate::types::{Color, Rect};
@@ -280,6 +280,8 @@ enum Action<S> {
     /// The scroll bar of scroll view `scroll`: screen y and length of the thumb's travel,
     /// thumb length (screen), the offset range and one page (content units).
     ScrollBar { scroll: u64, y0: f32, track: f32, len: f32, lo: f32, hi: f32, page: f32 },
+    /// A split's divider.
+    Split(Rc<SplitHit<S>>),
 }
 
 /// Scroll bar: hover strip along the right edge (thumb widths are in the theme).
@@ -346,6 +348,37 @@ struct TipState {
 
 /// Seconds between two presses that make a double click.
 const DOUBLE_CLICK: f32 = 0.4;
+/// Width of the strip that grabs a split's divider, centered on its line.
+const SPLIT_GRAB: f32 = 8.0;
+const SPLIT_SALT: u64 = 0x5B_17D1;
+
+/// What a press on a split's divider needs to resize it.
+pub(crate) struct SplitHit<S> {
+    /// The split view.
+    id: u64,
+    /// Screen x of the panel's outer edge, and which way from it the panel grows (+1 right).
+    edge: f32,
+    dir: f32,
+    /// Screen points per point.
+    s: f32,
+    min: f32,
+    max: f32,
+    /// The panel's width now (while open).
+    open: f32,
+    collapsed: bool,
+    /// Width under which a drag collapses it, with the handler.
+    collapse: Option<(f32, Rc<dyn Fn(&mut S, bool)>)>,
+    on_resize: Rc<dyn Fn(&mut S, f32)>,
+    reset: Option<f32>,
+}
+
+/// A divider being dragged.
+struct SplitDrag<S> {
+    hit: Rc<SplitHit<S>>,
+    /// Pointer distance from the panel's width at the press, kept so the line stays under it.
+    grab: f32,
+    collapsed: bool,
+}
 
 struct Hit<S> {
     id: u64,
@@ -548,6 +581,8 @@ struct Painter<'a, S> {
     hovered: &'a [u64],
     /// The scroll view whose bar thumb is being dragged.
     bar_drag: Option<u64>,
+    /// The split whose divider is being dragged.
+    split_drag: Option<u64>,
     springs: &'a mut HashMap<(u64, u8), Spring>,
     scrolls: &'a mut HashMap<u64, ScrollState>,
     pressed: Option<u64>,
@@ -604,6 +639,55 @@ struct Painter<'a, S> {
 }
 
 impl<S> Painter<'_, S> {
+    /// A split: the panel cut to its region, the main area, the divider line, and the strip
+    /// that grabs it (deferred with the scroll bars, so it wins over a bar at the panel's edge).
+    #[allow(clippy::too_many_arguments)]
+    fn paint_split(&mut self, sp: crate::view::Split<S>, children: Vec<View<S>>, ln: &LNode, (r, cr): (Rect, Rect), xf: Xf, id: u64, tbase: u32) {
+        let mut it = children.into_iter();
+        let (Some(panel), Some(main)) = (it.next(), it.next()) else { return };
+        let (pn, mn) = (&ln.children[0], &ln.children[1]);
+        let region = ln.split;
+        let (min, max) = (panel.style.min.0, panel.style.max.0.max(panel.style.min.0));
+        let (pid, mid) = (child_id(id, 0, panel.key), child_id(id, 1, main.key));
+        // The line is the panel region's inner edge.
+        let line_x = if sp.trailing { cr.x + cr.w - region } else { cr.x + region - SPLIT_LINE };
+        let inner = (region - SPLIT_LINE).max(0.0);
+        let area = Rect::new(if sp.trailing { line_x + SPLIT_LINE } else { cr.x }, cr.y, inner, cr.h);
+        let mut pxf = xf;
+        pxf.clip_to(xf.rect_px(area), 0.0, false);
+        self.tbase = tbase;
+        self.paint(panel, pn, (r.x, r.y), pxf, pid);
+        self.tbase = tbase + pn.tn;
+        self.paint(main, mn, (r.x, r.y), xf, mid);
+
+        let div = id ^ SPLIT_SALT;
+        let on = self.split_drag == Some(id) || self.hovered.contains(&div);
+        let t = self.crisp(div, 9, if on { 1.0 } else { 0.0 }).clamp(0.0, 1.0);
+        if region > 0.0 {
+            let c = self.look.theme.color.divider.lerp(self.look.theme.color.accent, t);
+            self.fill(&xf, Rect::new(line_x, cr.y, SPLIT_LINE.min(region), cr.h), 0.0, Fill::Solid(c), None);
+        }
+        let center = line_x + SPLIT_LINE * 0.5;
+        let grab = Rect::new(center - SPLIT_GRAB * 0.5, cr.y, SPLIT_GRAB, cr.h).intersect(&cr);
+        let scr = xf.rect(cr);
+        let hit = SplitHit {
+            id,
+            edge: if sp.trailing { scr.x + scr.w } else { scr.x },
+            dir: if sp.trailing { -1.0 } else { 1.0 },
+            s: xf.s,
+            min,
+            max,
+            open: sp.width.clamp(min, max),
+            collapsed: sp.collapse.as_ref().is_some_and(|c| c.0),
+            collapse: sp.collapse.map(|c| (c.1, c.2)),
+            on_resize: sp.on_resize,
+            reset: sp.reset,
+        };
+        let mut bxf = xf;
+        bxf.clip_r = 0.0;
+        self.bars.push(Bar { xf: bxf, id: div, strip: xf.rect(grab), zone: Some(Some(Cursor::ResizeH)), rail: None, thumb: None, hit: Some(Action::Split(Rc::new(hit))) });
+    }
+
     /// Paints the scroll bars collected so far, over everything painted before them: content
     /// laid over a scroll view (a fade, a floating composer) never covers its bar or takes its
     /// presses. Called at the end of the tree and of each layer, and before a modal's scrim,
@@ -873,6 +957,7 @@ impl<S> Painter<'_, S> {
 
     fn paint_node(&mut self, mut v: View<S>, ln: &LNode, origin: (f32, f32), mut xf: Xf, id: u64) {
         let mut extra = v.extra.take().map(|b| *b);
+        let mut split = extra.as_mut().and_then(|x| x.split.take());
         // Shortcuts count while their view is in the tree, on screen or not.
         if let Some(x) = &mut extra {
             self.shortcuts.append(&mut x.shortcuts);
@@ -1201,6 +1286,10 @@ impl<S> Painter<'_, S> {
                     fade,
                 }));
             }
+            Kind::Stack { children, .. } if split.is_some() && children.len() == 2 => {
+                let sp = split.take().expect("guarded");
+                self.paint_split(sp, children, ln, (r, cr), xf, id, tbase);
+            }
             Kind::Stack { children, axis, .. } => {
                 let pin = pin.filter(|_| axis == Axis::V && children.iter().any(|c| c.style.sticky));
                 let mut stuck = Vec::new();
@@ -1405,6 +1494,9 @@ pub struct Ui<S> {
     zones: Vec<Zone>,
     /// Views under the mouse, topmost first.
     hovered: Vec<u64>,
+    /// A split divider held by the pointer, and the last press on one (for a double click).
+    split_drag: Option<SplitDrag<S>>,
+    split_down: Option<(Instant, u64)>,
     /// Mouse position while it is over the window (touch has none).
     mouse: Option<(f32, f32)>,
     /// Pointer shape the runner should show (the topmost `.cursor()` under the mouse).
@@ -1473,6 +1565,8 @@ impl<S: 'static> Ui<S> {
             hits: Vec::new(),
             zones: Vec::new(),
             hovered: Vec::new(),
+            split_drag: None,
+            split_down: None,
             mouse: None,
             cursor: Cursor::Default,
             springs: HashMap::new(),
@@ -1684,6 +1778,7 @@ impl<S: 'static> Ui<S> {
             scrolls: &mut self.scrolls,
             pressed: self.ptr.pressed,
             bar_drag: self.ptr.bar.map(|b| b.0),
+            split_drag: self.split_drag.as_ref().map(|d| d.hit.id),
             frame,
             text: &mut self.text,
             focus: self.focus,
@@ -1847,6 +1942,59 @@ impl<S: 'static> Ui<S> {
         std::mem::replace(&mut s.offset, next) != next
     }
 
+    /// A press on a split's divider: a double click resets the width, otherwise it grabs it.
+    fn split_press(&mut self, h: Rc<SplitHit<S>>, x: f32) {
+        let now = Instant::now();
+        let double = self.split_down.take().is_some_and(|(t, id)| id == h.id && (now - t).as_secs_f32() < DOUBLE_CLICK);
+        if double {
+            if let Some(w) = h.reset {
+                (h.on_resize)(&mut self.state, w.clamp(h.min, h.max));
+            }
+            if let Some((_, f)) = h.collapse.as_ref().filter(|_| h.collapsed) {
+                f(&mut self.state, false);
+            }
+            return;
+        }
+        self.split_down = Some((now, h.id));
+        let shown = if h.collapsed { 0.0 } else { h.open };
+        let grab = h.dir * (x - h.edge) / h.s - shown;
+        self.split_drag = Some(SplitDrag { collapsed: h.collapsed, grab, hit: h });
+        self.cursor = Cursor::ResizeH;
+    }
+
+    /// The divider follows the pointer 1:1 within the panel's limits; past the collapse
+    /// threshold the panel closes (and opens again coming back), gliding on its spring.
+    fn split_move(&mut self, x: f32) -> bool {
+        let Some(d) = &mut self.split_drag else { return false };
+        let h = d.hit.clone();
+        let want = h.dir * (x - h.edge) / h.s - d.grab;
+        if let Some((threshold, f)) = &h.collapse {
+            if want < *threshold {
+                if d.collapsed {
+                    return false;
+                }
+                d.collapsed = true;
+                f(&mut self.state, true);
+                return true;
+            }
+            if d.collapsed {
+                d.collapsed = false;
+                f(&mut self.state, false);
+                (h.on_resize)(&mut self.state, want.clamp(h.min, h.max));
+                return true;
+            }
+        }
+        let w = want.clamp(h.min, h.max);
+        (h.on_resize)(&mut self.state, w);
+        // Resting (not still gliding open): the region jumps straight to the new width.
+        if let Some(s) = self.springs.get_mut(&(h.id, SLOT_SPLIT)) {
+            if (s.x - s.target).abs() < 0.5 {
+                (s.x, s.target, s.v) = (w + SPLIT_LINE, w + SPLIT_LINE, 0.0);
+            }
+        }
+        true
+    }
+
     fn slide(&mut self, i: usize, x: f32) {
         if let Action::Slider(x0, range, steps, f) = &self.hits[i].action {
             f(&mut self.state, popup::snap(((x - x0) / range).clamp(0.0, 1.0), *steps));
@@ -1883,6 +2031,12 @@ impl<S: 'static> Ui<S> {
             return true;
         }
         self.ptr.bar = None;
+        if let Some(Action::Split(h)) = hit.map(|i| &self.hits[i].action) {
+            let h = h.clone();
+            self.ptr.pressed = None;
+            self.split_press(h, pos.0);
+            return true;
+        }
         if let Some(i) = hit.filter(|_| !touch) {
             if let Action::ScrollBar { .. } = self.hits[i].action {
                 // The bar is not text: the selection and focus stay as they are.
@@ -1923,7 +2077,13 @@ impl<S: 'static> Ui<S> {
     fn update_hover(&mut self) -> bool {
         let (ids, cursor, tip) = hover_at(&self.zones, self.mouse);
         // A dragged scroll bar thumb keeps the arrow wherever the pointer wanders.
-        self.cursor = if self.ptr.bar.is_some() { Cursor::Default } else { cursor };
+        self.cursor = if self.ptr.bar.is_some() {
+            Cursor::Default
+        } else if self.split_drag.is_some() {
+            Cursor::ResizeH
+        } else {
+            cursor
+        };
         match (tip, &self.tip) {
             (Some(id), Some(t)) if t.id == id => {}
             (Some(id), _) => {
@@ -1963,6 +2123,9 @@ impl<S: 'static> Ui<S> {
             }
             changed
         };
+        if self.split_drag.is_some() {
+            return self.split_move(pos.0) || hover;
+        }
         if let Some((sid, grab)) = self.ptr.bar {
             self.cursor = Cursor::Default;
             return self.bar_drag(sid, grab, pos.1) || hover;
@@ -2018,7 +2181,7 @@ impl<S: 'static> Ui<S> {
     pub fn pointer_up(&mut self, pos: (f32, f32)) -> bool {
         let pressed = self.ptr.pressed.take();
         self.ptr.down = false;
-        if self.ptr.bar.take().is_some() {
+        if self.ptr.bar.take().is_some() || self.split_drag.take().is_some() {
             self.update_hover();
             return true;
         }

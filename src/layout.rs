@@ -59,6 +59,10 @@ const SLOT_W: u8 = 10;
 const SLOT_H: u8 = 11;
 const SLOT_LAST_W: u8 = 12;
 const SLOT_LAST_H: u8 = 13;
+/// A split's side region (panel + divider) on screen; input sets it directly while dragging.
+pub(crate) const SLOT_SPLIT: u8 = 14;
+/// Thickness of a split's divider line, in points.
+pub(crate) const SPLIT_LINE: f32 = 1.0;
 
 #[derive(Default, Clone)]
 pub(crate) struct LNode {
@@ -82,6 +86,8 @@ pub(crate) struct LNode {
     /// Number of text views in the subtree, rows of a lazy list not counted. Text selection
     /// numbers them in tree order, which paint (with sticky children last) cannot see.
     pub tn: u32,
+    /// Split nodes: width of the side region on screen (panel and divider) this frame.
+    pub split: f32,
     /// The attached popover's content and the tooltip, when they are shown (or fading out).
     pub pop: Option<Box<LNode>>,
     pub tip: Option<Box<LNode>>,
@@ -148,6 +154,7 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
         }
     }
     let inner = (ow.map(|w| (w - pad_w).max(0.0)), oh.map(|h| (h - pad_h).max(0.0)));
+    let split = v.extra.as_ref().and_then(|x| x.split.as_ref());
 
     let mut node = LNode::default();
     let mut hug_h = false;
@@ -303,6 +310,27 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
             node.children.push(c);
             s
         }
+        Kind::Stack { children, .. } if split.is_some() && children.len() == 2 => {
+            let sp = split.expect("guarded");
+            let w = inner.0.unwrap_or(0.0);
+            let (panel, main) = (&children[0], &children[1]);
+            let (min, max) = (panel.style.min.0, panel.style.max.0.max(panel.style.min.0));
+            let open = sp.width.clamp(min, max);
+            let collapsed = sp.collapse.as_ref().is_some_and(|c| c.0);
+            let region = lx.spring(id, SLOT_SPLIT, if collapsed { 0.0 } else { open + SPLIT_LINE }).clamp(0.0, w);
+            // The panel fills its region, but never narrower than its open width: closing,
+            // it slides out whole instead of being squeezed.
+            let pw = open.max(region - SPLIT_LINE);
+            let pn = layout(panel, (Some(pw), inner.1), lx, child_id(id, 0, panel.key));
+            let mn = layout(main, (Some((w - region).max(0.0)), inner.1), lx, child_id(id, 1, main.key));
+            let (px, mx) = if sp.trailing { (w - region + SPLIT_LINE, 0.0) } else { ((region - SPLIT_LINE - pn.size.0).min(0.0), region) };
+            let h = inner.1.unwrap_or(pn.size.1.max(mn.size.1));
+            node.split = region;
+            node.children = vec![pn, mn];
+            node.children[0].pos = (pad[0] + px, pad[1]);
+            node.children[1].pos = (pad[0] + mx, pad[1]);
+            (w, h)
+        }
         Kind::Stack { axis: Axis::Z, children, .. } => {
             let mut s = (0.0f32, 0.0f32);
             for (i, c) in children.iter().enumerate() {
@@ -409,6 +437,7 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
 
     // Place children now that the final size is known.
     match &v.kind {
+        Kind::Stack { .. } if split.is_some() && node.children.len() == 2 => {} // placed above
         Kind::Scroll { .. } => node.children[0].pos = (pad[0], pad[1]),
         Kind::Stack { axis: Axis::Z, align, children, .. } => {
             for (n, c) in node.children.iter_mut().zip(children) {

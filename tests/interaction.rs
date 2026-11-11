@@ -2998,3 +2998,156 @@ fn theme_picks_the_font_and_falls_back_to_inter() {
     assert_eq!(ui.text.font_family(), "Inter");
     assert_eq!(texts(&ui)[0].size.0, inter);
 }
+
+// ---------------------------------------------------------------- split
+
+struct Sp {
+    w: f32,
+    closed: bool,
+}
+
+const SIDE: Color = Color::hex(0x802020);
+const SIDE_IN: Color = Color::hex(0x208020);
+const MAIN: Color = Color::hex(0x202080);
+
+fn split_ui(trailing: bool) -> Ui<Sp> {
+    let mut ui = Ui::new(Sp { w: 300.0, closed: false }, move |s: &Sp| {
+        let panel = zstack(rect().fill().background(SIDE_IN)).background(SIDE).min_width(200.0).max_width(400.0);
+        let v = split(s.w, |s: &mut Sp, w| s.w = w, panel, rect().fill().background(MAIN))
+            .collapsible(s.closed, 120.0, |s: &mut Sp, c| s.closed = c)
+            .reset_width(260.0);
+        if trailing { v.trailing() } else { v }
+    });
+    ui.frame((800.0, 400.0));
+    ui
+}
+
+fn settle_split(ui: &mut Ui<Sp>) {
+    for _ in 0..400 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        ui.frame((800.0, 400.0));
+        if !ui.animating {
+            break;
+        }
+    }
+}
+
+#[test]
+fn split_drag_resizes_one_to_one_within_min_and_max() {
+    let mut ui = split_ui(false);
+    assert_eq!(quads(&ui, SIDE)[0], [0.0, 0.0, 300.0, 400.0]);
+    assert_eq!(quads(&ui, MAIN)[0], [301.0, 0.0, 499.0, 400.0], "the main area starts after the 1 pt line");
+    // Grabbed 0.5 pt right of the line's left edge: the line keeps that offset to the pointer.
+    ui.pointer_move((300.5, 200.0));
+    ui.frame((800.0, 400.0));
+    ui.pointer_down((300.5, 200.0), false);
+    for x in [320.5, 351.5, 390.5] {
+        ui.pointer_move((x, 200.0));
+        ui.frame((800.0, 400.0));
+        assert_eq!(ui.state.w, x - 0.5);
+        assert_eq!(quads(&ui, SIDE)[0][2], x - 0.5, "follows 1:1, no spring");
+        assert_eq!(quads(&ui, MAIN)[0][0], x + 0.5);
+        assert_eq!(ui.cursor, ruru::Cursor::ResizeH);
+    }
+    ui.pointer_move((700.0, 200.0));
+    assert_eq!(ui.state.w, 400.0, "max");
+    ui.pointer_move((150.0, 200.0));
+    assert_eq!(ui.state.w, 200.0, "min (above the collapse threshold)");
+    assert!(!ui.state.closed);
+    ui.pointer_up((150.0, 200.0));
+    ui.frame((800.0, 400.0));
+    assert_eq!(quads(&ui, SIDE)[0][2], 200.0, "no glide after a drag");
+}
+
+#[test]
+fn split_collapses_past_the_threshold_and_opens_from_the_edge() {
+    let mut ui = split_ui(false);
+    ui.pointer_down((300.5, 200.0), false);
+    ui.pointer_move((100.0, 200.0));
+    assert!(ui.state.closed, "dragged under 120: collapses");
+    assert_eq!(ui.state.w, 300.0, "and keeps its width for next time");
+    // It glides shut; the content inside keeps its width (cut, not squeezed).
+    let mut seen = Vec::new();
+    for _ in 0..400 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        ui.frame((800.0, 400.0));
+        if let Some(q) = quads(&ui, SIDE_IN).first() {
+            assert!(q[2] >= 300.0 - 1e-3, "content keeps its width: {q:?}");
+        }
+        seen.push(quads(&ui, MAIN)[0][0]);
+        if !ui.animating {
+            break;
+        }
+    }
+    assert!(seen.iter().any(|x| *x > 20.0 && *x < 280.0), "glides: {seen:?}");
+    assert_eq!(quads(&ui, MAIN)[0], [0.0, 0.0, 800.0, 400.0]);
+    ui.pointer_up((100.0, 200.0));
+    // From the edge, dragged out past the threshold: it opens.
+    ui.pointer_move((1.0, 200.0));
+    ui.frame((800.0, 400.0));
+    assert_eq!(ui.cursor, ruru::Cursor::ResizeH, "the edge of a collapsed panel can be grabbed");
+    ui.pointer_down((1.0, 200.0), false);
+    ui.pointer_move((60.0, 200.0));
+    assert!(ui.state.closed, "not yet past the threshold");
+    ui.pointer_move((250.0, 200.0));
+    assert!(!ui.state.closed);
+    settle_split(&mut ui);
+    ui.pointer_move((261.0, 200.0));
+    ui.frame((800.0, 400.0));
+    assert_eq!(ui.state.w, 260.0, "then follows the pointer again");
+    assert_eq!(quads(&ui, SIDE)[0][2], 260.0);
+    ui.pointer_up((261.0, 200.0));
+}
+
+#[test]
+fn split_divider_lights_up_on_hover_and_double_click_resets() {
+    let mut ui = split_ui(false);
+    let theme = ruru::Theme::default();
+    let line = |ui: &Ui<Sp>| {
+        ui.list.cmds.iter().find_map(|c| match c {
+            ruru::Cmd::Quad(q) if q.rect[0] == 300.0 && q.rect[2] == 1.0 => Some(q.c0),
+            _ => None,
+        })
+    };
+    let d = theme.color.divider;
+    assert_eq!(line(&ui), Some([d.r, d.g, d.b, d.a]));
+    ui.pointer_move((297.0, 200.0)); // within the 8 pt grab strip
+    settle_split(&mut ui);
+    assert_eq!(ui.cursor, ruru::Cursor::ResizeH);
+    let a = theme.color.accent;
+    let lit = line(&ui).unwrap();
+    assert!(lit.iter().zip([a.r, a.g, a.b, a.a]).all(|(x, y)| (x - y).abs() < 1e-4), "lit up in the accent color: {lit:?}");
+    ui.pointer_move((290.0, 200.0));
+    settle_split(&mut ui);
+    assert_eq!(ui.cursor, ruru::Cursor::Default);
+    assert_eq!(line(&ui), Some([d.r, d.g, d.b, d.a]));
+    // Double click: back to the reset width, gliding there.
+    click(&mut ui, (300.5, 200.0));
+    click(&mut ui, (300.5, 200.0));
+    assert_eq!(ui.state.w, 260.0);
+    ui.frame((800.0, 400.0));
+    assert!(ui.animating, "glides to it");
+    settle_split(&mut ui);
+    assert_eq!(quads(&ui, SIDE)[0][2], 260.0);
+}
+
+#[test]
+fn split_toggled_by_state_glides_and_trailing_panel_sits_right() {
+    let mut ui = split_ui(true);
+    assert_eq!(quads(&ui, SIDE)[0], [500.0, 0.0, 300.0, 400.0]);
+    assert_eq!(quads(&ui, MAIN)[0], [0.0, 0.0, 499.0, 400.0]);
+    // Dragging the line left widens a panel on the right.
+    ui.pointer_down((499.5, 200.0), false);
+    ui.pointer_move((449.5, 200.0));
+    assert_eq!(ui.state.w, 350.0);
+    ui.pointer_up((449.5, 200.0));
+    // A button closing it: a spring, not a jump.
+    ui.state.closed = true;
+    ui.frame((800.0, 400.0));
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    ui.frame((800.0, 400.0));
+    let w = quads(&ui, MAIN)[0][2];
+    assert!(w > 449.0 && w < 800.0, "on its way: {w}");
+    settle_split(&mut ui);
+    assert_eq!(quads(&ui, MAIN)[0], [0.0, 0.0, 800.0, 400.0]);
+}
