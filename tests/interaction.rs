@@ -2649,3 +2649,116 @@ fn view_reads_the_theme_from_env() {
     assert_eq!(t[0].color, Theme::light().color.danger);
     assert!(t[0].size.1 > 25.0, "title size: {}", t[0].size.1);
 }
+
+// ---- gaps found in GromAgent: menu icons, padding on leaves, menu border, sections, max_height
+
+fn image_quads(ui: &Ui<impl Sized>) -> Vec<ruru::Quad> {
+    ui.list.cmds.iter().filter_map(|c| match c {
+        ruru::Cmd::Quad(q) if q.p0[3] == 3.0 => Some(*q),
+        _ => None,
+    }).collect()
+}
+
+fn plain_menu(bg: Color) -> MenuStyle {
+    MenuStyle { background: bg, glass: None, border: None, shadow: None, ambient: None, rim: None, ..MenuStyle::from(&Theme::dark()) }
+}
+
+#[test]
+fn menu_icon_is_a_template_and_menu_image_keeps_its_colors() {
+    let pic = Image::from_rgba(2, 2, vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255]);
+    let (a, b) = (pic.clone(), pic);
+    let mut ui = Ui::new((), move |_: &()| {
+        let items = vec![MenuItem::action("Mono", |_: &mut ()| {}).icon(&a), MenuItem::action("Color", |_: &mut ()| {}).image(&b)];
+        zstack(menu(items)).place(Align::Start, Align::Start)
+    });
+    ui.frame((400.0, 400.0));
+    let q = image_quads(&ui);
+    assert_eq!(q.len(), 2);
+    assert_eq!(q[0].c1[1], 1.0, "icon: tinted with the row color");
+    assert_eq!(q[1].c1[1], 0.0, "image: painted as is");
+    assert!(q[1].rect[1] > q[0].rect[1]);
+}
+
+#[test]
+fn padding_moves_the_content_of_leaf_views() {
+    let red = Color::hex(0xFF0000);
+    let track = Color::hex(0x00FF00);
+    let mut ui = Ui::new((), move |_: &()| {
+        let slider_st = SliderStyle { track, ..SliderStyle::from(&Theme::dark()) };
+        vstack((
+            menu(vec![MenuItem::action("Row", |_: &mut ()| {})]).menu_style(plain_menu(red)).padding_ltrb(10.0, 6.0, 4.0, 2.0),
+            slider(0.0, |_: &mut (), _| {}).slider_style(slider_st).width(200.0).padding_ltrb(10.0, 6.0, 4.0, 2.0),
+            toggle(false, |_: &mut (), _| {}).padding_ltrb(10.0, 6.0, 4.0, 2.0),
+        ))
+        .align(Align::Start)
+        .place(Align::Start, Align::Start)
+    });
+    ui.frame((400.0, 400.0));
+    let panel = quads(&ui, red)[0];
+    assert_eq!((panel[0], panel[1]), (10.0, 6.0), "menu panel inside the padding");
+    let rows: Vec<_> = texts(&ui).iter().map(|t| t.pos).collect();
+    assert!(rows[0].1 > 6.0);
+    let menu_h = panel[3] + 8.0;
+    let t = quads(&ui, track)[0];
+    assert_eq!(t[0], 10.0, "slider track starts after the left padding");
+    assert_eq!(t[2], 200.0 - 14.0, "and ends before the right one");
+    let sh = SliderStyle::from(&Theme::dark()).knob_size.max(SliderStyle::from(&Theme::dark()).track_height);
+    assert!((t[1] + t[3] * 0.5 - (menu_h + 6.0 + sh * 0.5)).abs() < 0.6, "track centered in the content: {t:?}");
+    let k = Theme::dark().control.toggle;
+    let toggle = quads(&ui, Theme::dark().color.fill_strong).into_iter().find(|q| q[2] == k.0).expect("toggle track");
+    assert_eq!(toggle[0], 10.0);
+    assert_eq!(toggle[3], k.1, "the track keeps its size");
+}
+
+#[test]
+fn menu_border_lies_over_its_translucent_background() {
+    let edge = Color::WHITE.alpha(0.15);
+    for glass in [None, Some(Glass::dark())] {
+        let mut ui = Ui::new((), move |_: &()| {
+            let st = MenuStyle { glass, border: Some((0.5, edge)), background: Color::BLACK.alpha(0.5), ..plain_menu(Color::CLEAR) };
+            zstack(menu(vec![MenuItem::action("Row", |_: &mut ()| {})]).menu_style(st)).place(Align::Start, Align::Start)
+        });
+        ui.frame((400.0, 400.0));
+        let all = fills(&ui);
+        let bg = all.iter().position(|(_, c, _)| *c == [0.0, 0.0, 0.0, 0.5]).expect("background");
+        let border = all.iter().rposition(|(_, _, b)| *b == [1.0, 1.0, 1.0, 0.15]).expect("border");
+        assert!(border > bg, "glass {:?}: border painted after the fill", glass.is_some());
+        assert_eq!(all[bg].2, [0.0; 4], "the fill itself has no border");
+    }
+}
+
+#[test]
+fn menu_rows_and_sections_take_their_own_height() {
+    let mut ui = Ui::new((), |_: &()| {
+        let st = MenuStyle { padding: 0.0, row_height: 28.0, section_height: Some(20.0), section_gap: 4.0, ..plain_menu(Color::CLEAR) };
+        let items = vec![
+            MenuItem::section("A").height(12.0),
+            MenuItem::action("one", |_: &mut ()| {}),
+            MenuItem::section("B"),
+            MenuItem::action("two", |_: &mut ()| {}).height(32.0),
+        ];
+        zstack(menu(items).menu_style(st).background(Color::RED)).place(Align::Start, Align::Start)
+    });
+    ui.frame((400.0, 400.0));
+    assert_eq!(quads(&ui, Color::RED)[0][3], 12.0 + 28.0 + (4.0 + 20.0) + 32.0);
+}
+
+#[test]
+fn scroll_with_max_height_hugs_short_content_and_limits_long() {
+    for (rows, want) in [(3usize, 3.0 * 30.0), (20, 200.0)] {
+        let mut ui = Ui::new((), move |_: &()| {
+            let col = vstack((0..rows).map(|_| rect().fill_width().height(30.0)).collect::<Vec<_>>());
+            zstack(scroll(col).max_height(200.0).width(100.0).background(Color::RED)).place(Align::Start, Align::Start)
+        });
+        ui.frame((400.0, 400.0));
+        assert_eq!(quads(&ui, Color::RED)[0][3], want, "{rows} rows");
+    }
+    // Inside a popover, which offers no size at all.
+    let mut ui = Ui::new((), |_: &()| {
+        let col = vstack((0..20).map(|_| rect().fill_width().height(30.0)).collect::<Vec<_>>());
+        zstack(scroll(col).max_height(150.0).max_width(120.0).background(Color::RED)).place(Align::Start, Align::Start)
+    });
+    ui.frame((400.0, 400.0));
+    let q = quads(&ui, Color::RED)[0];
+    assert_eq!((q[2], q[3]), (120.0, 150.0));
+}

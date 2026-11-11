@@ -934,6 +934,10 @@ impl<S> Painter<'_, S> {
         }
 
         let pad = st.padding;
+        // Where the content goes: padding works the same on every kind of view, leaves
+        // (toggle, slider, menu, tabs, picture) included.
+        let cr = Rect::new(r.x + pad[0], r.y + pad[1], (r.w - pad[0] - pad[2]).max(0.0), (r.h - pad[1] - pad[3]).max(0.0));
+        let csr = if pad == [0.0; 4] { sr } else { xf.rect_px(cr) };
         match v.kind {
             Kind::Empty | Kind::Spacer => {}
             Kind::List { count, row_h, row } => {
@@ -1067,12 +1071,19 @@ impl<S> Painter<'_, S> {
                 self.paint(*child, cn, pos, cxf, cid);
             }
             Kind::Image(img, template) => {
-                self.picture(&xf, r, st.radius, &img, template.then_some(xf.fg), st.border);
+                // Padded, the frame (background, border) is the node's and the picture sits inside.
+                if pad == [0.0; 4] {
+                    self.picture(&xf, r, st.radius, &img, template.then_some(xf.fg), st.border);
+                } else {
+                    let k = (st.radius - pad[0].max(pad[1])).max(0.0);
+                    self.picture(&xf, cr, k, &img, template.then_some(xf.fg), None);
+                }
             }
             Kind::TextField(f) => self.paint_field(f, &st, r, sr, xf, id),
             Kind::Tabs { labels, selected, on_select } => {
                 let (tabs_pad, drop_tint, lift) = (self.look.theme.control.tab_padding, self.look.theme.control.tab_drop, self.look.theme.shadow.lift);
                 let n = labels.len().max(1);
+                let r = cr;
                 let tab_w = (r.w - 2.0 * tabs_pad) / n as f32;
                 let center = |i: usize| r.x + tabs_pad + tab_w * (i as f32 + 0.5);
                 let held = self.pressed == Some(id);
@@ -1110,7 +1121,7 @@ impl<S> Painter<'_, S> {
                 // The drop swells and stretches as it slides: no pixel steps.
                 let lxf = Xf { px: 0.0, ..xf };
                 self.glass(&lxf, lens, lh * 0.5, drop, None);
-                self.hit(&xf, id, sr.inflate(4.0), Action::Tabs {
+                self.hit(&xf, id, csr.inflate(4.0), Action::Tabs {
                         x0: (r.x + tabs_pad) * xf.s + xf.tx,
                         tab_w: tab_w * xf.s,
                         n,
@@ -1275,6 +1286,7 @@ impl<S> Painter<'_, S> {
                 }
             }
             Kind::Toggle(on, f) => {
+                let r = cr;
                 let t = self.spring(id, 1, if on { 1.0 } else { 0.0 });
                 let p = self.spring(id, 2, if self.pressed == Some(id) { 1.0 } else { 0.0 });
                 let theme = &*self.look.theme;
@@ -1289,14 +1301,15 @@ impl<S> Painter<'_, S> {
                 let kxf = Xf { px: 0.0, ..xf };
                 self.shadow(&kxf, knob, knob.h * 0.5, knob_sh, false);
                 self.fill(&kxf, knob, knob.h * 0.5, Fill::Solid(knob_c), None);
-                self.hit(&xf, id, sr.inflate(6.0), Action::Toggle(on, f));
+                self.hit(&xf, id, csr.inflate(6.0), Action::Toggle(on, f));
             }
             Kind::Menu { items, style } => {
                 let style = style.unwrap_or_else(|| self.look.menu.clone());
-                self.paint_menu(items, style, ln, r, xf, id)
+                self.paint_menu(items, style, ln, cr, xf, id)
             }
             Kind::Slider(value, steps, f, style) => {
                 let st = style.map_or(self.look.slider, |b| *b);
+                let r = cr;
                 let p = self.spring(id, 2, if self.pressed == Some(id) { 1.0 } else { 0.0 });
                 let knob_d = st.knob_size;
                 let range = (r.w - knob_d).max(1.0);
@@ -1321,7 +1334,7 @@ impl<S> Painter<'_, S> {
                 }
                 self.fill(&xf, knob, d * 0.5, Fill::Solid(st.knob), None);
                 let x0 = (r.x + knob_d * 0.5) * xf.s + xf.tx;
-                self.hit(&xf, id, sr.inflate(8.0), Action::Slider(x0, range * xf.s, steps, f));
+                self.hit(&xf, id, csr.inflate(8.0), Action::Slider(x0, range * xf.s, steps, f));
             }
         }
         if let Some((ixf, sh)) = inset {

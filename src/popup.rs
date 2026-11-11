@@ -259,15 +259,18 @@ pub struct MenuItem<S> {
     pub(crate) kind: ItemKind<S>,
     label: String,
     hint: Option<String>,
-    icon: Option<Image>,
+    /// The picture and whether it is a template (painted in the text color).
+    icon: Option<(Image, bool)>,
     shortcut: Option<String>,
     disabled: bool,
     checked: bool,
+    /// Row height instead of the style's (for a section, without the gap above it).
+    height: Option<f32>,
 }
 
 impl<S> MenuItem<S> {
     fn new(kind: ItemKind<S>, label: String) -> Self {
-        MenuItem { kind, label, hint: None, icon: None, shortcut: None, disabled: false, checked: false }
+        MenuItem { kind, label, hint: None, icon: None, shortcut: None, disabled: false, checked: false, height: None }
     }
     /// A row that runs `f` and closes the menu.
     pub fn action(label: impl Into<String>, f: impl Fn(&mut S) + 'static) -> Self {
@@ -287,7 +290,20 @@ impl<S> MenuItem<S> {
     }
     /// A glyph before the label, painted in the text color (like [`icon`](crate::icon)).
     pub fn icon(mut self, img: &Image) -> Self {
-        self.icon = Some(img.clone());
+        self.icon = Some((img.clone(), true));
+        self
+    }
+    /// A picture before the label, in its own colors (a multicolored SVG, an app icon);
+    /// dimmed when the row is disabled. Same place and size as [`icon`](Self::icon).
+    pub fn image(mut self, img: &Image) -> Self {
+        self.icon = Some((img.clone(), false));
+        self
+    }
+    /// This row's height instead of the style's. For a section it is the title's own part;
+    /// [`MenuStyle::section_gap`] still comes above every section but the first row, so
+    /// `MenuItem::section("Plugins").height(26.0)` sets one group apart from the others.
+    pub fn height(mut self, h: f32) -> Self {
+        self.height = Some(h);
         self
     }
     /// Key hint at the right edge: `"⌘R"` or `Shortcut::cmd('r')`. Only shown; bind the key
@@ -378,10 +394,15 @@ pub struct MenuStyle {
 /// Height of row `i`; a section's includes the gap above it.
 fn row_h<S>(it: &MenuItem<S>, i: usize, st: &MenuStyle) -> f32 {
     match it.kind {
-        ItemKind::Separator => st.separator_height,
-        ItemKind::Section => st.section_height.unwrap_or(st.row_height - 2.0) + if i > 0 { st.section_gap } else { 0.0 },
-        _ => st.row_height,
+        ItemKind::Separator => it.height.unwrap_or(st.separator_height),
+        ItemKind::Section => section_h(it, st) + if i > 0 { st.section_gap } else { 0.0 },
+        _ => it.height.unwrap_or(st.row_height),
     }
+}
+
+/// A section title's own part of its row (without the gap above).
+fn section_h<S>(it: &MenuItem<S>, st: &MenuStyle) -> f32 {
+    it.height.or(st.section_height).unwrap_or(st.row_height - 2.0)
 }
 
 impl MenuStyle {
@@ -654,13 +675,12 @@ impl<S> Painter<'_, S> {
         for sh in [st.shadow, st.ambient].into_iter().flatten() {
             self.shadow(&xf, r, st.radius, sh, true);
         }
-        match st.glass {
-            Some(g) => {
-                self.glass(&xf, r, st.radius, g, st.border);
-                self.fill(&xf, r, st.radius, Fill::Solid(st.background), None);
-            }
-            None => self.fill(&xf, r, st.radius, Fill::Solid(st.background), st.border),
+        // The border goes on last, over the (often translucent) background and the rows,
+        // as a container's does: under a translucent fill it would fade.
+        if let Some(g) = st.glass {
+            self.glass(&xf, r, st.radius, g, None);
         }
+        self.fill(&xf, r, st.radius, Fill::Solid(st.background), None);
         self.hit(&xf, id ^ 0x5A11, sr, Action::Swallow);
         let first = items.iter().position(MenuItem::selectable);
         let frame = self.frame;
@@ -679,6 +699,7 @@ impl<S> Painter<'_, S> {
         let mut subk = 0;
         for (i, it) in items.into_iter().enumerate() {
             let h = row_h(&it, i, st);
+            let title_h = section_h(&it, st);
             let row = Rect::new(r.x + st.padding, y, r.w - 2.0 * st.padding, h);
             let rid = row_id(id, i);
             let (label, hint, right) = (ln.texts[3 * i], ln.texts[3 * i + 1], ln.texts[3 * i + 2]);
@@ -693,7 +714,7 @@ impl<S> Painter<'_, S> {
                 }
                 ItemKind::Section => {
                     // Centered in the part under the gap.
-                    let top = h - st.section_height.unwrap_or(st.row_height - 2.0);
+                    let top = h - title_h;
                     let y = row.y + top + (h - top - label.1 .1) * 0.5 + 1.0;
                     self.label(&cxf, label.0, (lx, y), label.1, st.section_color.unwrap_or(st.dim));
                     nav.push((rid, Nav::Skip));
@@ -711,9 +732,13 @@ impl<S> Painter<'_, S> {
                         _ => st.text,
                     };
                     let dim = if enabled { st.dim } else { st.disabled };
-                    if let Some(img) = &it.icon {
+                    if let Some((img, template)) = &it.icon {
                         let ic = Rect::new(lx, row.y + (h - st.icon_size) * 0.5, st.icon_size, st.icon_size);
-                        self.picture(&cxf, ic, 0.0, img, Some(color), None);
+                        let mut ixf = cxf;
+                        if !template && !enabled {
+                            ixf.opacity *= 0.4;
+                        }
+                        self.picture(&ixf, ic, 0.0, img, template.then_some(color), None);
                     } else if it.checked {
                         let at = (lx + (st.icon_size - check_size.0) * 0.5, mid(check_size));
                         self.label(&cxf, check, at, check_size, color);
@@ -775,6 +800,9 @@ impl<S> Painter<'_, S> {
         }
         if let Some(rim) = st.rim {
             self.shadow(&xf, r, st.radius, rim, false);
+        }
+        if let Some(b) = st.border {
+            self.fill(&xf, r, st.radius, Fill::Solid(Color::CLEAR), Some(b));
         }
         self.menu_nav.push(MenuNav { id, parent: self.layer.parent_menu, rows: nav, keys: self.layer.inside });
     }

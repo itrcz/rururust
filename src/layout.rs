@@ -150,6 +150,7 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
     let inner = (ow.map(|w| (w - pad_w).max(0.0)), oh.map(|h| (h - pad_h).max(0.0)));
 
     let mut node = LNode::default();
+    let mut hug_h = false;
     let content: (f32, f32) = match &v.kind {
         Kind::Empty | Kind::Spacer => (0.0, 0.0),
         Kind::Text(t) => {
@@ -288,7 +289,16 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
             let c = layout(child, (inner.0, None), lx, child_id(id, 0, child.key));
             node.shift = std::mem::replace(&mut lx.shift, outer);
             node.content_h = c.size.1;
-            let s = (inner.0.unwrap_or(c.size.0), inner.1.unwrap_or(c.size.1));
+            // A scroll fills what it is offered, except in height under a max limit: there it
+            // hugs the content up to the limit, then scrolls (a menu list "as tall as its
+            // rows, at most 320"). `.height()` still fixes it.
+            hug_h = !matches!(dim_h, Dim::Fixed(_)) && st.max.1.is_finite();
+            let h = match inner.1 {
+                Some(o) if hug_h => c.size.1.min(o),
+                Some(o) => o,
+                None => c.size.1,
+            };
+            let s = (inner.0.unwrap_or(c.size.0), h);
             node.children.push(c);
             s
         }
@@ -362,7 +372,7 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
     };
     node.size = (
         clamp_w(resolve(dim_w, prop.0, content.0 + pad_w)),
-        clamp_h(resolve(dim_h, prop.1, content.1 + pad_h)),
+        clamp_h(if hug_h { content.1 + pad_h } else { resolve(dim_h, prop.1, content.1 + pad_h) }),
     );
     // Children are placed in the size they were laid out for; an animated node then shows
     // only as much of it as its spring has reached.
