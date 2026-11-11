@@ -31,6 +31,36 @@ pub enum Titlebar {
     Overlay,
 }
 
+/// What shows through a window with [`App::blur`]: on macOS the system materials, the same
+/// ones native sidebars, HUDs and menus use (an `NSVisualEffectView` under the content, so the
+/// blur, the window's rounded corners and its shadow share one shape). Elsewhere every material
+/// is the platform's one blur. The app's [`background`](App::background) tints it from above;
+/// the material itself is drawn light or dark to match the theme.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Backdrop {
+    /// The sidebar of Finder or Mail: a light frost, the desktop's colours come through.
+    #[default]
+    Sidebar,
+    /// The material behind window content in system apps; more opaque than `Sidebar`.
+    UnderWindow,
+    /// The plain window background, nearly opaque.
+    Window,
+    /// Behind text and lists; nearly opaque.
+    Content,
+    Titlebar,
+    HeaderView,
+    Menu,
+    Popover,
+    Sheet,
+    /// Heads-up windows: dark and strongly blurred.
+    Hud,
+    FullScreenUi,
+    /// The legacy window-server blur with this radius in pt (what `with_blur` in winit sets, at
+    /// 80). Its corners are rounder than the window's on macOS 26+, so a sliver of unblurred
+    /// desktop shows in them (decision 006); prefer a material.
+    Blur(f32),
+}
+
 // AppKit's title bar is 28 pt tall; the traffic lights end at about 70 pt, plus a gap.
 #[cfg(target_os = "macos")]
 const MAC_TITLEBAR: f32 = 28.0;
@@ -44,8 +74,10 @@ pub struct App<S> {
     min_size: Option<(f32, f32)>,
     max_size: Option<(f32, f32)>,
     transparent: bool,
-    blur: bool,
+    backdrop: Option<Backdrop>,
     titlebar: Titlebar,
+    /// Height of the title bar strip the traffic lights are centred in (`titlebar_height`).
+    titlebar_height: Option<f32>,
     /// Light and dark theme to follow the system appearance with (`theme_auto`).
     auto: Option<(Theme, Theme)>,
 }
@@ -60,8 +92,9 @@ impl<S: 'static> App<S> {
             min_size: None,
             max_size: None,
             transparent: false,
-            blur: false,
+            backdrop: None,
             titlebar: Titlebar::Standard,
+            titlebar_height: None,
             auto: None,
         }
     }
@@ -122,18 +155,44 @@ impl<S: 'static> App<S> {
     }
 
     /// Blurs the desktop behind the window (implies [`transparent`](Self::transparent)).
-    /// macOS: the system window-background blur; Windows: acrylic / blur-behind where the OS has
-    /// it; Linux: KDE's blur protocol. Where the platform has none it is just transparent, so give
+    /// macOS: a system material ([`Backdrop::Sidebar`] unless [`backdrop`](Self::backdrop) picks
+    /// another); Windows: acrylic / blur-behind where the OS has it; Linux: KDE's blur protocol.
+    /// Where the platform has none it is just transparent, so give
     /// [`background`](Self::background) enough alpha to stay readable without it.
     pub fn blur(mut self, on: bool) -> Self {
-        self.blur = on;
+        self.backdrop = if on { Some(self.backdrop.unwrap_or_default()) } else { None };
         self.transparent |= on;
+        self
+    }
+
+    /// Blurs the desktop behind the window with this material (implies [`blur`](Self::blur)).
+    ///
+    /// ```no_run
+    /// # use ruru::prelude::*;
+    /// App::new((), |_: &(), _: &Env| text("hi")).backdrop(Backdrop::Hud).run();
+    /// ```
+    pub fn backdrop(mut self, b: Backdrop) -> Self {
+        self.backdrop = Some(b);
+        self.transparent = true;
         self
     }
 
     /// Who draws the title bar; see [`Titlebar`].
     pub fn titlebar(mut self, t: Titlebar) -> Self {
         self.titlebar = t;
+        self
+    }
+
+    /// A taller title bar of your own ([`Titlebar::Overlay`]): `h` pt, the traffic lights centred
+    /// in it and moved in from the edge to match, as in apps with a toolbar. [`Env::titlebar`]
+    /// is `h` and [`Env::window_buttons`] the width the lights take (both 0 in full screen).
+    /// macOS only; elsewhere both insets stay 0.
+    ///
+    /// [`Env::titlebar`]: crate::Env::titlebar
+    /// [`Env::window_buttons`]: crate::Env::window_buttons
+    pub fn titlebar_height(mut self, h: f32) -> Self {
+        self.titlebar = Titlebar::Overlay;
+        self.titlebar_height = Some(h.max(0.0));
         self
     }
 
@@ -168,6 +227,10 @@ impl<S: 'static> App<S> {
             transparent: false,
             clipboard: Clipboard::new(&event_loop),
             ime: (false, None),
+            #[cfg(target_os = "macos")]
+            chrome: None,
+            #[cfg(target_os = "macos")]
+            buttons: None,
         };
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -328,6 +391,12 @@ struct Runner<S> {
     clipboard: Clipboard,
     /// IME allowed, and the caret area last reported to it.
     ime: (bool, Option<crate::Rect>),
+    /// The backdrop view and the traffic lights' place.
+    #[cfg(target_os = "macos")]
+    chrome: Option<crate::macos::Chrome>,
+    /// Width of the traffic lights' zone as last placed (`titlebar_height`).
+    #[cfg(target_os = "macos")]
+    buttons: Option<f32>,
 }
 
 /// The system clipboard: `arboard` on desktops (feature `clipboard`), the browser's clipboard
@@ -610,8 +679,12 @@ impl<S: 'static> Runner<S> {
         #[cfg(target_os = "macos")]
         if self.app.titlebar == Titlebar::Overlay {
             let full = window.fullscreen().is_some();
-            ui.titlebar = if full { 0.0 } else { MAC_TITLEBAR };
-            ui.window_buttons = if full { 0.0 } else { MAC_BUTTONS };
+            ui.titlebar = if full { 0.0 } else { self.app.titlebar_height.unwrap_or(MAC_TITLEBAR) };
+            ui.window_buttons = if full { 0.0 } else { self.buttons.unwrap_or(MAC_BUTTONS) };
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(chrome) = &mut self.chrome {
+            chrome.set_dark(ui.clear_color().luminance() < 0.5);
         }
         let started = web_time::Instant::now();
         ui.scale = scale;
@@ -677,6 +750,16 @@ impl<S: 'static> Runner<S> {
         }
     }
 
+    /// AppKit lays the traffic lights out again on resize, full screen, key and appearance
+    /// changes: put them back after each (no polling).
+    #[cfg(target_os = "macos")]
+    fn place_buttons(&mut self, window: &Window) {
+        let (Some(h), Some(chrome)) = (self.app.titlebar_height, &mut self.chrome) else { return };
+        if window.fullscreen().is_none() {
+            self.buttons = chrome.place_buttons(window, h).or(self.buttons);
+        }
+    }
+
     fn scale(&self) -> f32 {
         self.window.as_ref().map_or(1.0, |w| w.scale_factor() as f32)
     }
@@ -733,8 +816,12 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
         let mut attrs = Window::default_attributes()
             .with_title(self.app.title.clone())
             .with_inner_size(LogicalSize::new(self.app.size.0 as f64, self.app.size.1 as f64))
-            .with_transparent(self.transparent)
-            .with_blur(self.app.blur && self.transparent);
+            .with_transparent(self.transparent);
+        // macOS puts its own backdrop under the content once the window exists.
+        #[cfg(not(target_os = "macos"))]
+        {
+            attrs = attrs.with_blur(self.app.backdrop.is_some() && self.transparent);
+        }
         if let Some((w, h)) = self.app.min_size {
             attrs = attrs.with_min_inner_size(LogicalSize::new(w as f64, h as f64));
         }
@@ -769,6 +856,13 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
                 win.request_redraw();
             });
         }
+        // Before the surface: its Metal layer then lands above the backdrop view.
+        #[cfg(target_os = "macos")]
+        {
+            let backdrop = self.app.backdrop.filter(|_| self.transparent);
+            self.chrome = Some(crate::macos::Chrome::new(&window, backdrop));
+            self.place_buttons(&window);
+        }
         #[cfg(not(target_arch = "wasm32"))]
         {
             *self.gfx.borrow_mut() = Some(pollster::block_on(init_gfx(window.clone(), self.transparent)));
@@ -780,6 +874,19 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        #[cfg(target_os = "macos")]
+        if matches!(
+            event,
+            WindowEvent::Resized(_)
+                | WindowEvent::ScaleFactorChanged { .. }
+                | WindowEvent::Focused(_)
+                | WindowEvent::ThemeChanged(_)
+                | WindowEvent::Occluded(false)
+        ) {
+            if let Some(w) = self.window.clone() {
+                self.place_buttons(&w);
+            }
+        }
         let scale = self.scale();
         let ui = &mut self.app.ui;
         let dirty = match event {

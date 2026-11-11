@@ -3192,3 +3192,83 @@ fn split_toggled_by_state_glides_and_trailing_panel_sits_right() {
     settle_split(&mut ui);
     assert_eq!(quads(&ui, MAIN)[0], [0.0, 0.0, 800.0, 400.0]);
 }
+
+/// Frames of a menu growing in at 120 Hz until it rests: per frame, each text's
+/// `(x, y, scale)` (device pixels) and the icon's rect (device pixels).
+fn menu_text_frames(scale: f32) -> Vec<(Vec<(f32, f32, f32)>, [f32; 4])> {
+    let img = Image::from_rgba(2, 2, vec![255; 16]);
+    let mut ui = Ui::new(false, move |s: &bool| {
+        let items = vec![
+            MenuItem::action("Paste", |_: &mut bool| {}).icon(&img),
+            MenuItem::action("Bold", |_: &mut bool| {}).checked(true),
+        ];
+        rect()
+            .size(31.3, 17.7)
+            .popover(*s, Placement::bottom().gap(5.3), |s: &mut bool| *s = false, menu(items))
+            .padding_ltrb(37.3, 21.7, 0.0, 0.0)
+            .place(Align::Start, Align::Start)
+    });
+    ui.scale = scale;
+    ui.frame((401.0, 303.0));
+    ui.state = true;
+    let mut seen = Vec::new();
+    for _ in 0..400 {
+        std::thread::sleep(std::time::Duration::from_millis(8));
+        ui.frame((401.0, 303.0));
+        let icon = ui.list.cmds.iter().find_map(|c| match c {
+            ruru::Cmd::Quad(q) if q.p0[3] == 3.0 => Some(q.rect.map(|v| v * scale)),
+            _ => None,
+        });
+        let t: Vec<_> = texts(&ui).iter().map(|t| (t.pos.0 * scale, t.pos.1 * scale, t.scale)).collect();
+        if let Some(icon) = icon {
+            seen.push((t, icon));
+        }
+        if !ui.animating {
+            break;
+        }
+    }
+    seen
+}
+
+/// Text in a growing menu ends where it rests without a last-frame jump: glyphon puts glyph
+/// rows on whole pixels (it truncates `top`), so the painter must hand it whole-pixel rows
+/// or text approaching from above its resting row sits a pixel short until the very end.
+#[test]
+fn menu_text_and_icon_settle_without_a_jump() {
+    for scale in [1.0, 2.0] {
+        let seen = menu_text_frames(scale);
+        let n = seen.len();
+        assert!(n > 8, "animated, {n} frames");
+        let (rest, rest_icon) = &seen[n - 1];
+        assert_eq!(rest.len(), 3, "icon row label, check mark, label");
+        for (f, (t, icon)) in seen.iter().enumerate() {
+            for (i, &(x, y, k)) in t.iter().enumerate() {
+                // What glyphon draws: rows on truncated pixels, glyphs at the quantized scale.
+                let row = (y + 1e-3).trunc();
+                let (rx, ry, _) = rest[i];
+                // Measured from the icon, which moves smoothly: never more than half a pixel
+                // from where the text sits next to it at rest.
+                let (dx, dy) = (x - icon[0] - (rx - rest_icon[0]), row - icon[1] - (ry - rest_icon[1]));
+                if f + 7 >= n {
+                    assert!(dy.abs() <= 0.5 + 1e-3 && dx.abs() < 0.5, "scale {scale}: text {i} off the icon by ({dx}, {dy}) at frame {f} of {n}");
+                    assert_eq!(k, 1.0, "scale {scale}: text {i} rasterized at {k} near the end");
+                }
+            }
+        }
+        // The last animated frame is the resting one, give or take a fraction of a pixel.
+        for (a, b) in seen[n - 2].0.iter().zip(rest) {
+            assert!((a.0 - b.0).abs() < 0.5 && a.1 == b.1, "scale {scale}: last step {a:?} -> {b:?}");
+        }
+        for w in seen[n - 7..].windows(2) {
+            for (a, b) in w[0].0.iter().zip(&w[1].0) {
+                assert!((b.0 - a.0).abs() < 0.5 && (b.1 - a.1).abs() < 0.5, "scale {scale}: step {a:?} -> {b:?}");
+            }
+        }
+        // The painter hands over whole-pixel rows, so the list says where glyphs land.
+        for (f, (t, _)) in seen.iter().enumerate() {
+            for (i, &(_, y, _)) in t.iter().enumerate() {
+                assert!((y - y.round()).abs() < 1e-3, "scale {scale}: text {i} row off the pixel grid at frame {f}: {y}");
+            }
+        }
+    }
+}

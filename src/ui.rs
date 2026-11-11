@@ -489,6 +489,12 @@ pub(crate) fn snap(v: f32, px: f32) -> f32 {
     (v * px + 0.5).floor() / px
 }
 
+/// The scale text is rasterized at for a view scaled by `s`: steps of 1/16, so an animation
+/// rasterizes each glyph at a couple of sizes rather than at a new one every frame.
+pub(crate) fn text_scale(s: f32) -> f32 {
+    (s * 16.0).round() / 16.0
+}
+
 /// Both edges of `r` on the pixel grid. A hairline (half a pixel or more) that would
 /// round away stays one pixel thick, centered where it was; anything thinner (a panel
 /// collapsing to nothing) is let go, so it meets its neighbour.
@@ -530,6 +536,24 @@ impl Xf {
             px if px > 0.0 => (snap(p.0, px), snap(p.1, px)),
             _ => p,
         }
+    }
+    /// Where text whose box starts at the local point `p` (from [`at_px`](Self::at_px)) and is
+    /// `size` big goes on screen, and the scale its glyphs are rasterized at.
+    ///
+    /// The scale is quantized to 1/16 (each new size rasterizes every glyph again and floods
+    /// the atlas), so the glyphs are a little bigger or smaller than the scaled box; the
+    /// difference is split around the box's center, which keeps text where the quads around
+    /// it are and halves the step when the quantized scale changes. Glyphon truncates the
+    /// glyph row to whole pixels, so a row a hair above its resting one would be drawn a
+    /// pixel short until the scale reached 1; the row is rounded here instead, and the list
+    /// says where the glyphs land. At rest (`s` = 1) this is `p` itself.
+    fn text_at(&self, p: (f32, f32), size: (f32, f32)) -> ((f32, f32), f32) {
+        let k = text_scale(self.s);
+        let d = (self.s - k) * 0.5;
+        let x = p.0 * self.s + self.tx + size.0 * d;
+        let y = p.1 * self.s + self.ty + size.1 * d;
+        let y = if self.px > 0.0 { (y * self.px).round() / self.px } else { y };
+        ((x, y), k)
     }
     /// A border width `w` (points) on screen: never thinner than one device pixel, and a
     /// whole number of them while it is thin, so a hairline is one solid row of pixels.
@@ -734,12 +758,12 @@ impl<S> Painter<'_, S> {
     }
 
     fn label(&mut self, xf: &Xf, key: u64, pos: (f32, f32), size: (f32, f32), color: Color) {
-        let pos = xf.at_px(pos);
+        let (pos, scale) = xf.text_at(xf.at_px(pos), size);
         self.list.cmds.push(Cmd::Text(TextCmd {
             key,
-            pos: (pos.0 * xf.s + xf.tx, pos.1 * xf.s + xf.ty),
+            pos,
             size: (size.0 * xf.s, size.1 * xf.s),
-            scale: xf.s,
+            scale,
             color: color.alpha(color.a * xf.opacity),
             clip: xf.clip,
             fade: None,
@@ -1293,11 +1317,12 @@ impl<S> Painter<'_, S> {
                 dxf.clip = clip;
                 self.text_extras(&dxf, id, ln.text, &t.spans, &t.content, (inner.x, inner.y), (inner.w, inner.h), tbase);
                 self.span_decor(&dxf, ln.text, &t.spans, (inner.x, inner.y));
+                let (pos, scale) = xf.text_at(at, (inner.w, inner.h));
                 self.list.cmds.push(Cmd::Text(TextCmd {
                     key: ln.text,
-                    pos: (box_.x, box_.y),
+                    pos,
                     size: (box_.w, box_.h),
-                    scale: xf.s,
+                    scale,
                     color: xf.fg.alpha(xf.fg.a * xf.opacity),
                     clip,
                     fade,

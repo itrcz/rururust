@@ -33,6 +33,7 @@ cargo check --no-default-features --features "<набор>" --lib  # прове�
 | `src/popup.rs` | слои поверх дерева (подмодуль `ui`): поповеры, меню с подменю и клавиатурой, контекстное меню, тултипы; `Placement`, `MenuStyle`, шорткаты |
 | `src/task.rs` | канал «фон → состояние»: `Link`, `Task`, `spawn`, `sleep`, `Ui::pump` |
 | `src/app.rs` | winit: окно, события, пробуждения; единственное место, знающее про платформу |
+| `src/macos.rs` | AppKit, чего нет в winit: подложка `NSVisualEffectView`, место светофора; вызывается только из `app.rs` |
 | `src/markdown.rs`, `src/headless.rs` | под фичами `markdown`, `headless` |
 
 Поток кадра: `state → view(&S, &Env) → layout → paint → DrawList → Renderer`. Обработчики — `Fn(&mut S)`.
@@ -121,6 +122,9 @@ API `wgpu 30`, `glyphon 0.12`, `cosmic-text 0.19`, `winit 0.30` заметно �
 ## Стиль
 
 - Комментарий объясняет «почему», а не «что». Публичный API — с doc-комментарием и примером, если неочевидно.
-- Без `unsafe`, без `unwrap()` на пользовательских данных (decode, svg, markdown возвращают `Result` или деградируют).
+- Без `unsafe` — с одним исключением: `src/macos.rs` (`cfg(target_os = "macos")`, фича `app`), вызовы
+  AppKit через `objc2` тех версий, что уже тянет winit. Каждый блок — с `// SAFETY:`. Новый `unsafe`
+  в другом файле или другая платформа — только отдельным решением в `docs/decisions/`.
+- Без `unwrap()` на пользовательских данных (decode, svg, markdown возвращают `Result` или деградируют).
 - Имена виджетов и модификаторов — короткие, как в SwiftUI; новый модификатор не должен дублировать существующий.
 - Отвечай пользователю по-русски.
