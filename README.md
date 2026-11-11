@@ -158,6 +158,14 @@ ruru = { version = "0.1", default-features = false, features = ["app"] }        
 `SetClipboard(текст)`, `OpenUrl(url)`); `ime_area()` — где показать окно IME. Фича `clipboard` (по умолчанию) —
 системный буфер на десктопе через `arboard` (+18 КБ к бинарнику); без неё буфер внутренний.
 
+Размер. wgpu подключён без своих фич по умолчанию: только фронтенд WGSL и бэкенды платформы — Metal на
+macOS/iOS, DX12 + Vulkan на Windows, Vulkan + GLES на Linux/Android, WebGPU (+ WebGL2 с фичей `webgl`)
+в браузере. Профиль релиза — `lto = "fat"`, `codegen-units = 1`, `strip = true`: showcase ≈ 7,4 МБ
+нативно, wasm ≈ 7,9 МБ (≈ 2,9 МБ gzip). Делайте так же в своём приложении — fat LTO против thin
+даёт −23%, `opt-level = "s"` ещё −16% ценой скорости. Минимальная сборка — `default-features = false`
+и только нужное из `app`/`renderer`, `decode`, `svg` (≈ 0,4 МБ: usvg + tiny-skia), `markdown`
+(≈ 0,1 МБ кода + моноширинный шрифт), `headless`, `webgl` (≈ 1 МБ wasm), `clipboard`.
+
 ## Как устроено
 
 | Файл | Что делает |
