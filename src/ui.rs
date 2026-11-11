@@ -458,7 +458,7 @@ pub(crate) fn snap(v: f32, px: f32) -> f32 {
 pub(crate) fn snap_rect(r: Rect, px: f32) -> Rect {
     let axis = |a: f32, len: f32| {
         let (mut lo, mut hi) = (snap(a, px), snap(a + len, px));
-        if len * px >= 0.499 && hi - lo < 0.5 / px {
+        if len * px >= 0.5 && hi - lo < 0.5 / px {
             lo = snap(a + len * 0.5 - 0.5 / px, px);
             hi = lo + 1.0 / px;
         }
@@ -473,41 +473,36 @@ impl Xf {
     fn rect(&self, r: Rect) -> Rect {
         Rect::new(r.x * self.s + self.tx, r.y * self.s + self.ty, r.w * self.s, r.h * self.s)
     }
-    /// Pixels per point when this transform snaps: not while it scales (press, pop-in), where
-    /// whole-pixel steps would make the size judder.
-    fn grid(&self) -> f32 {
-        if self.px > 0.0 && (self.s - 1.0).abs() < 1e-4 { self.px } else { 0.0 }
-    }
-    /// Screen rect of `r` with its edges on device pixels: crisp edges and hairlines, and
-    /// neighbours that share an edge still meet.
+    // Snapping happens in local points, before the transform. The translation only ever comes
+    // from scaling about a point (press, pop-in), so at rest (`s` = 1) local points are screen
+    // points: a scaled view is its resting, snapped self, scaled. An animation that ends at
+    // `s` = 1 therefore lands exactly on the snapped rect instead of jumping to it.
+
+    /// Screen rect of `r` with its edges on device pixels at rest: crisp edges and hairlines,
+    /// and neighbours that share an edge still meet.
     fn rect_px(&self, r: Rect) -> Rect {
-        let sr = self.rect(r);
-        match self.grid() {
-            0.0 => sr,
-            px => snap_rect(sr, px),
+        match self.px {
+            px if px > 0.0 => self.rect(snap_rect(r, px)),
+            _ => self.rect(r),
         }
     }
-    /// The local point nearest to `p` that lands on a device pixel. Text and whatever is
-    /// drawn relative to it (plates, selection) start here, so they move together.
+    /// The local point nearest to `p` that lands on a device pixel at rest. Text and whatever
+    /// is drawn relative to it (plates, selection) start here, so they move together.
     fn at_px(&self, p: (f32, f32)) -> (f32, f32) {
-        match self.grid() {
-            0.0 => p,
-            px => {
-                let (x, y) = (p.0 * self.s + self.tx, p.1 * self.s + self.ty);
-                (p.0 + (snap(x, px) - x) / self.s, p.1 + (snap(y, px) - y) / self.s)
-            }
+        match self.px {
+            px if px > 0.0 => (snap(p.0, px), snap(p.1, px)),
+            _ => p,
         }
     }
     /// A border width `w` (points) on screen: never thinner than one device pixel, and a
     /// whole number of them while it is thin, so a hairline is one solid row of pixels.
     fn line(&self, w: f32) -> f32 {
-        let sw = w * self.s;
         if self.px <= 0.0 || w <= 0.0 {
-            return sw;
+            return w * self.s;
         }
-        let d = sw * self.px;
-        let d = if self.grid() > 0.0 && d <= 1.5 { (d - 0.01).round() } else { d };
-        d.max(1.0) / self.px
+        let d = w * self.px;
+        let d = if d <= 1.5 { (d - 0.01).round() } else { d };
+        d.max(1.0) / self.px * self.s
     }
     /// Narrows the clip to the screen rect `r` with corner radius `radius`. The GPU clips to
     /// one rounded rectangle, so nested clips keep the corners of whichever is inside.

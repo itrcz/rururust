@@ -2279,6 +2279,80 @@ fn animate_snaps_without_size_judder() {
     assert_eq!(*widths.last().unwrap(), 0.0);
 }
 
+/// Frames of `ui` until it is still, recording the first quad of `color` each frame.
+fn track<T: 'static>(ui: &mut Ui<T>, size: (f32, f32), color: Color) -> Vec<[f32; 4]> {
+    let mut seen = Vec::new();
+    for _ in 0..400 {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        ui.frame(size);
+        if let Some(q) = quads(ui, color).first() {
+            seen.push(*q);
+        }
+        if !ui.animating {
+            break;
+        }
+    }
+    seen
+}
+
+/// The frames of a scale-in end exactly on the snapped rect: once an edge is within a pixel
+/// of where it rests, it only takes steps of a fraction of a pixel (no jump to the grid when
+/// the scale reaches 1). Without overshoot (`one_way`) every edge also moves only one way.
+fn assert_lands_on_grid(seen: &[[f32; 4]], scale: f32, one_way: bool, what: &str) {
+    assert!(seen.len() > 5, "{what}: animated, {} frames", seen.len());
+    let last = *seen.last().unwrap();
+    assert!(last.iter().all(|&v| on_grid(v, scale)), "{what}: rests on the grid {last:?}");
+    for c in 0..4 {
+        let v: Vec<f32> = seen.iter().map(|q| q[c] * scale).collect();
+        let end = *v.last().unwrap();
+        let near = v.iter().position(|x| (x - end).abs() < 1.0).unwrap();
+        assert!(v[near..].windows(2).all(|p| (p[1] - p[0]).abs() < 0.5), "{what}: edge {c} jumps near the end {v:?}");
+        let steps: Vec<f32> = v.windows(2).map(|p| p[1] - p[0]).filter(|d| d.abs() > 1e-4).collect();
+        assert!(!one_way || steps.iter().all(|d| d.signum() == steps[0].signum()), "{what}: edge {c} turns back {v:?}");
+    }
+}
+
+#[test]
+fn popover_modal_and_press_settle_without_a_snap_jump() {
+    const PANEL: Color = Color::hex(0x336699);
+    const DIALOG: Color = Color::hex(0x663399);
+    const KEY: Color = Color::hex(0x996633);
+    // Everything sits off the pixel grid, so snapping has something to do at the end.
+    let mut ui = Ui::new((false, false), |s: &(bool, bool)| {
+        zstack((
+            rect()
+                .size(31.3, 17.7)
+                .popover(s.0, Placement::bottom().gap(5.3), |s: &mut (bool, bool)| s.0 = false, rect().size(120.3, 40.7).background(PANEL))
+                .padding_ltrb(37.3, 21.7, 0.0, 0.0)
+                .place(Align::Start, Align::Start),
+            rect().size(90.3, 30.6).background(KEY).on_tap(|_: &mut (bool, bool)| {}).padding_ltrb(0.0, 0.0, 13.3, 11.7).place(Align::End, Align::End),
+            modal(s.1, |s: &mut (bool, bool)| s.1 = false, rect().size(150.3, 70.9).background(DIALOG)),
+        ))
+        .fill()
+    });
+    let size = (401.0, 303.0);
+    for scale in [1.5, 2.0] {
+        ui.scale = scale;
+        ui.state = (false, false);
+        track(&mut ui, size, PANEL);
+        ui.state.0 = true;
+        assert_lands_on_grid(&track(&mut ui, size, PANEL), scale, true, "popover");
+        ui.state = (false, false);
+        track(&mut ui, size, PANEL);
+        ui.state.1 = true;
+        assert_lands_on_grid(&track(&mut ui, size, DIALOG), scale, false, "modal");
+        ui.state = (false, false);
+        track(&mut ui, size, DIALOG);
+        // A pressed button shrinks a little; let go, it grows back onto the grid.
+        let k = quads(&ui, KEY)[0];
+        let at = (k[0] + 10.0, k[1] + 10.0);
+        ui.pointer_down(at, false);
+        track(&mut ui, size, KEY);
+        ui.pointer_up(at);
+        assert_lands_on_grid(&track(&mut ui, size, KEY), scale, true, "press");
+    }
+}
+
 fn clipped_menu_view(s: &M) -> View<M> {
     let items = || {
         vec![
