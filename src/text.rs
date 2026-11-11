@@ -2,8 +2,8 @@
 
 use crate::view::Span;
 use cosmic_text::{
-    fontdb, Align as TextAlign, Attrs, Buffer, CacheKeyFlags, Color as TextColor, Ellipsize, EllipsizeHeightLimit,
-    Family, FontSystem, Metrics, Shaping, Weight,
+    fontdb, Align as TextAlign, Attrs, AttrsList, Buffer, BufferLine, CacheKeyFlags, Color as TextColor, Ellipsize,
+    EllipsizeHeightLimit, Family, FontSystem, LayoutLine, LineEnding, Metrics, ShapeBuffer, Shaping, Weight,
 };
 use crate::types::Rect;
 use std::collections::HashMap;
@@ -26,20 +26,91 @@ pub(crate) struct ListCache {
     pub anchor: usize,
 }
 
-pub(crate) struct Entry {
-    pub buffer: Buffer,
-    pub size: (f32, f32),
-    /// Byte offset of each buffer line (paragraph) in the source text.
-    starts: Vec<usize>,
+/// How a shaped text is laid out: wrap width, line limit (with "…") and centering.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Variant {
+    width: Option<f32>,
+    lines: usize,
+    center: bool,
+}
+
+const NATURAL: Variant = Variant { width: None, lines: 0, center: false };
+
+/// One laid-out copy of a text. The first copy of an entry owns the shaping; more copies
+/// appear only when the same text is shown at several widths within one frame.
+struct Layout {
+    buffer: Buffer,
+    /// What the buffer is set up for.
+    variant: Variant,
+    /// Laid out and measured for its current lines.
+    ready: bool,
+    size: (f32, f32),
+    glyphs: usize,
     used: u64,
 }
 
+/// A text shaped once. Keyed by content and style, not by width: a new width only re-wraps.
+pub(crate) struct Entry {
+    layouts: Vec<Layout>,
+    /// Byte offset of each buffer line (paragraph) in the source text.
+    starts: Vec<usize>,
+    /// Unwrapped width and height of each buffer line, filled lazily.
+    line_nat: Vec<Option<(f32, f32)>>,
+    natural: Option<(f32, f32)>,
+    line_h: f32,
+    used: u64,
+}
+
+impl Entry {
+    fn bytes(&self) -> usize {
+        let glyphs = self.layouts.iter().map(|l| l.glyphs).max().unwrap_or(0);
+        let text = self.starts.last().copied().unwrap_or(0);
+        glyphs * (std::mem::size_of::<cosmic_text::ShapeGlyph>() + self.layouts.len() * std::mem::size_of::<cosmic_text::LayoutGlyph>())
+            + text * self.layouts.len()
+            + self.starts.len() * 256
+            + 512
+    }
+}
+
+/// A view of one laid-out text, what `hit`, `caret` and friends read.
+struct Shaped<'a> {
+    buffer: &'a Buffer,
+    starts: &'a [usize],
+    size: (f32, f32),
+}
+
+/// Read-only access to laid-out texts while the font system is borrowed for drawing.
+#[cfg(feature = "renderer")]
+pub(crate) struct Buffers<'a>(&'a HashMap<u64, Entry>);
+
+#[cfg(feature = "renderer")]
+impl<'a> Buffers<'a> {
+    pub(crate) fn get(&self, key: u64) -> Option<&'a Buffer> {
+        let (k, slot) = split_key(key);
+        self.0.get(&k)?.layouts.get(slot).map(|l| &l.buffer)
+    }
+}
+
+/// Up to this many layouts of one text live at once (see [`Entry`]).
+const MAX_LAYOUTS: usize = 4;
+/// Shaped text kept between frames, by estimated bytes. Over it, the least recently used
+/// texts go first, down to 3/4 of it; texts of the last frame are never dropped.
+const CACHE_BUDGET: usize = 48 << 20;
+
 pub struct TextSystem {
     pub(crate) fonts: FontSystem,
-    pub(crate) entries: HashMap<u64, Entry>,
+    entries: HashMap<u64, Entry>,
+    /// Which entry a text node showed last time: lets growing text reuse its shaping.
+    owners: HashMap<u64, u64>,
+    /// Lines of the new text are built here, then only changed ones move into the entry.
+    staging: Buffer,
+    scratch: ShapeBuffer,
+    scratch_lines: Vec<LayoutLine>,
     /// Layout cache that has to survive between frames: lazy-list row heights by list id.
     pub(crate) lists: HashMap<u64, ListCache>,
     frame: u64,
+    /// Bytes of shaped text kept between frames, [`CACHE_BUDGET`] unless a test lowers it.
+    budget: usize,
 }
 
 /// Default line height, as a multiple of the font size.
@@ -64,11 +135,14 @@ pub(crate) struct TextSpec<'a> {
     pub line_height: f32,
     /// Letter spacing in em.
     pub tracking: f32,
+    /// Id of the node showing the text, 0 if none. When its text changes (streaming,
+    /// typing), the previous shaping is reused for the paragraphs that stayed the same.
+    pub owner: u64,
 }
 
 impl Default for TextSpec<'_> {
     fn default() -> Self {
-        TextSpec { spans: &[], text: "", size: 17.0, weight: 400, center: false, line_height: LINE_HEIGHT, tracking: 0.0 }
+        TextSpec { spans: &[], text: "", size: 17.0, weight: 400, center: false, line_height: LINE_HEIGHT, tracking: 0.0, owner: 0 }
     }
 }
 
@@ -87,6 +161,50 @@ pub(crate) struct SpanBox {
     /// Baseline of the row.
     pub baseline: f32,
     pub size: f32,
+}
+
+/// Low bits of a text key pick the layout within its entry.
+const SLOT_BITS: u64 = 3;
+
+fn split_key(key: u64) -> (u64, usize) {
+    (key & !SLOT_BITS, (key & SLOT_BITS) as usize)
+}
+
+/// Lays `buffer` out as `v` describes. Shaping is kept: only wrapping is redone, and only
+/// for lines that changed if the width is the same.
+fn apply(fonts: &mut FontSystem, buffer: &mut Buffer, v: Variant) {
+    buffer.set_size(v.width, None);
+    let lines = if v.lines > 0 && v.width.is_some() { v.lines } else { 0 };
+    buffer.set_ellipsize(if lines > 0 { Ellipsize::End(EllipsizeHeightLimit::Lines(lines)) } else { Ellipsize::None });
+    let align = (v.center && v.width.is_some()).then_some(TextAlign::Center);
+    for l in &mut buffer.lines {
+        l.set_align(align);
+    }
+    buffer.shape_until_scroll(fonts, false);
+    // Lines that were never shaped are not "invalidated", so the call above can skip them.
+    for i in 0..buffer.lines.len() {
+        buffer.line_layout(fonts, i);
+    }
+}
+
+impl Layout {
+    fn measure(&mut self, v: Variant, line_h: f32) {
+        let (mut w, mut h, mut n) = (0.0f32, 0.0f32, 0);
+        for run in self.buffer.layout_runs() {
+            w = w.max(run.line_w);
+            h = h.max(run.line_top + run.line_height);
+            n += run.glyphs.len();
+        }
+        // A centered, wrapped block occupies its full wrap width.
+        let w = match v.width {
+            Some(width) if v.center => width,
+            _ => w.ceil(),
+        };
+        self.size = (w, if h > 0.0 { h } else { line_h });
+        self.glyphs = n;
+        self.variant = v;
+        self.ready = true;
+    }
 }
 
 impl TextSystem {
@@ -109,10 +227,22 @@ impl TextSystem {
             fonts.db_mut().load_font_source(fontdb::Source::Binary(std::sync::Arc::new(MONO)));
             fonts.db_mut().set_monospace_family("JetBrains Mono");
         }
-        TextSystem { fonts, entries: HashMap::new(), lists: HashMap::new(), frame: 0 }
+        TextSystem {
+            fonts,
+            entries: HashMap::new(),
+            owners: HashMap::new(),
+            staging: Buffer::new_empty(Metrics::new(17.0, 22.0)),
+            scratch: ShapeBuffer::default(),
+            scratch_lines: Vec::new(),
+            lists: HashMap::new(),
+            // Starts at 1: a layout with `used == 0` was never handed out.
+            frame: 1,
+            budget: CACHE_BUDGET,
+        }
     }
 
-    fn key(spec: &TextSpec, width: Option<f32>, ellipsis: usize) -> u64 {
+    /// Content and style, not width: one entry serves every width the text is shown at.
+    fn key(spec: &TextSpec) -> u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         spec.text.hash(&mut h);
         for s in spec.spans {
@@ -124,34 +254,45 @@ impl TextSystem {
         spec.size.to_bits().hash(&mut h);
         (spec.line_height.to_bits(), spec.tracking.to_bits()).hash(&mut h);
         spec.weight.hash(&mut h);
-        spec.center.hash(&mut h);
-        width.map(f32::to_bits).hash(&mut h);
-        ellipsis.hash(&mut h);
-        h.finish()
+        h.finish() & !SLOT_BITS
     }
 
-    /// Shapes (or finds) the text wrapped at `width`; `ellipsis` > 0 cuts it to that many
-    /// lines ending with "…".
-    fn entry(&mut self, spec: &TextSpec, width: Option<f32>, ellipsis: usize) -> (u64, (f32, f32)) {
-        let key = Self::key(spec, width, ellipsis);
+    /// Finds the entry for the text, or shapes it. A text that replaced the one its node
+    /// showed before (streaming, typing) takes over that entry and reshapes only the
+    /// paragraphs that differ.
+    fn shape(&mut self, spec: &TextSpec) -> u64 {
+        let key = Self::key(spec);
         let frame = self.frame;
         if let Some(e) = self.entries.get_mut(&key) {
             e.used = frame;
-            return (key, e.size);
+            return key;
         }
         let line_h = spec.line_h();
-        let mut buffer = Buffer::new(&mut self.fonts, Metrics::new(spec.size, line_h));
-        buffer.set_size(width, None);
-        if ellipsis > 0 && width.is_some() {
-            buffer.set_ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(ellipsis)));
+        let metrics = Metrics::new(spec.size, line_h);
+        // The old entry is reused only if nothing drew from it this frame.
+        let prev = match self.owners.get(&spec.owner) {
+            Some(&k) if spec.owner != 0 && self.entries.get(&k).is_some_and(|e| e.used < frame) => self.entries.remove(&k),
+            _ => None,
+        };
+        let (mut buffer, mut line_nat, prev_variant) = match prev {
+            Some(mut e) => {
+                let l = e.layouts.swap_remove(0);
+                (l.buffer, std::mem::take(&mut e.line_nat), Some(l.variant))
+            }
+            None => (Buffer::new_empty(metrics), Vec::new(), None),
+        };
+        if buffer.metrics() != metrics {
+            // Kept lines keep their shaping, but their unwrapped size scales with the font.
+            line_nat.clear();
+            buffer.set_metrics(metrics);
         }
+
         let mut attrs = Attrs::new().family(Family::SansSerif).weight(Weight(spec.weight));
         if spec.tracking != 0.0 {
             attrs = attrs.letter_spacing(spec.tracking);
         }
-        let align = (spec.center && width.is_some()).then_some(TextAlign::Center);
         let starts = if spec.spans.is_empty() {
-            buffer.set_text(spec.text, &attrs, Shaping::Advanced, align);
+            self.staging.set_text(spec.text, &attrs, Shaping::Advanced, None);
             line_starts(spec.text)
         } else {
             let mut runs: Vec<(&str, Attrs)> = Vec::with_capacity(spec.spans.len());
@@ -195,26 +336,135 @@ impl TextSystem {
                 }
                 runs.push((s.text.as_str(), a));
             }
-            let starts = line_starts(&shaped_text(spec.spans, ""));
-            buffer.set_rich_text(runs, &attrs, Shaping::Advanced, align);
-            starts
+            self.staging.set_rich_text(runs, &attrs, Shaping::Advanced, None);
+            line_starts(&shaped_text(spec.spans, ""))
         };
-        buffer.shape_until_scroll(&mut self.fonts, false);
-        let (mut w, mut h) = (0.0f32, 0.0f32);
-        for run in buffer.layout_runs() {
-            w = w.max(run.line_w);
-            h = h.max(run.line_top + run.line_height);
+
+        // Keep the lines (paragraphs) that did not change, with their shaping; take the
+        // rest from staging, whose old lines lend their allocations to the next text.
+        let new = &mut self.staging.lines;
+        line_nat.resize(new.len(), None);
+        for (i, line) in new.iter_mut().enumerate() {
+            match buffer.lines.get_mut(i) {
+                Some(old) if old.text() == line.text() && old.ending() == line.ending() && old.attrs_list() == line.attrs_list() => {}
+                Some(old) => {
+                    std::mem::swap(old, line);
+                    line_nat[i] = None;
+                }
+                None => {
+                    let fresh = BufferLine::new(String::new(), LineEnding::None, AttrsList::new(&attrs), Shaping::Advanced);
+                    buffer.lines.push(std::mem::replace(line, fresh));
+                    line_nat[i] = None;
+                }
+            }
         }
-        // A centered, wrapped block occupies its full wrap width.
-        let w = if align.is_some() { width.unwrap() } else { w.ceil() };
-        let size = (w, if h > 0.0 { h } else { line_h });
-        self.entries.insert(key, Entry { buffer, size, starts, used: frame });
-        (key, size)
+        buffer.lines.truncate(new.len());
+
+        // A reused buffer keeps its wrap width, so unchanged lines keep their layout too.
+        let variant = prev_variant.unwrap_or(NATURAL);
+        let layout = Layout { buffer, variant, ready: false, size: (0.0, 0.0), glyphs: 0, used: 0 };
+        let e = Entry { layouts: vec![layout], starts, line_nat, natural: None, line_h, used: frame };
+        self.entries.insert(key, e);
+        if spec.owner != 0 {
+            self.owners.insert(spec.owner, key);
+        }
+        key
+    }
+
+    /// Size of the text without wrapping. Lines keep their own natural size, so a changed
+    /// paragraph does not make the others lay out again.
+    fn natural(&mut self, key: u64) -> (f32, f32) {
+        let Some(e) = self.entries.get_mut(&key) else { return (0.0, 0.0) };
+        if let Some(n) = e.natural {
+            return n;
+        }
+        let main = &mut e.layouts[0];
+        // Laid out unwrapped anyway (most short labels): read the lines from there.
+        let direct = main.variant == NATURAL;
+        if direct && !main.ready {
+            apply(&mut self.fonts, &mut main.buffer, NATURAL);
+            main.measure(NATURAL, e.line_h);
+        }
+        let b = &mut main.buffer;
+        let line_height = b.metrics().line_height;
+        let (mut w, mut h) = (0.0f32, 0.0f32);
+        for i in 0..b.lines.len() {
+            let (lw, lh) = match e.line_nat[i] {
+                Some(n) => n,
+                None => {
+                    let n = if direct {
+                        let ll = b.lines[i].layout_opt().map_or(&[][..], |v| v.as_slice());
+                        line_size(ll, line_height)
+                    } else {
+                        let (size, wrap, mono, hinting) = (b.metrics().font_size, b.wrap(), b.monospace_width(), b.hinting());
+                        let Some(shape) = b.line_shape(&mut self.fonts, i) else { continue };
+                        shape.layout_to_buffer(&mut self.scratch, size, None, wrap, Ellipsize::None, None, &mut self.scratch_lines, mono, hinting);
+                        line_size(&self.scratch_lines, line_height)
+                    };
+                    e.line_nat[i] = Some(n);
+                    n
+                }
+            };
+            w = w.max(lw);
+            h += lh;
+        }
+        let n = (w.ceil(), if h > 0.0 { h } else { e.line_h });
+        e.natural = Some(n);
+        n
+    }
+
+    /// The layout of entry `key` as `v`, made if needed; returns its key and size.
+    /// A layout drawn from this frame is never re-wrapped, so two places showing the same
+    /// text at different widths each get their own copy.
+    fn layout(&mut self, key: u64, v: Variant) -> (u64, (f32, f32)) {
+        let frame = self.frame;
+        let Some(e) = self.entries.get_mut(&key) else { return (key, (0.0, 0.0)) };
+        let ls = &mut e.layouts;
+        let slot = match ls.iter().position(|l| l.variant == v) {
+            Some(i) if ls[i].ready => i,
+            Some(i) => {
+                apply(&mut self.fonts, &mut ls[i].buffer, v);
+                ls[i].measure(v, e.line_h);
+                i
+            }
+            None => {
+                let free = (0..ls.len()).filter(|&i| ls[i].used < frame || !ls[i].ready).min_by_key(|&i| ls[i].used);
+                let i = match free {
+                    Some(i) => i,
+                    None if ls.len() < MAX_LAYOUTS => {
+                        let buffer = ls[0].buffer.clone();
+                        ls.push(Layout { buffer, variant: ls[0].variant, ready: false, size: (0.0, 0.0), glyphs: 0, used: 0 });
+                        ls.len() - 1
+                    }
+                    // Out of copies: re-wrap the oldest even if it is drawn this frame.
+                    None => (0..ls.len()).min_by_key(|&i| ls[i].used).unwrap_or(0),
+                };
+                apply(&mut self.fonts, &mut ls[i].buffer, v);
+                ls[i].measure(v, e.line_h);
+                i
+            }
+        };
+        let l = &mut e.layouts[slot];
+        l.used = frame;
+        (key | slot as u64, l.size)
+    }
+
+    fn get(&self, key: u64) -> Option<Shaped<'_>> {
+        let (k, slot) = split_key(key);
+        let e = self.entries.get(&k)?;
+        let l = e.layouts.get(slot)?;
+        Some(Shaped { buffer: &l.buffer, starts: &e.starts, size: l.size })
+    }
+
+    /// The fonts, and the laid-out buffers behind keys from `measure`, for drawing.
+    #[cfg(feature = "renderer")]
+    pub(crate) fn for_drawing(&mut self) -> (&mut FontSystem, Buffers<'_>) {
+        (&mut self.fonts, Buffers(&self.entries))
     }
 
     /// Boxes of the spans that have a plate or an icon, row by row.
     pub(crate) fn span_boxes(&self, key: u64, out: &mut Vec<SpanBox>) {
-        let Some(e) = self.entries.get(&key) else { return };
+        let Some(e) = self.get(key) else { return };
         for run in e.buffer.layout_runs() {
             for g in run.glyphs {
                 if g.metadata == 0 {
@@ -232,11 +482,13 @@ impl TextSystem {
 
     /// Returns a cache key for the shaped text and its size, wrapping at `max_w` if needed.
     pub(crate) fn measure(&mut self, spec: &TextSpec, max_w: Option<f32>) -> (u64, (f32, f32)) {
-        let natural = self.entry(spec, None, 0);
-        match max_w {
-            Some(w) if natural.1 .0 > w + 0.5 => self.entry(spec, Some(w.floor().max(1.0)), 0),
-            _ => natural,
-        }
+        let key = self.shape(spec);
+        let natural = self.natural(key);
+        let v = match max_w {
+            Some(w) if natural.0 > w + 0.5 => Variant { width: Some(w.floor().max(1.0)), lines: 0, center: spec.center },
+            _ => NATURAL,
+        };
+        self.layout(key, v)
     }
 
     /// Like `measure`, but at most `lines` lines tall. Returns the key, the size it takes
@@ -251,26 +503,29 @@ impl TextSystem {
     ) -> (u64, (f32, f32), bool) {
         let line_h = spec.line_h();
         let max_h = lines as f32 * line_h;
-        let natural = self.entry(spec, None, 0);
+        let key = self.shape(spec);
+        let natural = self.natural(key);
+        let wrap = |width: f32, lines: usize| Variant { width: Some(width), lines, center: spec.center };
         let w = match max_w {
-            Some(w) if natural.1 .0 > w + 0.5 => w.floor().max(1.0),
+            Some(w) if natural.0 > w + 0.5 => w.floor().max(1.0),
             // Fits on its lines (an explicit newline can still make too many of them).
             _ => {
-                let cut = natural.1 .1 > max_h + 0.5;
+                let cut = natural.1 > max_h + 0.5;
                 if cut && !fade {
-                    let e = self.entry(spec, Some(natural.1 .0.ceil().max(1.0)), lines);
+                    let e = self.layout(key, wrap(natural.0.ceil().max(1.0), lines));
                     return (e.0, e.1, true);
                 }
-                return (natural.0, (natural.1 .0, natural.1 .1.min(max_h)), cut);
+                let (k, _) = self.layout(key, NATURAL);
+                return (k, (natural.0, natural.1.min(max_h)), cut);
             }
         };
         if !fade {
-            let (key, size) = self.entry(spec, Some(w), lines);
+            let (key, size) = self.layout(key, wrap(w, lines));
             return (key, (size.0.min(w), size.1.min(max_h)), true);
         }
         // One line: keep it unwrapped and let it run under the fade. More lines: wrap, and
         // the last one shown fades if more text follows.
-        let (key, size) = if lines == 1 && natural.1 .1 <= line_h + 0.5 { natural } else { self.entry(spec, Some(w), 0) };
+        let (key, size) = if lines == 1 && natural.1 <= line_h + 0.5 { self.layout(key, NATURAL) } else { self.layout(key, wrap(w, 0)) };
         let cut = size.0 > w + 0.5 || size.1 > max_h + 0.5;
         (key, (size.0.min(w), size.1.min(max_h)), cut)
     }
@@ -278,7 +533,7 @@ impl TextSystem {
     /// Byte index (in the whole text) closest to the point `(x, y)` of the shaped text `key`.
     /// Points above the text land at its start, below it at its end.
     pub(crate) fn hit(&self, key: u64, x: f32, y: f32) -> usize {
-        let Some(e) = self.entries.get(&key) else { return 0 };
+        let Some(e) = self.get(key) else { return 0 };
         let y = y.clamp(0.0, (e.size.1 - 0.01).max(0.0));
         match e.buffer.hit(x.max(0.0), y) {
             Some(c) => e.starts.get(c.line).copied().unwrap_or(0) + c.index,
@@ -289,7 +544,7 @@ impl TextSystem {
     /// Caret before byte `i`: x, top of its visual row, and the row height.
     /// At a soft wrap the caret goes to the start of the next row.
     pub(crate) fn caret(&self, key: u64, i: usize) -> (f32, f32, f32) {
-        let Some(e) = self.entries.get(&key) else { return (0.0, 0.0, 0.0) };
+        let Some(e) = self.get(key) else { return (0.0, 0.0, 0.0) };
         let (line, local) = locate(&e.starts, i);
         let mut end_match = None;
         let mut last = None;
@@ -318,7 +573,7 @@ impl TextSystem {
     /// A row whose line break is selected gets a little extra width, so selected empty
     /// lines stay visible.
     pub(crate) fn range_rects(&self, key: u64, r: Range<usize>, out: &mut Vec<Rect>) {
-        let Some(e) = self.entries.get(&key) else { return };
+        let Some(e) = self.get(key) else { return };
         if r.start >= r.end {
             return;
         }
@@ -356,7 +611,7 @@ impl TextSystem {
 
     /// The word (or run of spaces / punctuation) around byte `i`, within its paragraph.
     pub(crate) fn word_at(&self, key: u64, i: usize) -> Range<usize> {
-        let Some(e) = self.entries.get(&key) else { return i..i };
+        let Some(e) = self.get(key) else { return i..i };
         let (line, local) = locate(&e.starts, i);
         let Some(l) = e.buffer.lines.get(line) else { return i..i };
         let base = e.starts[line];
@@ -383,7 +638,7 @@ impl TextSystem {
 
     /// The paragraph (source line, without its line break) around byte `i`.
     pub(crate) fn para_at(&self, key: u64, i: usize) -> Range<usize> {
-        let Some(e) = self.entries.get(&key) else { return i..i };
+        let Some(e) = self.get(key) else { return i..i };
         let (line, _) = locate(&e.starts, i);
         let base = e.starts[line];
         base..base + e.buffer.lines.get(line).map_or(0, |l| l.text().len())
@@ -392,7 +647,7 @@ impl TextSystem {
     /// Start and end of the visual row holding byte `i` (soft wraps count as row ends;
     /// a trailing space at a wrap is left out of the end).
     pub(crate) fn row_at(&self, key: u64, i: usize) -> Range<usize> {
-        let Some(e) = self.entries.get(&key) else { return i..i };
+        let Some(e) = self.get(key) else { return i..i };
         let (_, top, _) = self.caret(key, i);
         for run in e.buffer.layout_runs() {
             if (run.line_top - top).abs() > 0.5 {
@@ -411,10 +666,30 @@ impl TextSystem {
 
     pub(crate) fn end_frame(&mut self) {
         self.frame += 1;
-        if self.entries.len() > 512 {
-            let frame = self.frame;
-            self.entries.retain(|_, e| e.used + 2 >= frame);
+        // Shaped words (cosmic-text's run cache) live for 8-16 frames: enough for a streamed
+        // paragraph, which is reshaped every frame, to find all but its newest words there.
+        if self.frame % 8 == 0 {
+            self.fonts.shape_run_cache.trim(1);
         }
+        let total: usize = self.entries.values().map(Entry::bytes).sum();
+        if total <= self.budget {
+            return;
+        }
+        // Least recently used first; what the frame just drawn still refers to stays.
+        let frame = self.frame;
+        let mut old: Vec<(u64, u64, usize)> =
+            self.entries.iter().filter(|(_, e)| e.used + 1 < frame).map(|(k, e)| (e.used, *k, e.bytes())).collect();
+        old.sort_unstable();
+        let mut total = total;
+        for (_, k, bytes) in old {
+            if total <= self.budget / 4 * 3 {
+                break;
+            }
+            self.entries.remove(&k);
+            total -= bytes;
+        }
+        let entries = &self.entries;
+        self.owners.retain(|_, k| entries.contains_key(k));
     }
 }
 
@@ -460,6 +735,11 @@ fn line_starts(text: &str) -> Vec<usize> {
         }
     }
     starts
+}
+
+/// Unwrapped width and height of one buffer line laid out as `lines`.
+fn line_size(lines: &[LayoutLine], line_height: f32) -> (f32, f32) {
+    lines.iter().fold((0.0f32, 0.0f32), |(w, h), l| (w.max(l.w), h + l.line_height_opt.unwrap_or(line_height)))
 }
 
 /// Line and offset within it of the byte `i`.
@@ -519,5 +799,141 @@ mod tests {
         assert_eq!(&text[ts.word_at(key, two - 1)], "раз", "right after a word: that word");
         assert_eq!(&text[ts.para_at(key, 2)], "раз два-три");
         assert_eq!(&text[ts.para_at(key, text.len())], "четыре");
+    }
+
+    /// Everything that ends up on screen or in hit tests, for comparing two layouts.
+    fn dump(ts: &TextSystem, key: u64) -> (Vec<String>, (f32, f32)) {
+        let e = ts.get(key).expect("laid out");
+        let mut out = Vec::new();
+        for run in e.buffer.layout_runs() {
+            out.push(format!("row {} {} {} {}", run.line_i, run.line_y, run.line_top, run.line_w));
+            for g in run.glyphs {
+                out.push(format!("{} {}..{} {} {} {} {} {}", g.glyph_id, g.start, g.end, g.x, g.y, g.w, g.font_size, g.metadata));
+            }
+        }
+        (out, e.size)
+    }
+
+    /// Shapes with nothing cached (font loading is the slow part of a new system, so keep it).
+    fn from_scratch(ts: &mut TextSystem, spec: &TextSpec, width: Option<f32>) -> (u64, (f32, f32)) {
+        ts.entries.clear();
+        ts.fonts.shape_run_cache = Default::default();
+        ts.measure(spec, width)
+    }
+
+    fn rich(n: usize) -> Vec<Span> {
+        let words = ["Привет, ", "мир ", "👍🏽 ", "code\n", "жирный ", "wraps here and there ", "x\n\n", "ещё "];
+        (0..n)
+            .map(|i| {
+                let s = Span::new(words[i % words.len()]);
+                match i % 5 {
+                    1 => s.bold(),
+                    2 => s.code(),
+                    3 => s.size(22.0).italic(),
+                    4 => s.color(crate::types::Color::rgba(1.0, 0.0, 0.0, 1.0)),
+                    _ => s,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn growing_text_lays_out_like_shaping_from_scratch() {
+        let mut grow = TextSystem::new();
+        let mut fresh = TextSystem::new();
+        let words = ["Привет, ", "мир! ", "👍🏽 ", "строка\n", "long-long-word ", "x ", "\n", "эмодзи 🇷🇺 ", "end"];
+        let mut text = String::new();
+        for (step, w) in words.iter().cycle().take(40).enumerate() {
+            text.push_str(w);
+            for width in [None, Some(90.0), Some(160.0)] {
+                let spec = TextSpec { text: &text, owner: 7, ..Default::default() };
+                let (k, size) = grow.measure(&spec, width);
+                let (k2, size2) = from_scratch(&mut fresh, &TextSpec { owner: 0, ..spec }, width);
+                assert_eq!(size, size2, "step {step} width {width:?}");
+                assert_eq!(dump(&grow, k), dump(&fresh, k2), "step {step} width {width:?}");
+                grow.end_frame();
+            }
+        }
+        // Styled spans: plates, sizes, colors, line breaks inside a span.
+        for n in 1..24 {
+            let spans = rich(n);
+            for width in [Some(120.0), None] {
+                let spec = TextSpec { spans: &spans, owner: 9, ..Default::default() };
+                let (k, size) = grow.measure(&spec, width);
+                let (k2, size2) = from_scratch(&mut fresh, &TextSpec { owner: 0, ..spec }, width);
+                assert_eq!(size, size2, "spans {n} width {width:?}");
+                assert_eq!(dump(&grow, k), dump(&fresh, k2), "spans {n} width {width:?}");
+                let mut a = Vec::new();
+                let mut b = Vec::new();
+                grow.span_boxes(k, &mut a);
+                fresh.span_boxes(k2, &mut b);
+                assert_eq!(a.len(), b.len());
+                grow.end_frame();
+            }
+        }
+    }
+
+    #[test]
+    fn growing_text_reuses_its_entry() {
+        let mut ts = TextSystem::new();
+        let mut text = String::from("first line\nsecond");
+        for _ in 0..5 {
+            ts.measure(&TextSpec { text: &text, owner: 3, ..Default::default() }, Some(200.0));
+            ts.end_frame();
+            text.push_str(" more");
+        }
+        assert_eq!(ts.entries.len(), 1, "the old text gave its entry to the new one");
+        // Same text, bigger font: kept lines must not keep their old unwrapped size.
+        let (_, big) = ts.measure(&TextSpec { text: &text, size: 30.0, owner: 3, ..Default::default() }, Some(400.0));
+        let mut fresh = TextSystem::new();
+        let (_, want) = fresh.measure(&TextSpec { text: &text, size: 30.0, ..Default::default() }, Some(400.0));
+        assert_eq!(big, want);
+    }
+
+    #[test]
+    fn one_text_at_two_widths_in_one_frame() {
+        let mut ts = TextSystem::new();
+        let text = "the same text shown in a narrow and in a wide place at once";
+        let spec = TextSpec { text, ..Default::default() };
+        for _ in 0..3 {
+            let (narrow, ns) = ts.measure(&spec, Some(100.0));
+            let (wide, ws) = ts.measure(&spec, Some(260.0));
+            assert_ne!(narrow, wide);
+            assert!(ns.1 > ws.1, "{ns:?} {ws:?}");
+            // The wide layout did not re-wrap the narrow one.
+            assert_eq!(ts.get(narrow).unwrap().size, ns);
+            assert_eq!(ts.get(narrow).unwrap().buffer.size().0, Some(100.0));
+            let mut fresh = TextSystem::new();
+            let k = fresh.measure(&spec, Some(100.0)).0;
+            assert_eq!(dump(&ts, narrow), dump(&fresh, k));
+            ts.end_frame();
+        }
+        assert_eq!(ts.entries.len(), 1);
+        assert_eq!(ts.entries.values().next().unwrap().layouts.len(), 2, "no new copy every frame");
+    }
+
+    #[test]
+    fn cache_drops_least_recently_used_first() {
+        let mut ts = TextSystem::new();
+        let hot = "kept: shown every frame";
+        let spec = |t| TextSpec { text: t, ..Default::default() };
+        ts.measure(&spec(hot), None);
+        ts.end_frame();
+        let one = ts.entries.values().next().unwrap().bytes();
+        ts.budget = one * 20;
+        let cold: Vec<String> = (0..100).map(|i| format!("cold text number {i:03} filler")).collect();
+        for (i, t) in cold.iter().enumerate() {
+            ts.measure(&spec(hot), None);
+            ts.measure(&spec(t), None);
+            ts.end_frame();
+            let key = TextSystem::key(&spec(hot));
+            assert!(ts.entries.contains_key(&key), "hot text evicted at {i}");
+            assert!(ts.entries.contains_key(&TextSystem::key(&spec(t))), "text of the last frame evicted");
+        }
+        let total: usize = ts.entries.values().map(Entry::bytes).sum();
+        assert!(total <= ts.budget, "{total} > {}", ts.budget);
+        // The most recent cold texts are still there, the oldest are gone.
+        assert!(ts.entries.contains_key(&TextSystem::key(&spec(&cold[98]))));
+        assert!(!ts.entries.contains_key(&TextSystem::key(&spec(&cold[0]))));
     }
 }
