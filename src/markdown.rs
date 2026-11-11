@@ -6,6 +6,10 @@ use crate::types::Color;
 use crate::view::{hstack, image, rect, rich_text, text, vstack, Align, Image, Span, View, Weight};
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
+#[path = "markdown_code.rs"]
+mod code;
+pub use code::{CodeHeaderStyle, CodeSyntaxStyle};
+
 /// How [`markdown_styled`] looks. `MarkdownStyle::default()` is the look of [`markdown`];
 /// change only what you need:
 ///
@@ -56,6 +60,8 @@ pub struct CodeBlockStyle {
     pub border: Option<(f32, Color)>,
     pub radius: f32,
     pub padding: f32,
+    pub header: Option<CodeHeaderStyle>,
+    pub syntax: Option<CodeSyntaxStyle>,
 }
 
 /// Tables: rows of cells with a rule between rows and no outer frame.
@@ -139,6 +145,8 @@ impl Default for CodeBlockStyle {
             border: Some((1.0, Color::rgba(1.0, 1.0, 1.0, 0.08))),
             radius: 12.0,
             padding: 14.0,
+            header: None,
+            syntax: None,
         }
     }
 }
@@ -195,6 +203,7 @@ pub fn markdown_styled_with<S>(source: &str, style: &MarkdownStyle, images: impl
     let mut list_from: Option<usize> = None; // first block of the outermost open list
     let mut heading: Option<HeadingLevel> = None;
     let mut code: Option<String> = None;
+    let mut code_language = String::new();
     let mut lists: Vec<Option<u64>> = Vec::new(); // open lists: next number, or None for bullets
     let mut bullet: Option<String> = None; // marker waiting for the item's first line
     let mut quote = 0u32;
@@ -275,7 +284,8 @@ pub fn markdown_styled_with<S>(source: &str, style: &MarkdownStyle, images: impl
                     links.push(dest_url.into_string());
                 }
                 Tag::BlockQuote(_) => quote += 1,
-                Tag::CodeBlock(_) => {
+                Tag::CodeBlock(kind) => {
+                    code_language = match kind { pulldown_cmark::CodeBlockKind::Fenced(info) => info.split_whitespace().next().unwrap_or("").to_owned(), _ => String::new() };
                     flush(&mut spans, &mut blocks, heading, lists.len(), &mut bullet, quote);
                     code = Some(String::new());
                 }
@@ -350,23 +360,7 @@ pub fn markdown_styled_with<S>(source: &str, style: &MarkdownStyle, images: impl
                 }
                 TagEnd::CodeBlock => {
                     if let Some(src) = code.take() {
-                        let c = &st.code_block;
-                        let mut body = rich_text(vec![Span::new(src.trim_end_matches('\n')).code()])
-                            .font_size(c.size)
-                            .line_height(c.line_height);
-                        if let Some(color) = c.color {
-                            body = body.color(color);
-                        }
-                        let mut block = vstack(body)
-                            .align(Align::Start)
-                            .fill_width()
-                            .padding(c.padding)
-                            .background(c.background)
-                            .radius(c.radius);
-                        if let Some((w, color)) = c.border {
-                            block = block.border(w, color);
-                        }
-                        blocks.push(block);
+                        blocks.push(code::block(src, &code_language, &st.code_block));
                     }
                 }
                 TagEnd::Image => {

@@ -25,7 +25,14 @@ pub(crate) struct Field<S> {
     pub placeholder: String,
     pub on_change: Box<dyn Fn(&mut S, String)>,
     pub on_submit: Option<Box<dyn Fn(&mut S)>>,
+    pub on_blur: Option<Box<dyn Fn(&mut S)>>,
+    pub on_cancel: Option<Box<dyn Fn(&mut S)>>,
+    pub autofocus: bool,
+    pub select_on_focus: bool,
     pub size: f32,
+    pub weight: u16,
+    pub weighted: bool,
+    pub intrinsic: bool,
     /// Set by `.font_size()`: the theme's body size does not replace it.
     pub sized: bool,
     pub line_height: f32,
@@ -50,7 +57,9 @@ impl<S> Field<S> {
             placeholder,
             on_change,
             on_submit: None,
+            on_blur: None, on_cancel: None, autofocus: false, select_on_focus: false,
             size: body.size,
+            weight: body.weight as u16, weighted: false, intrinsic: false,
             sized: false,
             line_height: body.line_height,
             tracking: body.tracking,
@@ -63,6 +72,7 @@ impl<S> Field<S> {
     }
 
     pub(crate) fn theme(&mut self, body: &crate::theme::TextStyle) {
+        if !self.weighted { self.weight = body.weight as u16; }
         if !self.sized {
             self.size = body.size;
         }
@@ -122,6 +132,33 @@ impl<S> View<S> {
         }
         self
     }
+    /// Size a single-line field to its shaped text, growing up to the parent's available width.
+    /// Existing padding is included, with room for the caret at the end.
+    pub fn fit_content(mut self) -> Self {
+        if let Some(f) = self.field() { f.intrinsic = true; }
+        self.style.width = crate::view::Dim::Auto;
+        self
+    }
+    /// Focus this field once when it appears in the view tree.
+    pub fn autofocus(mut self) -> Self {
+        if let Some(f) = self.field() { f.autofocus = true; }
+        self
+    }
+    /// Select the whole value when focus enters this field.
+    pub fn select_on_focus(mut self) -> Self {
+        if let Some(f) = self.field() { f.select_on_focus = true; }
+        self
+    }
+    /// Run when focus leaves the field, for example to commit an inline edit.
+    pub fn on_blur(mut self, f: impl Fn(&mut S) + 'static) -> Self {
+        if let Some(field) = self.field() { field.on_blur = Some(Box::new(f)); }
+        self
+    }
+    /// Handle Escape without committing an inline edit.
+    pub fn on_cancel(mut self, f: impl Fn(&mut S) + 'static) -> Self {
+        if let Some(field) = self.field() { field.on_cancel = Some(Box::new(f)); }
+        self
+    }
     /// Text field without its own look: no background, padding, corners or focus ring.
     /// Put it in a container styled the way the app needs (e.g. a chat composer).
     pub fn plain(mut self) -> Self {
@@ -141,8 +178,8 @@ fn line_h(size: f32, k: f32) -> f32 {
     (size * k).round() // as text.rs lays out lines
 }
 
-fn spec(text: &str, size: f32, line_height: f32, tracking: f32) -> TextSpec<'_> {
-    TextSpec { spans: &[], text, size, weight: 400, center: false, line_height, tracking, ..Default::default() }
+fn spec(text: &str, size: f32, line_height: f32, tracking: f32, weight: u16) -> TextSpec<'_> {
+    TextSpec { spans: &[], text, size, weight, center: false, line_height, tracking, ..Default::default() }
 }
 
 fn wrap_at(multi: bool, w: f32) -> Option<f32> {
@@ -152,9 +189,13 @@ fn wrap_at(multi: bool, w: f32) -> Option<f32> {
 /// Content size of a field: the offered width, and one row or as many as its text
 /// needs, up to `max_lines`.
 pub(crate) fn layout_field<S>(f: &Field<S>, width: Option<f32>, ts: &mut TextSystem, node: &mut LNode) -> (f32, f32) {
-    let w = width.unwrap_or(220.0);
+    let w = if f.intrinsic && f.max_lines == 1 {
+        let label = if f.value.is_empty() { &f.placeholder } else { &f.value };
+        let natural = ts.measure(&spec(label, f.size, f.line_height, f.tracking, f.weight), None).1.0 + 2.0;
+        width.map_or(natural, |offered| natural.min(offered))
+    } else { width.unwrap_or(220.0) };
     let lh = line_h(f.size, f.line_height);
-    let (key, size) = ts.measure(&spec(&f.value, f.size, f.line_height, f.tracking), wrap_at(f.max_lines > 1, w));
+    let (key, size) = ts.measure(&spec(&f.value, f.size, f.line_height, f.tracking, f.weight), wrap_at(f.max_lines > 1, w));
     node.text = key;
     let rows = ((size.1 / lh).round() as usize).clamp(1, f.max_lines.max(1));
     (w, rows as f32 * lh)
@@ -167,6 +208,7 @@ pub(crate) struct FieldHit<S> {
     scale: f32,
     wrap: Option<f32>,
     size: f32,
+    weight: u16,
     line_height: f32,
     tracking: f32,
     multi: bool,
@@ -176,6 +218,10 @@ pub(crate) struct FieldHit<S> {
     value: String,
     on_change: Box<dyn Fn(&mut S, String)>,
     on_submit: Option<Box<dyn Fn(&mut S)>>,
+    on_blur: Option<Box<dyn Fn(&mut S)>>,
+    on_cancel: Option<Box<dyn Fn(&mut S)>>,
+    autofocus: bool,
+    select_on_focus: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -334,17 +380,41 @@ impl<S: 'static> Ui<S> {
     /// the text key plus the press position in text coordinates.
     fn shaped(&mut self, i: usize, pos: (f32, f32)) -> (u64, (f32, f32)) {
         let Action::Field(h) = &self.hits[i].action else { return (0, (0.0, 0.0)) };
-        let key = self.text.measure(&spec(&h.value, h.size, h.line_height, h.tracking), h.wrap).0;
+        let key = self.text.measure(&spec(&h.value, h.size, h.line_height, h.tracking, h.weight), h.wrap).0;
         (key, ((pos.0 - h.origin.0) / h.scale, (pos.1 - h.origin.1) / h.scale))
     }
 
     pub(super) fn blur(&mut self) -> bool {
         self.ed.preedit = None;
+        if let Some(i) = self.field_index() {
+            if let Action::Field(h) = &self.hits[i].action {
+                if let Some(f) = &h.on_blur { f(&mut self.state); }
+            }
+        }
         self.focus.take().is_some()
+    }
+
+    pub(super) fn field_ids(&self) -> Vec<u64> {
+        self.hits.iter().filter(|h| matches!(h.action, Action::Field(_))).map(|h| h.id).collect()
+    }
+    pub(super) fn focus_new_field(&mut self, previous: &[u64]) -> bool {
+        let target = self.hits.iter().position(|h| !previous.contains(&h.id)
+            && matches!(&h.action, Action::Field(f) if f.autofocus));
+        if let Some(i) = target {
+            self.blur();
+            let Action::Field(h) = &self.hits[i].action else { return false };
+            self.focus = Some(self.hits[i].id);
+            self.ed = Editor { field: self.focus, mods: self.ed.mods, caret: h.value.len(),
+                anchor: if h.select_on_focus { 0 } else { h.value.len() }, ..Editor::default() };
+            self.ed.touched();
+            return true;
+        }
+        false
     }
 
     pub(super) fn field_press(&mut self, i: usize, pos: (f32, f32)) {
         let id = self.hits[i].id;
+        let entering = self.focus != Some(id);
         let now = Instant::now();
         if self.ed.field != Some(id) {
             self.ed = Editor { field: Some(id), mods: self.ed.mods, ..Editor::default() };
@@ -375,6 +445,7 @@ impl<S: 'static> Ui<S> {
             None if self.ed.mods.shift => self.ed.caret = idx,
             None => (self.ed.anchor, self.ed.caret) = (idx, idx),
         }
+        if entering && h.select_on_focus { (self.ed.anchor,self.ed.caret) = (0,len); }
         self.ed.unit = unit;
         self.ed.goal_x = None;
         self.ed.group = None;
@@ -497,7 +568,7 @@ impl<S: 'static> Ui<S> {
         let m = self.ed.mods;
         let word = m.alt || m.command;
         let (c, sel) = (self.ed.caret, self.ed.range());
-        let key_v = self.text.measure(&spec(&value, h.size, h.line_height, h.tracking), h.wrap).0;
+        let key_v = self.text.measure(&spec(&value, h.size, h.line_height, h.tracking, h.weight), h.wrap).0;
         use KeyInput as K;
         if !matches!(key, K::Up | K::Down) {
             self.ed.goal_x = None;
@@ -572,7 +643,14 @@ impl<S: 'static> Ui<S> {
                 true
             }
             K::Enter => self.blur(),
-            K::Escape => false,
+            K::Escape => {
+                if let Some(f) = &h.on_cancel {
+                    f(&mut self.state);
+                    self.focus = None;
+                    self.ed.preedit = None;
+                    true
+                } else { false }
+            },
         }
     }
 
@@ -608,7 +686,7 @@ impl<S> Painter<'_, S> {
         let inner = Rect::new(r.x + pad[0], r.y + pad[1], (r.w - pad[0] - pad[2]).max(0.0), (r.h - pad[1] - pad[3]).max(0.0));
         let multi = f.max_lines > 1;
         let wrap = wrap_at(multi, inner.w);
-        let (key_v, size_v) = self.text.measure(&spec(&f.value, f.size, f.line_height, f.tracking), wrap);
+        let (key_v, size_v) = self.text.measure(&spec(&f.value, f.size, f.line_height, f.tracking, f.weight), wrap);
         let lh = line_h(f.size, f.line_height);
         let content_h = size_v.1.max(lh);
 
@@ -634,7 +712,7 @@ impl<S> Painter<'_, S> {
             Some((p, cur)) => {
                 let c = ed.caret;
                 let shown = format!("{}{}{}", &f.value[..c], p, &f.value[c..]);
-                let (k, s) = self.text.measure(&spec(&shown, f.size, f.line_height, f.tracking), wrap);
+                let (k, s) = self.text.measure(&spec(&shown, f.size, f.line_height, f.tracking, f.weight), wrap);
                 (k, s, c + cur.map_or(p.len(), |x| x.0.min(p.len())), Some(c..c + p.len()))
             }
             None => (key_v, size_v, ed.caret, None),
@@ -674,7 +752,7 @@ impl<S> Painter<'_, S> {
             }
         }
         if f.value.is_empty() && pre.is_none() {
-            let (key_p, size_p) = self.text.measure(&spec(&f.placeholder, f.size, f.line_height, f.tracking), wrap);
+            let (key_p, size_p) = self.text.measure(&spec(&f.placeholder, f.size, f.line_height, f.tracking, f.weight), wrap);
             let color = f.placeholder_color.unwrap_or(xf.fg.alpha(xf.fg.a * 0.4));
             self.label(&cxf, key_p, origin, size_p, color);
         } else {
@@ -704,6 +782,7 @@ impl<S> Painter<'_, S> {
                 scale: xf.s,
                 wrap,
                 size: f.size,
+                weight: f.weight,
                 line_height: f.line_height,
                 tracking: f.tracking,
                 multi,
@@ -712,6 +791,8 @@ impl<S> Painter<'_, S> {
                 value: f.value,
                 on_change: f.on_change,
                 on_submit: f.on_submit,
+                on_blur: f.on_blur, on_cancel: f.on_cancel,
+                autofocus: f.autofocus, select_on_focus: f.select_on_focus,
             })),
         );
     }

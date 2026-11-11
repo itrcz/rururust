@@ -13,6 +13,13 @@ use bytemuck::{Pod, Zeroable};
 use std::collections::HashMap;
 use web_time::Instant;
 
+#[path = "reveal.rs"]
+mod reveal;
+#[path = "marquee.rs"]
+mod marquee;
+#[path = "cursor.rs"]
+mod cursor;
+
 #[path = "edit.rs"]
 pub(crate) mod edit;
 #[path = "select.rs"]
@@ -28,6 +35,7 @@ pub(crate) const KIND_FILL: f32 = 0.0;
 pub(crate) const KIND_SHADOW: f32 = 1.0;
 pub(crate) const KIND_GLASS: f32 = 2.0;
 pub(crate) const KIND_IMAGE: f32 = 3.0;
+pub(crate) const KIND_MORPH: f32 = 4.0;
 
 /// One GPU instance. Units are logical points; the shader applies the scale factor.
 #[repr(C)]
@@ -38,7 +46,7 @@ pub struct Quad {
     pub c0: [f32; 4],
     pub c1: [f32; 4],
     pub border: [f32; 4],
-    /// radius, border width, shadow blur, kind
+    /// radius, border width, shadow blur (glass: bottom fade height), kind
     pub p0: [f32; 4],
     /// gradient dir x, gradient dir y, clip radius, opacity
     pub p1: [f32; 4],
@@ -95,6 +103,12 @@ impl Spring {
 
     pub(crate) fn new(x: f32, target: f32, (k, c): (f32, f32)) -> Self {
         Spring { x, v: 0.0, target, used: 0, k, c }
+    }
+
+    pub(crate) fn snap_to(&mut self, target: f32) {
+        self.x = target;
+        self.target = target;
+        self.v = 0.0;
     }
 
     fn step(&mut self, dt: f32) {
@@ -246,7 +260,7 @@ pub fn after<S: 'static>(seconds: f32, f: impl FnOnce(&mut S) + 'static) {
 // ---------------------------------------------------------------- input
 
 enum Action<S> {
-    Tap(Box<dyn Fn(&mut S)>),
+    Tap(Option<Box<dyn Fn(&mut S)>>, Option<Box<dyn Fn(&mut S)>>),
     Toggle(bool, Box<dyn Fn(&mut S, bool)>),
     /// x of value 0, width of the value range (screen space), number of stops (0 = smooth)
     Slider(f32, f32, u32, Box<dyn Fn(&mut S, f32)>),
@@ -270,7 +284,7 @@ enum Action<S> {
     Link(Box<select::LinkHit<S>>),
     /// Everything outside an open popover: a press closes it and goes no further.
     Outside(Dismiss<S>),
-    /// A menu row: run the action, then close the popover it is in.
+    /// A menu row: close its source popover, then run the action.
     MenuPick(Box<dyn Fn(&mut S)>, Option<Dismiss<S>>),
     /// A submenu row: (menu id, row) opens it.
     SubMenu(u64, usize),
@@ -334,6 +348,7 @@ struct Menu<S> {
     selected: usize,
     on_select: Rc<dyn Fn(&mut S, usize)>,
     fg: Color,
+    text_style: crate::theme::TextStyle,
 }
 
 /// The view with a tooltip under the mouse.
@@ -457,6 +472,7 @@ struct Pointer {
     last_move: Option<Instant>,
     /// Time and place of the last press on a window-drag area, to spot a double click.
     drag_down: Option<(Instant, (f32, f32))>,
+    tap: Option<(Instant, u64, (f32, f32))>,
     /// A scroll bar thumb held by the mouse: the scroll view, and where on the thumb.
     bar: Option<(u64, f32)>,
 }
@@ -469,6 +485,8 @@ struct Xf {
     tx: f32,
     ty: f32,
     opacity: f32,
+    text_reveal: Option<crate::view::TextReveal>,
+    hover_scope: Option<bool>,
     clip: Rect,
     clip_r: f32,
     /// The clip's corners are continuous (`.smooth()`), not circular.
@@ -477,6 +495,8 @@ struct Xf {
     /// clockwise): a side panel cut from a rounded one at a divider keeps its outer corners
     /// round and its inner ones sharp.
     clip_sq: u8,
+    shape_sq: u8,
+    border_hidden: u8,
     fg: Color,
     /// Device pixels per point, for snapping to the pixel grid; 0 turns snapping off for
     /// what is drawn with it (a knob or lens that swells on a spring: steps would show).
@@ -568,16 +588,22 @@ impl Xf {
     /// Narrows the clip to the screen rect `r` with corner radius `radius`. The GPU clips to
     /// one rounded rectangle, so nested clips keep the corners of whichever is inside.
     fn clip_to(&mut self, r: Rect, radius: f32, smooth: bool) {
+        self.clip_to_corners(r, radius, smooth, 0);
+    }
+    fn clip_to_corners(&mut self, r: Rect, radius: f32, smooth: bool, corners: u8) {
         let next = self.clip.intersect(&r);
         let near = |a: &Rect, b: &Rect| {
             (a.x - b.x).abs() < 0.5 && (a.y - b.y).abs() < 0.5 && (a.w - b.w).abs() < 0.5 && (a.h - b.h).abs() < 0.5
         };
-        let (src, sq, rad, smooth) = if near(&next, &r) {
-            (r, 0, radius, smooth)
+        let (src, sq, rad, smooth) = if near(&next, &r) && near(&next, &self.clip) && self.clip_r >= radius {
+            let sq = if self.clip_r == radius { self.clip_sq & corners } else { self.clip_sq };
+            (self.clip, sq, self.clip_r, self.clip_smooth)
+        } else if near(&next, &r) {
+            (r, corners, radius, smooth)
         } else if near(&next, &self.clip) {
             (self.clip, self.clip_sq, self.clip_r, self.clip_smooth)
         } else if radius > self.clip_r {
-            (r, 0, radius, smooth)
+            (r, corners, radius, smooth)
         } else {
             (self.clip, self.clip_sq, self.clip_r, self.clip_smooth)
         };
@@ -610,11 +636,18 @@ struct Bar<S> {
     hit: Option<Action<S>>,
 }
 
+struct PointerObserver<S> {
+    rect: Rect,
+    scale: f32,
+    handler: Box<dyn Fn(&mut S, Option<(f32, f32)>)>,
+}
+
 struct Painter<'a, S> {
     list: &'a mut DrawList,
     look: &'a Look,
     hits: &'a mut Vec<Hit<S>>,
     zones: &'a mut Vec<Zone>,
+    pointer_observers: &'a mut Vec<PointerObserver<S>>,
     /// Views under the pointer (from the last frame's zones).
     hovered: &'a [u64],
     /// The scroll view whose bar thumb is being dragged.
@@ -625,7 +658,10 @@ struct Painter<'a, S> {
     scrolls: &'a mut HashMap<u64, ScrollState>,
     pressed: Option<u64>,
     frame: u64,
+    resizing: bool,
     text: &'a mut TextSystem,
+    reveals: &'a mut reveal::Reveals,
+    marquees: &'a mut marquee::Marquees,
     focus: Option<u64>,
     ed: &'a mut edit::Editor,
     caret_on: bool,
@@ -682,7 +718,7 @@ impl<S> Painter<'_, S> {
     #[allow(clippy::too_many_arguments)]
     fn paint_split(&mut self, sp: crate::view::Split<S>, children: Vec<View<S>>, ln: &LNode, (r, cr): (Rect, Rect), xf: Xf, id: u64, tbase: u32) {
         let mut it = children.into_iter();
-        let (Some(panel), Some(main)) = (it.next(), it.next()) else { return };
+        let (Some(panel), Some(mut main)) = (it.next(), it.next()) else { return };
         let (pn, mn) = (&ln.children[0], &ln.children[1]);
         let region = ln.split;
         let line = self.look.theme.control.border;
@@ -696,17 +732,36 @@ impl<S> Painter<'_, S> {
         pxf.clip_to(xf.rect_px(area), 0.0, false);
         self.tbase = tbase;
         self.paint(panel, pn, (r.x, r.y), pxf, pid);
+        let div = id ^ SPLIT_SALT;
+        let hidden = sp.hide_collapsed_divider && sp.collapse.as_ref().is_some_and(|c| c.0);
+        let on = self.split_drag == Some(id) || self.hovered.contains(&div);
+        let t = if hidden { 0.0 } else { self.crisp(div, 9, if on { 1.0 } else { 0.0 }).clamp(0.0, 1.0) };
+        if hidden { main.style.border_hidden |= if sp.trailing { 2 } else { 8 }; }
+        if sp.highlight_main_border && !hidden {
+            let (width, color) = main.style.border.unwrap_or((line, self.look.theme.color.divider));
+            main.style.border = Some((width, color.lerp(self.look.theme.color.accent, t)));
+            main.style.border_fade = sp.highlight_fade.map(|fraction| (color, fraction, sp.trailing));
+        }
         self.tbase = tbase + pn.tn;
         self.paint(main, mn, (r.x, r.y), xf, mid);
+        // An existing drag owns its SplitHit until release; it can reverse without an edge hit.
+        if hidden { return; }
 
-        let div = id ^ SPLIT_SALT;
-        let on = self.split_drag == Some(id) || self.hovered.contains(&div);
-        let t = self.crisp(div, 9, if on { 1.0 } else { 0.0 }).clamp(0.0, 1.0);
-        if region > 0.0 {
+        if region > 0.0 && !sp.highlight_main_border {
             let c = self.look.theme.color.divider.lerp(self.look.theme.color.accent, t);
             self.fill(&xf, Rect::new(line_x, cr.y, line.min(region), cr.h), 0.0, Fill::Solid(c), None);
         }
         let center = line_x + line * 0.5;
+        if sp.resize_grip && region > 0.0 {
+            let (width, resting, hovered) = self.look.theme.control.split_grip;
+            let held = self.crisp(div, 10, if self.split_drag == Some(id) { 1.0 } else { 0.0 }).clamp(0.0, 1.0);
+            let w = width * (1.0 + 0.15 * t);
+            let h = (resting + (hovered-resting)*t + hovered*0.15*held).min(cr.h);
+            let grip_y = sp.grip_bottom.map_or((cr.h-h)*0.5, |inset| (cr.h-inset-h*0.5).clamp(0.0,(cr.h-h).max(0.0)));
+            let grip = Rect::new(center-w*0.5, cr.y+grip_y, w, h);
+            let color = self.look.theme.color.text_muted.alpha(0.45).lerp(self.look.theme.color.accent, t);
+            self.fill(&xf, grip, w*0.5, Fill::Solid(color), None);
+        }
         let grab = Rect::new(center - SPLIT_GRAB * 0.5, cr.y, SPLIT_GRAB, cr.h).intersect(&cr);
         let scr = xf.rect(cr);
         let hit = SplitHit {
@@ -819,7 +874,7 @@ impl<S> Painter<'_, S> {
     /// Spring that starts from `initial` the first time it is seen (appear animations).
     fn spring_from(&mut self, id: u64, slot: u8, initial: f32, target: f32) -> f32 {
         let s = self.springs.entry((id, slot)).or_insert(Spring::new(initial, target, self.look.theme.motion.bouncy));
-        s.target = target;
+        if self.resizing { s.snap_to(target); } else { s.target = target; }
         s.used = self.frame;
         s.x
     }
@@ -845,12 +900,12 @@ impl<S> Painter<'_, S> {
 
     fn paint_picker_menu(&mut self, m: Menu<S>, size: (f32, f32)) {
         let theme = self.look.theme.clone();
-        let row_h = theme.control.picker_row;
+        let row_h = theme.control.picker_row.max((m.text_style.size*m.text_style.line_height).round()+theme.control.picker_padding.1*2.0);
         let screen = Rect::new(0.0, 0.0, size.0, size.1);
         // Anything outside the menu closes it.
         self.hits.push(Hit { id: m.id ^ 0xD15, rect: screen, round: NO_ROUND, action: Action::Dismiss });
         self.zones.push(Zone { id: m.id ^ 0xD15, rect: screen, round: NO_ROUND, cursor: None, blocks: true, tip: false });
-        let spec = |text| spec_in(&theme.text.body, text);
+        let spec = |text| spec_in(&m.text_style, text);
         let rows: Vec<(u64, (f32, f32))> = m.options.iter().map(|o| self.text.measure(&spec(o), None)).collect();
         let (check, check_size) = self.text.measure(&TextSpec { weight: 600, ..spec("✓") }, None);
         let widest = rows.iter().map(|r| r.1 .0).fold(0.0, f32::max);
@@ -863,6 +918,7 @@ impl<S> Painter<'_, S> {
         // The menu grows out of the control it belongs to.
         let frame = self.frame;
         let s = self.springs.entry((m.id, 4)).or_insert(Spring::new(0.0, 1.0, theme.motion.bouncy));
+        if self.resizing { s.snap_to(1.0); }
         s.used = frame;
         let t = s.x;
         let k = 0.8 + 0.2 * t;
@@ -872,10 +928,14 @@ impl<S> Painter<'_, S> {
             tx: ax * (1.0 - k),
             ty: ay * (1.0 - k),
             opacity: t.clamp(0.0, 1.0),
+            text_reveal: None,
+            hover_scope: None,
             clip: screen,
             clip_r: 0.0,
             clip_smooth: false,
             clip_sq: 0,
+            shape_sq: 0,
+            border_hidden: 0,
             fg: m.fg,
             px: self.px,
         };
@@ -901,7 +961,7 @@ impl<S> Painter<'_, S> {
 
     fn spring(&mut self, id: u64, slot: u8, target: f32) -> f32 {
         let s = self.springs.entry((id, slot)).or_insert(Spring::new(target, target, self.look.theme.motion.bouncy));
-        s.target = target;
+        if self.resizing { s.snap_to(target); } else { s.target = target; }
         s.used = self.frame;
         s.x
     }
@@ -909,7 +969,7 @@ impl<S> Painter<'_, S> {
     /// A spring without overshoot, for press feedback.
     fn crisp(&mut self, id: u64, slot: u8, target: f32) -> f32 {
         let s = self.springs.entry((id, slot)).or_insert(Spring::new(target, target, self.look.theme.motion.crisp));
-        s.target = target;
+        if self.resizing { s.snap_to(target); } else { s.target = target; }
         s.used = self.frame;
         s.x
     }
@@ -930,7 +990,7 @@ impl<S> Painter<'_, S> {
             // A negative radius asks the shader for continuous corners (glass always has them).
             p0: [if self.smooth && kind != KIND_GLASS { -radius * xf.s } else { radius * xf.s }, 0.0, 0.0, kind],
             p1: [0.0, 1.0, if xf.clip_smooth { -xf.clip_r } else { xf.clip_r }, xf.opacity],
-            np: [0.0, 0.0, 0.0, xf.clip_sq as f32],
+            np: [0.0, 0.0, 0.0, (u32::from(xf.clip_sq) | (u32::from(xf.shape_sq) << 4) | (u32::from(xf.border_hidden) << 10)) as f32],
             ..Zeroable::zeroed()
         }
     }
@@ -979,6 +1039,7 @@ impl<S> Painter<'_, S> {
         let mut q = self.quad(xf, r, radius, KIND_GLASS);
         q.c0 = g.tint.arr();
         q.c1 = [g.saturation, g.depth * xf.s, g.rim, g.dispersion];
+        if g.horizontal_light { q.np[3] = ((q.np[3] as u32) | 512) as f32; }
         q.p1[0] = g.frost * xf.s;
         q.p1[1] = g.refraction;
         if let Some((w, c)) = border {
@@ -989,8 +1050,20 @@ impl<S> Painter<'_, S> {
     }
 
     fn paint(&mut self, v: View<S>, ln: &LNode, origin: (f32, f32), xf: Xf, id: u64) {
+        let hidden = (v.style.reveal == Some(false)).then(||
+            (self.hits.len(), self.zones.len(), self.layers.len(), self.bars.len(), self.shortcuts.len(), self.pointer_observers.len()));
+        let saved_pin = self.sticky;
         let saved = self.enter_text_ctx(&v, id);
         self.paint_node(v, ln, origin, xf, id);
+        self.sticky = saved_pin;
+        if let Some((hits, zones, layers, bars, shortcuts, pointers)) = hidden {
+            self.hits.truncate(hits);
+            self.zones.truncate(zones);
+            self.layers.truncate(layers);
+            self.bars.truncate(bars);
+            self.shortcuts.truncate(shortcuts);
+            self.pointer_observers.truncate(pointers);
+        }
         if let Some(t) = saved {
             self.tctx = t;
         }
@@ -1004,19 +1077,43 @@ impl<S> Painter<'_, S> {
             self.shortcuts.append(&mut x.shortcuts);
         }
         let tap_menu = extra.as_ref().is_some_and(|x| matches!(x.pop, Some(crate::view::Pop { opens: crate::view::Opens::Tap, .. })));
-        let pin = self.sticky.take();
+        let pin = self.sticky;
         let tbase = std::mem::take(&mut self.tbase);
-        let st = v.style;
+        let mut st = v.style;
+        if st.animate_radius { st.radius = self.crisp(id, 16, st.radius.max(0.0)).max(0.0); }
+        xf.shape_sq = st.square_corners;
+        xf.border_hidden = st.border_hidden;
         let r = Rect::new(origin.0 + ln.pos.0, origin.1 + ln.pos.1, ln.size.0, ln.size.1);
         xf.opacity *= st.opacity;
+        xf.text_reveal = st.text_reveal.or(xf.text_reveal);
+        if st.hover_scope { xf.hover_scope=Some(self.hovered.contains(&id)); }
+        if let Some((x,y))=st.hover_offset {
+            let amount=self.crisp(id,18,if xf.hover_scope.unwrap_or(false) {1.0}else{0.0});
+            xf.tx+=x*amount*xf.s;xf.ty+=y*amount*xf.s;
+        }
         if let Some(fg) = st.fg {
             xf.fg = fg;
         }
 
+        if let Some(shown) = st.reveal {
+            // Slot 15 is reserved for visibility, independently of control and layout springs.
+            let progress = self.spring(id, 15, if shown { 1.0 } else { 0.0 });
+            let scale = 0.5 + 0.5 * progress.max(0.0);
+            let (cx, cy) = (r.x + r.w * 0.5, r.y + r.h * 0.5);
+            xf.tx += cx * (1.0 - scale) * xf.s;
+            xf.ty += cy * (1.0 - scale) * xf.s;
+            xf.s *= scale;
+            xf.opacity *= progress.clamp(0.0, 1.0);
+        }
+
+        // Attachments follow layout, not the button's transient press squeeze. A moving
+        // anchor can cross a half-pixel rounding boundary after the popup itself settles,
+        // shifting every label/icon while its frame and separators stay in place.
+        let anchor = xf.rect_px(r);
         // Press feedback: a quick, quiet dim with a barely-there squeeze. No bounce.
-        if v.on_tap.is_some() || tap_menu {
+        if v.on_tap.is_some() || v.on_double_tap.is_some() || tap_menu {
             let p = self.crisp(id, 0, if self.pressed == Some(id) { 1.0 } else { 0.0 });
-            let k = 1.0 - 0.02 * p;
+            let k = 1.0 - (1.0 - st.press_scale) * p;
             let (cx, cy) = (r.x + r.w * 0.5, r.y + r.h * 0.5);
             xf.tx += cx * (1.0 - k) * xf.s;
             xf.ty += cy * (1.0 - k) * xf.s;
@@ -1029,7 +1126,21 @@ impl<S> Painter<'_, S> {
         if !sr.inflate(margin * xf.s).intersects(&xf.clip) || xf.opacity <= 0.001 {
             return; // culled
         }
+        if let Some(handler) = extra.as_mut().and_then(|x|x.pointer.take()) {
+            self.pointer_observers.push(PointerObserver {rect:xf.rect(r),scale:xf.s,handler});
+        }
 
+        // Clear only the underlying scene at the corners. Painting this before the
+        // surface keeps its shadow continuous across the masked backdrop.
+        if let Some((color, square)) = st.backdrop_corner_mask {
+            let mut mxf = xf;
+            mxf.shape_sq = square | st.square_corners;
+            self.smooth = st.smooth || st.glass.is_some();
+            self.fill(&mxf, r, st.radius, Fill::Solid(color), None);
+            if let Some(Cmd::Quad(q)) = self.list.cmds.last_mut() {
+                q.np[3] = ((q.np[3] as u32) | 256) as f32;
+            }
+        }
         self.smooth = st.smooth;
         let translucent = st.glass.is_some() || !matches!(st.bg, Some(Fill::Solid(c)) if c.a >= 1.0);
         for sh in st.shadow.into_iter().flatten() {
@@ -1040,12 +1151,14 @@ impl<S> Painter<'_, S> {
         // would cover it otherwise.
         let late_border = st
             .border
-            .filter(|_| st.clip || ln.clip || st.hover.is_some() || st.glass.is_some() || !ln.children.is_empty())
+            .filter(|_| st.clip || ln.clip || st.hover.is_some() || st.glass.is_some() || st.border_fade.is_some() || !ln.children.is_empty())
             .map(|b| (xf, b));
         // Inner shadows lie over the children too, like the border.
         let inset = st.inset.map(|sh| (xf, sh));
+        let corner_mask = st.corner_mask.map(|mask| (xf, mask));
         if let Some(g) = st.glass {
             self.glass(&xf, r, st.radius, g, st.border.filter(|_| late_border.is_none()));
+            if let Some(Cmd::Quad(q)) = self.list.cmds.last_mut() { q.p0[2] = st.glass_fade * xf.s; }
         }
         match (st.bg, st.border.filter(|_| late_border.is_none()), st.glass) {
             (Some(bg), border, None) => self.fill(&xf, r, st.radius, bg, border),
@@ -1058,10 +1171,10 @@ impl<S> Painter<'_, S> {
         let cursor = st.cursor.or(match &v.kind {
             Kind::TextField(_) => Some(Cursor::Text),
             Kind::Toggle(..) | Kind::Slider(..) | Kind::Tabs { .. } | Kind::Picker { .. } => Some(Cursor::Pointer),
-            _ if v.on_tap.is_some() || tap_menu => Some(Cursor::Pointer),
+            _ if v.on_tap.is_some() || v.on_double_tap.is_some() || tap_menu => Some(Cursor::Pointer),
             _ => None,
         });
-        if cursor.is_some() || st.hover.is_some() || st.hover_fg.is_some() {
+        if cursor.is_some() || st.hover.is_some() || st.hover_fg.is_some() || st.hover_scope || st.hover_marquee.is_some() {
             self.zone(&xf, id, sr, cursor);
         }
         if st.hover.is_some() || st.hover_fg.is_some() {
@@ -1078,7 +1191,10 @@ impl<S> Painter<'_, S> {
         if st.clip || ln.clip {
             // Inside the border: children never show through or under it.
             let bw = st.border.map_or(0.0, |b| xf.line(b.0));
-            xf.clip_to(sr.inflate(-bw), (st.radius * xf.s - bw).max(0.0), st.smooth);
+            let edge = |bit| if st.border_hidden & bit == 0 { bw } else { 0.0 };
+            let (top, right, bottom, left) = (edge(1), edge(2), edge(4), edge(8));
+            let inside = Rect::new(sr.x + left, sr.y + top, (sr.w-left-right).max(0.0), (sr.h-top-bottom).max(0.0));
+            xf.clip_to_corners(inside, (st.radius * xf.s - bw).max(0.0), st.smooth, st.square_corners);
         }
 
         self.area_hit(&xf, id, sr);
@@ -1086,11 +1202,11 @@ impl<S> Painter<'_, S> {
         if st.drag {
             self.hit(&xf, id ^ 0xD6A9, sr, Action::DragWindow);
         }
-        if let Some(f) = v.on_tap {
-            self.hit(&xf, id, sr, Action::Tap(f));
+        if v.on_tap.is_some() || v.on_double_tap.is_some() {
+            self.hit(&xf, id, sr, Action::Tap(v.on_tap, v.on_double_tap));
         }
         if let Some(x) = extra {
-            self.attach(x, ln, &xf, id, sr);
+            self.attach(x, ln, &xf, id, sr, anchor);
         }
 
         let pad = st.padding;
@@ -1100,6 +1216,26 @@ impl<S> Painter<'_, S> {
         let csr = if pad == [0.0; 4] { sr } else { xf.rect_px(cr) };
         match v.kind {
             Kind::Empty | Kind::Spacer => {}
+            Kind::Activity {stroke,period} => {
+                let diameter=(r.w-pad[0]-pad[2]).min(r.h-pad[1]-pad[3]).max(0.0);
+                let stroke=stroke.min(diameter);
+                if diameter>0.0 && stroke>0.0 && xf.fg.a>0.001 {
+                    // Overlapping subpixel discs form a smooth tapered ring without a texture,
+                    // renderer dependency or a per-frame SVG allocation.
+                    let radius=(diameter-stroke)*0.5;
+                    let center=(r.x+pad[0]+diameter*0.5,r.y+pad[1]+diameter*0.5);
+                    let turn=if period>0.0 {self.time/period}else{0.0};
+                    let segments=((std::f32::consts::TAU*radius/stroke*2.0).ceil() as usize).clamp(24,128);
+                    let smooth=Xf {px:0.0,..xf};
+                    for step in 0..segments {
+                        let part=step as f32/segments as f32;
+                        let angle=(turn+part)*std::f32::consts::TAU;
+                        let color=xf.fg.alpha(xf.fg.a*(0.12+0.88*part));
+                        self.fill(&smooth,Rect::new(center.0+angle.cos()*radius-stroke*0.5,center.1+angle.sin()*radius-stroke*0.5,stroke,stroke),stroke*0.5,Fill::Solid(color),None);
+                    }
+                    self.spin|=period>0.0;
+                }
+            }
             Kind::List { count, row_h, row } => {
                 // Only the rows inside the clip are built, laid out and painted. Their real
                 // heights are remembered so the scroll range converges on the truth.
@@ -1136,7 +1272,7 @@ impl<S> Painter<'_, S> {
                     let mut rv = row(i);
                     crate::theme::apply(&mut rv, p.look);
                     let cid = child_id(id, i, rv.key);
-                    let mut lx = Lx { text: p.text, look: p.look, springs: p.springs, frame: p.frame, along: None, menu: p.open_menu, tip: p.tip, shift: 0.0 };
+                    let mut lx = Lx { text: p.text, look: p.look, springs: p.springs, frame: p.frame, resizing: p.resizing, along: None, menu: p.open_menu, tip: p.tip, shift: 0.0, tail_viewport: None };
                     let n = layout(&rv, (Some(r.w), None), &mut lx, cid);
                     (i, rv, n, cid)
                 };
@@ -1189,8 +1325,10 @@ impl<S> Painter<'_, S> {
                     (c.seen, c.anchor) = if seen.0 == usize::MAX { ((0, 0), 0) } else { ((seen.0, seen.1), seen.2.min(seen.1)) };
                 }
             }
-            Kind::Overlay { open, mode, child, on_dismiss } => {
-                let t = self.spring_from(id, 7, 0.0, if open { 1.0 } else { 0.0 });
+            Kind::Overlay { open, mode, child, on_dismiss, style } => {
+                let target = if open { 1.0 } else { 0.0 };
+                let t = if mode == OverlayMode::Modal { self.fade(id, target) }
+                    else { self.spring_from(id, 7, 0.0, target) };
                 if t <= 0.004 && !open {
                     return;
                 }
@@ -1201,14 +1339,10 @@ impl<S> Painter<'_, S> {
                 let mut cxf = xf;
                 let pos = match mode {
                     OverlayMode::Modal => {
-                        // Pops out of the center.
-                        let k = 0.88 + 0.12 * t;
-                        let (mx, my) = (r.x + r.w * 0.5, r.y + r.h * 0.5);
-                        cxf.tx += mx * (1.0 - k) * xf.s;
-                        cxf.ty += my * (1.0 - k) * xf.s;
-                        cxf.s *= k;
+                        // Fade at the final geometry: scaling long text through quantized
+                        // glyph sizes makes its horizontal position drift and jump.
                         cxf.opacity *= tc;
-                        (cx, r.y + (r.h - h) * 0.5)
+                        (cx, r.y + (r.h - h) * 0.5 + style.rise * (1.0 - tc))
                     }
                     OverlayMode::Sheet => (cx, r.y + r.h - h + (1.0 - t) * (h + 24.0)),
                     OverlayMode::Drawer => (r.x - (1.0 - t) * (w + 24.0), r.y),
@@ -1222,9 +1356,21 @@ impl<S> Painter<'_, S> {
                 // Bars of what lies underneath go under the scrim with it.
                 self.flush_bars();
                 if mode != OverlayMode::Toast {
+                    if let Some(mut glass) = style.backdrop {
+                        // Fade both the blur radius and its contribution; the dialog is
+                        // painted afterwards and remains crisp throughout the transition.
+                        glass.frost *= tc;
+                        let mut backdrop_xf = xf;
+                        backdrop_xf.opacity *= tc;
+                        self.glass(&backdrop_xf, r, 0.0, glass, None);
+                    }
                     let scrim = self.look.theme.color.scrim;
                     self.fill(&xf, r, 0.0, Fill::Solid(scrim.alpha(scrim.a * tc)), None);
                     self.hit(&xf, id, sr, Action::Block(on_dismiss));
+                    self.zones.push(Zone {
+                        id, rect: sr.intersect(&xf.clip), round: (xf.clip, xf.clip_r),
+                        cursor: None, blocks: true, tip: false,
+                    });
                 }
                 let body = cxf.rect(Rect::new(pos.0, pos.1, w, h));
                 self.hits.push(Hit { id: child_id(id, 1, None), rect: body, round: NO_ROUND, action: Action::Swallow });
@@ -1279,6 +1425,7 @@ impl<S> Painter<'_, S> {
                     depth: 16.0,
                     dispersion: 0.6,
                     rim: 0.55,
+                    horizontal_light: false,
                 };
                 // The drop swells and stretches as it slides: no pixel steps.
                 let lxf = Xf { px: 0.0, ..xf };
@@ -1290,43 +1437,109 @@ impl<S> Painter<'_, S> {
                         on_select,
                     });
             }
-            Kind::Picker { options, selected, on_select } => {
-                let inner = Rect::new(r.x + pad[0], r.y + pad[1], r.w - pad[0] - pad[2], r.h - pad[1] - pad[3]);
-                self.label(&xf, ln.text, (inner.x, inner.y), (inner.w - 26.0, inner.h), xf.fg);
-                let spec = TextSpec { spans: &[], text: "⌄", size: 15.0, weight: 700, center: false, ..Default::default() };
-                let (chev, cs) = self.text.measure(&spec, None);
-                let at = (inner.x + inner.w - cs.0 - 2.0, inner.y + (inner.h - cs.1) * 0.5 - 3.0);
-                self.label(&xf, chev, at, cs, xf.fg.alpha(xf.fg.a * 0.6));
-                self.hit(&xf, id, sr, Action::OpenMenu);
-                if self.open_menu == Some(id) {
-                    self.menu = Some(Menu { id, anchor: sr, options, selected, on_select, fg: xf.fg });
+            Kind::Picker { options, selected, on_select, label } => {
+                let text_style=label.text_style();
+                let inner=cr;
+                let ts=ln.texts[0].1;
+                let mut pxf=xf;
+                pxf.clip_to(xf.rect(inner),0.0,false);
+                self.label(&pxf,ln.text,(inner.x,inner.y+(inner.h-ts.1)*0.5),ts,xf.fg);
+                let spec=TextSpec {text:"⌄",weight:700,..spec_in(&text_style,"")};
+                let (chev,cs)=self.text.measure(&spec,None);
+                // The down-chevron glyph sits below the baseline; align its ink, not the
+                // font's full line box, to the control's vertical center.
+                let at=(inner.x+inner.w-cs.0,inner.y+(inner.h-cs.1)*0.5-text_style.size*0.18);
+                self.label(&pxf,chev,at,cs,xf.fg.alpha(xf.fg.a*0.6));
+                self.hit(&xf,id,sr,Action::OpenMenu);
+                if self.open_menu==Some(id) {
+                    self.menu=Some(Menu {id,anchor,options,selected,on_select,fg:xf.fg,text_style});
                 }
             }
             Kind::Text(t) => {
-                let at = xf.at_px((r.x + pad[0], r.y + pad[1]));
-                let inner = Rect::new(at.0, at.1, r.w - pad[0] - pad[2], r.h - pad[1] - pad[3]);
+                let mut at = xf.at_px((r.x + pad[0], r.y + pad[1]));
+                let mut inner = Rect::new(at.0, at.1, r.w - pad[0] - pad[2], r.h - pad[1] - pad[3]);
                 let box_ = xf.rect(inner);
                 // Text limited to some lines is cut to its box; the last line may fade out.
-                let clip = if t.lines > 0 { xf.clip.intersect(&box_.inflate(1.0)) } else { xf.clip };
-                let fade = (ln.fade && t.truncate == Truncate::Fade).then(|| {
+                let mut clip = if t.lines > 0 { xf.clip.intersect(&box_.inflate(1.0)) } else { xf.clip };
+                let mut fade = (ln.fade && t.truncate == Truncate::Fade).then(|| {
                     let line_h = (t.size * t.line_height).round() * xf.s;
                     let w = (FADE_W * xf.s).min(box_.w * 0.5);
                     Rect::new(box_.x + box_.w - w, box_.y + box_.h - line_h, w, line_h)
                 });
+                if let Some((speed,inset,fade_width))=st.hover_marquee {
+                    let hovered=xf.hover_scope.unwrap_or_else(||self.hovered.contains(&id));
+                    let width=(inner.w-if hovered {inset}else{0.0}).max(0.0);
+                    let distance=(ln.marquee_width-width).max(0.0);
+                    let (offset,running)=self.marquees.offset(id,ln.text,distance,speed,hovered,self.time,self.frame);
+                    self.spin|=running;
+                    let visible=xf.rect(Rect::new(inner.x,inner.y,width,inner.h));
+                    clip=xf.clip.intersect(&visible);
+                    fade=(hovered && offset<distance-0.5 && fade_width>0.0).then(|| {
+                        let width=(fade_width*xf.s).min(visible.w);
+                        Rect::new(visible.x+visible.w-width,visible.y,width,visible.h)
+                    });
+                    at.0-=offset;
+                    inner.x-=offset;
+                    inner.w=ln.marquee_width;
+                }
                 let mut dxf = xf;
                 dxf.clip = clip;
                 self.text_extras(&dxf, id, ln.text, &t.spans, &t.content, (inner.x, inner.y), (inner.w, inner.h), tbase);
                 self.span_decor(&dxf, ln.text, &t.spans, (inner.x, inner.y));
                 let (pos, scale) = xf.text_at(at, (inner.w, inner.h));
-                self.list.cmds.push(Cmd::Text(TextCmd {
-                    key: ln.text,
-                    pos,
-                    size: (box_.w, box_.h),
-                    scale,
-                    color: xf.fg.alpha(xf.fg.a * xf.opacity),
-                    clip,
-                    fade,
-                }));
+                let revealed = xf.text_reveal.is_some_and(|reveal| reveal.duration > 0.0) && fade.is_none()
+                    && self.paint_reveal(&dxf, id, ln.text, &t.spans, &t.content, pos, scale);
+                if !revealed {
+                    self.list.cmds.push(Cmd::Text(TextCmd {
+                        key: ln.text,
+                        pos,
+                        size: (inner.w*xf.s, box_.h),
+                        scale,
+                        color: xf.fg.alpha(xf.fg.a * xf.opacity),
+                        clip,
+                        fade,
+                    }));
+                }
+                if let Some(cursor)=st.text_cursor {
+                    let shaped=crate::text::shaped_text(&t.spans,&t.content);
+                    let index=shaped.char_indices().last().map_or(0,|(index,_)|index);
+                    let (x,y,height)=self.text.caret(ln.text,index);
+                    let target=cursor.size*scale;
+                    let at=(pos.0+(x+cursor.gap)*scale,pos.1+y*scale);
+                    let area=Rect::new(at.0,at.1,cursor.reserve*scale,height*scale);
+                    if area.intersects(&clip) && xf.opacity>0.0 {
+                        let size=self.crisp(id,17,target).max(0.0);
+                        let pose=cursor::pose(self.time,cursor.cycle_period,cursor.transition_duration);
+                        self.spin|=pose.animate;
+                        if let Some(delay)=pose.wake {self.wake=Some(self.wake.map_or(delay,|wake|wake.min(delay)));}
+                        let marker=Rect::new(at.0,at.1+(height*scale-size)*0.5,size,size);
+                        let cxf=Xf {s:1.0,tx:0.0,ty:0.0,px:0.0,clip,opacity:xf.opacity,..xf};
+                        if cursor.cycle_period>0.0 && cursor.transition_duration>0.0 {
+                            let mut quad=self.quad(&cxf,marker,cursor.radius*scale,KIND_MORPH);
+                            quad.c0=cursor.color.arr();quad.p1[0]=pose.shape;quad.p1[1]=pose.rotation;
+                            self.list.cmds.push(Cmd::Quad(quad));
+                        } else {self.fill(&cxf,marker,cursor.radius*scale,Fill::Solid(cursor.color),None);}
+                    }
+                }
+                if let Some((period, highlight)) = st.text_shimmer.filter(|_| box_.intersects(&clip) && xf.opacity > 0.0 && !t.content.is_empty()) {
+                    // Reuse the shaped run and atlas. Narrow clips tint only the glyphs under
+                    // the moving band; neither hit testing nor text selection is duplicated.
+                    self.spin = true;
+                    let band = (box_.w * 0.6).max(t.size * xf.s);
+                    let center = box_.x - band + (self.time / period).fract() * (box_.w + 2.0 * band);
+                    let stripe = (2.0 * band / 32.0).max(1.0 / self.px.max(1.0));
+                    for index in 0..32 {
+                        let x = center - band + index as f32 * stripe;
+                        let mask = Rect::new(x, box_.y, stripe, box_.h).intersect(&clip).intersect(&box_);
+                        if mask.w <= 0.0 || mask.h <= 0.0 { continue; }
+                        let distance = ((x + stripe * 0.5 - center) / band).abs();
+                        let alpha = (1.0 - distance * distance).max(0.0).powi(3);
+                        self.list.cmds.push(Cmd::Text(TextCmd {
+                            key: ln.text, pos, size: (box_.w, box_.h), scale,
+                            color: highlight.alpha(highlight.a * xf.opacity * alpha), clip: mask, fade,
+                        }));
+                    }
+                }
             }
             Kind::Stack { children, .. } if split.is_some() && children.len() == 2 => {
                 let sp = split.take().expect("guarded");
@@ -1351,6 +1564,7 @@ impl<S> Painter<'_, S> {
                     let n = &ln.children[i];
                     // Pinned to the top of the viewport, pushed out by the next sticky one.
                     let mut y = tops[k].max(pin.unwrap_or(tops[k]));
+                    y = y.min((r.y + r.h - pad[3] - n.size.1).max(tops[k]));
                     if let Some(next) = tops.get(k + 1) {
                         y = y.min(next - n.size.1);
                     }
@@ -1359,7 +1573,7 @@ impl<S> Painter<'_, S> {
                     self.paint(c, n, (r.x, r.y + y - tops[k]), xf, cid);
                 }
             }
-            Kind::Scroll { child, refresh, indicator, stick, bar_insets } => {
+            Kind::Scroll { child, refresh, indicator, stick, bar_insets, bottom_overlay } => {
                 let content = ln.content_h + pad[1] + pad[3];
                 let (frame, now) = (self.frame, self.now);
                 let s = self.scrolls.entry(id).or_default();
@@ -1381,6 +1595,11 @@ impl<S> Painter<'_, S> {
                     s.offset = max;
                 }
                 s.max = max;
+                if self.resizing {
+                    let (lo, hi) = s.bounds();
+                    s.offset = s.offset.clamp(lo, hi);
+                    s.vel = 0.0;
+                }
                 s.used = frame;
                 s.refreshing = refresh.as_ref().is_some_and(|r| r.0);
                 let (offset, over, refreshing, active_at) = (s.offset, s.over(), s.refreshing, s.active_at);
@@ -1388,7 +1607,7 @@ impl<S> Painter<'_, S> {
                 let has_refresh = refresh.is_some();
                 self.hit(&xf, id, sr, Action::Scroll { refresh: refresh.map(|r| r.1) });
                 let mut cxf = xf;
-                cxf.clip_to(sr, st.radius * xf.s, st.smooth);
+                cxf.clip_to_corners(sr, st.radius * xf.s, st.smooth, st.square_corners);
                 let cid = child_id(id, 0, child.key);
                 self.sticky = Some(r.y + pad[1]);
                 self.tbase = tbase;
@@ -1424,6 +1643,7 @@ impl<S> Painter<'_, S> {
                 let a = self.spring(id, 8, if show { 1.0 } else { 0.0 }).clamp(0.0, 1.0);
                 let wide = self.crisp(id, 9, if show && (near || grabbed) { 1.0 } else { 0.0 }).clamp(0.0, 1.0);
                 let (it, ib) = bar_insets;
+                let ib=ib+ln.children.get(1).map_or(0.0,|overlay|overlay.size.1);
                 let (by, bh) = (r.y + it, (r.h - it - ib).max(0.0));
                 let strip = Rect::new(r.x + r.w - BAR_STRIP, by, BAR_STRIP, bh);
                 let mut bar = Bar { xf: cxf, id: bar_id, strip: xf.rect(strip), zone: None, rail: None, thumb: None, hit: None };
@@ -1441,9 +1661,10 @@ impl<S> Painter<'_, S> {
                     let at = ((offset - lo) / (hi - lo).max(1.0)).clamp(0.0, 1.0);
                     let (thin, wide_w) = self.look.theme.control.scrollbar;
                     let w = thin + (wide_w - thin) * wide;
-                    if wide > 0.01 {
+                    let track_opacity = self.look.theme.control.scrollbar_track_opacity;
+                    if wide > 0.01 && track_opacity > 0.0 {
                         let rail = Rect::new(r.x + r.w - wide_w - 4.0, by, wide_w + 4.0, bh);
-                        bar.rail = Some((rail, xf.fg.alpha(0.06 * wide * a)));
+                        bar.rail = Some((rail, xf.fg.alpha(track_opacity * wide * a)));
                     }
                     let thumb = Rect::new(r.x + r.w - 2.0 - w, by + 4.0 + (track - len) * at, w, len);
                     bar.thumb = Some((thumb, w * 0.5, xf.fg.alpha((0.45 + 0.1 * wide) * a)));
@@ -1453,6 +1674,11 @@ impl<S> Painter<'_, S> {
                     }
                 }
                 self.bars.push(bar);
+                if let Some(overlay)=bottom_overlay {
+                    let cid=child_id(id,1,overlay.key);
+                    self.tbase=tbase+ln.children[0].tn;
+                    self.paint(*overlay,&ln.children[1],(r.x,r.y),cxf,cid);
+                }
             }
             Kind::Toggle(on, f) => {
                 let r = cr;
@@ -1487,12 +1713,15 @@ impl<S> Painter<'_, S> {
                 let (th, tr) = (st.track_height, st.track_height * 0.5);
                 let track = Rect::new(r.x, cy - tr, r.w, th);
                 self.fill(&xf, track, tr, Fill::Solid(st.track), st.track_border);
-                let filled = Rect::new(r.x, cy - tr, kx - r.x + knob_d * 0.5, th);
-                self.fill(&xf, filled, tr, Fill::Solid(st.fill), None);
+                // Zero is an empty track, including the half-knob cap at its start.
+                if value > 0.0 {
+                    let filled = Rect::new(r.x, cy - tr, kx - r.x + knob_d * 0.5, th);
+                    self.fill(&xf, filled, tr, Fill::Solid(st.fill), None);
+                }
                 let (ts, tk) = (st.tick_size, st.tick_size * 0.5);
                 for k in 0..steps {
                     let x = r.x + knob_d * 0.5 + range * k as f32 / (steps - 1) as f32;
-                    let on = x <= kx + knob_d * 0.5;
+                    let on = value > 0.0 && x <= kx + knob_d * 0.5;
                     let c = if on { st.tick_on } else { st.tick_off.unwrap_or(xf.fg.alpha(0.35)) };
                     self.fill(&xf, Rect::new(x - tk, cy - tk, ts, ts), tk, Fill::Solid(c), None);
                 }
@@ -1506,6 +1735,15 @@ impl<S> Painter<'_, S> {
                 self.hit(&xf, id, csr.inflate(8.0), Action::Slider(x0, range * xf.s, steps, f));
             }
         }
+        if let Some((mut mxf, (color, square))) = corner_mask {
+            mxf.shape_sq = square | st.square_corners;
+            self.smooth = st.smooth || st.glass.is_some();
+            self.fill(&mxf, r, st.radius, Fill::Solid(color), None);
+            if let Some(Cmd::Quad(q)) = self.list.cmds.last_mut() {
+                q.np[3] = ((q.np[3] as u32) | 256) as f32;
+            }
+            self.smooth = false;
+        }
         if let Some((ixf, sh)) = inset {
             self.smooth = st.smooth;
             self.shadow(&ixf, r, st.radius, sh, false);
@@ -1514,6 +1752,13 @@ impl<S> Painter<'_, S> {
         if let Some((bxf, b)) = late_border {
             self.smooth = st.smooth;
             self.fill(&bxf, r, st.radius, Fill::Solid(Color::CLEAR), Some(b));
+            if let Some((color, fraction, trailing)) = st.border_fade {
+                if let Some(Cmd::Quad(q)) = self.list.cmds.last_mut() {
+                    q.n0 = color.arr();
+                    q.n1 = [fraction, if trailing { 1.0 } else { 0.0 }, 0.0, 0.0];
+                    q.np[3] = ((q.np[3] as u32) | 16384) as f32;
+                }
+            }
             self.smooth = false;
         }
     }
@@ -1529,11 +1774,18 @@ pub struct Ui<S> {
     /// Window background; `None` = the theme's `color.bg`. See [`Ui::clear_color`].
     pub background: Option<Color>,
     look: Rc<Look>,
-    theme_fn: Option<Box<dyn Fn(&S) -> Theme>>,
+    theme_fn: Option<Box<dyn Fn(&S,bool) -> Theme>>,
+    /// Latest platform appearance. The runner updates this only on OS events; embedders
+    /// and headless tests may set it explicitly. It is independent of the current theme.
+    pub system_dark:bool,
     /// True while springs or scroll inertia are still moving: keep drawing frames.
     pub animating: bool,
+    /// Native live-resize gesture. Size changes also bypass animations automatically.
+    /// Embedders can hold this true between resize events; the app runner sets it on macOS.
+    pub resizing: bool,
     hits: Vec<Hit<S>>,
     zones: Vec<Zone>,
+    pointer_observers: Vec<PointerObserver<S>>,
     /// Views under the mouse, topmost first.
     hovered: Vec<u64>,
     /// A split divider held by the pointer, and the last press on one (for a double click).
@@ -1545,6 +1797,8 @@ pub struct Ui<S> {
     pub cursor: Cursor,
     springs: HashMap<(u64, u8), Spring>,
     scrolls: HashMap<u64, ScrollState>,
+    reveals: reveal::Reveals,
+    marquees: marquee::Marquees,
     ptr: Pointer,
     last_frame: Option<Instant>,
     frame: u64,
@@ -1603,9 +1857,12 @@ impl<S: 'static> Ui<S> {
             background: None,
             look: Rc::new(Look::new(Rc::new(Theme::default()))),
             theme_fn: None,
+            system_dark:true,
             animating: false,
+            resizing: false,
             hits: Vec::new(),
             zones: Vec::new(),
+            pointer_observers: Vec::new(),
             hovered: Vec::new(),
             split_drag: None,
             split_down: None,
@@ -1613,6 +1870,8 @@ impl<S: 'static> Ui<S> {
             cursor: Cursor::Default,
             springs: HashMap::new(),
             scrolls: HashMap::new(),
+            reveals: reveal::Reveals::default(),
+            marquees: marquee::Marquees::default(),
             ptr: Pointer::default(),
             last_frame: None,
             frame: 0,
@@ -1658,7 +1917,12 @@ impl<S: 'static> Ui<S> {
     /// `ui.theme_with(|s: &State| if s.dark { Theme::dark() } else { Theme::light() })`.
     /// Overrides [`set_theme`](Self::set_theme).
     pub fn theme_with(&mut self, f: impl Fn(&S) -> Theme + 'static) {
-        self.theme_fn = Some(Box::new(f));
+        self.theme_fn = Some(Box::new(move |state,_|f(state)));
+    }
+    /// Derive a theme from state and the latest OS appearance. This supports a persistent
+    /// System/Light/Dark preference without polling or mutating the OS appearance.
+    pub fn theme_with_system(&mut self,f:impl Fn(&S,bool)->Theme+'static) {
+        self.theme_fn=Some(Box::new(f));
     }
     /// What to clear the window with: [`background`](Self::background), or the theme's.
     pub fn clear_color(&self) -> Color {
@@ -1667,10 +1931,10 @@ impl<S: 'static> Ui<S> {
 
     /// Builds, lays out and paints one frame for a window of `size` points.
     pub fn frame(&mut self, size: (f32, f32)) {
-        if let Some(f) = &self.theme_fn {
-            let t = f(&self.state);
-            self.set_theme(t);
-        }
+        // Dependent animated layout follows direct split drags just like window resizing.
+        let dragging_split = self.split_drag.as_ref().is_some_and(|d| !d.collapsed
+            && self.springs.get(&(d.hit.id, SLOT_SPLIT)).is_some_and(|s| s.target > 0.0 && (s.x - s.target).abs() < 0.5));
+        let resizing = self.resizing || dragging_split || (self.frame > 0 && self.size != size);
         // Updates sent through `Link`s from background work.
         self.pump();
         self.text.set_scale(self.scale);
@@ -1690,7 +1954,7 @@ impl<S: 'static> Ui<S> {
         self.frame += 1;
 
         for s in self.springs.values_mut() {
-            s.step(dt);
+            if resizing { s.snap_to(s.target); } else { s.step(dt); }
         }
         // Timers queued with `after()`.
         PENDING.with(|p| {
@@ -1708,7 +1972,20 @@ impl<S: 'static> Ui<S> {
                 i += 1;
             }
         }
+        // A timer can schedule its next bounded animation tick. Collect those before
+        // computing wake_in, otherwise the UI could sleep with callbacks still pending.
+        PENDING.with(|p| {
+            for (delay,f) in p.borrow_mut().drain(..) {
+                if let Ok(f)=f.downcast::<Box<dyn FnOnce(&mut S)>>() {
+                    self.timers.push((now+std::time::Duration::from_secs_f32(delay),*f));
+                }
+            }
+        });
         // From handlers that ran outside a tap (keys, timers, background updates).
+        if let Some(f)=&self.theme_fn {
+            let theme=f(&self.state,self.system_dark);
+            self.set_theme(theme);
+        }
         self.take_copies();
 
         // Scroll physics: inertia inside the content, a spring back from beyond its ends.
@@ -1785,12 +2062,14 @@ impl<S: 'static> Ui<S> {
         if tip_show.is_some() {
             self.tip_seen = Some(now);
         }
-        let mut lx = Lx { text: &mut self.text, look: &look, springs: &mut self.springs, frame: self.frame, along: None, menu: self.open_menu, tip: tip_show, shift: 0.0 };
+        let mut lx = Lx { text: &mut self.text, look: &look, springs: &mut self.springs, frame: self.frame, resizing, along: None, menu: self.open_menu, tip: tip_show, shift: 0.0, tail_viewport: None };
         let root = layout(&view, (Some(size.0), Some(size.1)), &mut lx, 1);
         self.list.cmds.clear();
         self.list.images.clear();
+        let previous_fields = self.field_ids();
         self.hits.clear();
         self.zones.clear();
+        self.pointer_observers.clear();
         self.sel.texts.clear();
         self.sel.areas.clear();
         self.menu_nav.clear();
@@ -1803,10 +2082,14 @@ impl<S: 'static> Ui<S> {
             tx: 0.0,
             ty: 0.0,
             opacity: 1.0,
+            text_reveal: None,
+            hover_scope: None,
             clip: Rect::new(0.0, 0.0, size.0, size.1),
             clip_r: 0.0,
             clip_smooth: false,
             clip_sq: 0,
+            shape_sq: 0,
+            border_hidden: 0,
             fg,
             px: self.scale,
         };
@@ -1816,6 +2099,7 @@ impl<S: 'static> Ui<S> {
             look: &look,
             hits: &mut self.hits,
             zones: &mut self.zones,
+            pointer_observers: &mut self.pointer_observers,
             hovered: &self.hovered,
             springs: &mut self.springs,
             scrolls: &mut self.scrolls,
@@ -1823,7 +2107,10 @@ impl<S: 'static> Ui<S> {
             bar_drag: self.ptr.bar.map(|b| b.0),
             split_drag: self.split_drag.as_ref().map(|d| d.hit.id),
             frame,
+            resizing,
             text: &mut self.text,
+            reveals: &mut self.reveals,
+            marquees: &mut self.marquees,
             focus: self.focus,
             ed: &mut self.ed,
             caret_on: blink % 1.0 < 0.5,
@@ -1874,10 +2161,11 @@ impl<S: 'static> Ui<S> {
             self.sel_drag(self.ptr.last); // the text under the pointer moved
         }
         if let Some(id) = self.focus {
-            if !self.hits.iter().any(|h| h.id == id) {
+            if !self.hits.iter().any(|h| h.id == id && matches!(h.action, Action::Field(_))) {
                 self.focus = None;
             }
         }
+        let autofocus = self.focus_new_field(&previous_fields);
         let timer_wake = self.timers.iter().map(|t| t.0.saturating_duration_since(now).as_secs_f32()).reduce(f32::min);
         self.wake_in = [self.focus.filter(|_| self.ed.blinks()).map(|_| 0.5 - blink % 0.5), paint_wake, scroll_wake, timer_wake, tip_wake]
             .into_iter()
@@ -1898,8 +2186,10 @@ impl<S: 'static> Ui<S> {
         self.menu_state.retain(|_, m| m.used == frame);
         self.springs.retain(|_, s| s.used == frame);
         self.scrolls.retain(|_, s| s.used == frame);
+        self.reveals.end_frame(frame);
+        self.marquees.end_frame(frame);
         self.text.end_frame();
-        self.animating = self.show_fps
+        self.animating = autofocus || self.show_fps
             || rehover
             || spin
             || relayout
@@ -1943,6 +2233,12 @@ impl<S: 'static> Ui<S> {
             clip,
             fade: None,
         }));
+    }
+
+    /// Whether the topmost input target at `pos` is a window-drag area. Native hosts use this
+    /// to gate system title-bar gestures; controls and open overlays block the area underneath.
+    pub fn window_drag_at(&self, pos: (f32, f32)) -> bool {
+        self.hit(pos, false).is_some_and(|i| matches!(self.hits[i].action, Action::DragWindow))
     }
 
     fn hit(&self, pos: (f32, f32), scroll: bool) -> Option<usize> {
@@ -2067,6 +2363,12 @@ impl<S: 'static> Ui<S> {
             t.hidden = true; // a click hides the tooltip until the mouse moves on
         }
         let hit = self.hit(pos, false);
+        // A consumed click breaks the title-bar gesture, including popover dismissal (which
+        // returns early below). Only consecutive mouse presses on the drag area may zoom.
+        if touch || !hit.is_some_and(|i| matches!(self.hits[i].action, Action::DragWindow)) {
+            self.ptr.drag_down = None;
+        }
+        if !hit.is_some_and(|i| matches!(self.hits[i].action, Action::Tap(..))) { self.ptr.tap = None; }
         self.ptr.pressed = hit.map(|i| self.hits[i].id);
         if let Some(Action::Outside(d)) = hit.map(|i| &self.hits[i].action) {
             // macOS: the click that closes a popover does nothing else.
@@ -2077,6 +2379,7 @@ impl<S: 'static> Ui<S> {
         self.ptr.bar = None;
         if let Some(Action::Split(h)) = hit.map(|i| &self.hits[i].action) {
             let h = h.clone();
+            self.blur();
             self.ptr.pressed = None;
             self.split_press(h, pos.0);
             return true;
@@ -2088,7 +2391,7 @@ impl<S: 'static> Ui<S> {
                 return true;
             }
         }
-        self.focus = None;
+        if !hit.is_some_and(|i| self.focus == Some(self.hits[i].id)) { self.blur(); }
         if let Some(i) = hit {
             if matches!(self.hits[i].action, Action::DragWindow) && !touch {
                 let now = Instant::now();
@@ -2145,8 +2448,17 @@ impl<S: 'static> Ui<S> {
 
     /// The mouse left the window: nothing is hovered any more.
     pub fn pointer_leave(&mut self) -> bool {
-        self.mouse = None;
-        self.update_hover()
+        let changed=self.mouse.take().is_some();
+        let tracked=changed && self.notify_pointer();
+        self.update_hover() || tracked
+    }
+
+    fn notify_pointer(&mut self) -> bool {
+        for observer in &self.pointer_observers {
+            let pos=self.mouse.map(|p|((p.0-observer.rect.x)/observer.scale,(p.1-observer.rect.y)/observer.scale));
+            (observer.handler)(&mut self.state,pos);
+        }
+        !self.pointer_observers.is_empty()
     }
 
     /// Pointer moved. Returns true if a redraw is needed: dragging something, or the mouse
@@ -2160,12 +2472,14 @@ impl<S: 'static> Ui<S> {
             false
         } else {
             self.ptr.touch = false;
+            let moved=self.mouse!=Some(pos);
             self.mouse = Some(pos);
+            let tracked=moved && self.notify_pointer();
             let changed = self.update_hover();
             if changed {
                 self.menu_hover();
             }
-            changed
+            changed || tracked
         };
         if self.split_drag.is_some() {
             return self.split_move(pos.0) || hover;
@@ -2256,8 +2570,24 @@ impl<S: 'static> Ui<S> {
     /// Does what a click on hit `i` does.
     fn activate(&mut self, i: usize) {
         let id = self.hits[i].id;
+        // Dismiss the source menu before its action can open another application layer.
+        if let Action::MenuPick(_, Some(d)) = &self.hits[i].action {
+            self.run_dismiss(d.clone());
+        }
         match &self.hits[i].action {
-            Action::Tap(f) => f(&mut self.state),
+            Action::Tap(tap, double_tap) => {
+                let now = Instant::now();
+                let pos = self.ptr.last;
+                let double = self.ptr.tap.take().is_some_and(|(t, previous, p)| previous == id
+                    && (now-t).as_secs_f32() < DOUBLE_CLICK
+                    && (p.0-pos.0).abs() < 4.0 && (p.1-pos.1).abs() < 4.0);
+                if double && double_tap.is_some() {
+                    if let Some(f) = double_tap { f(&mut self.state); }
+                } else {
+                    self.ptr.tap = Some((now,id,pos));
+                    if let Some(f) = tap { f(&mut self.state); }
+                }
+            },
             Action::Toggle(on, f) => f(&mut self.state, !on),
             Action::OpenMenu => {
                 self.springs.remove(&(id, 4)); // replay the opening animation
@@ -2270,13 +2600,7 @@ impl<S: 'static> Ui<S> {
                 f(&mut self.state, *index);
                 self.open_menu = None;
             }
-            Action::MenuPick(f, d) => {
-                let d = d.clone();
-                f(&mut self.state);
-                if let Some(d) = d {
-                    self.run_dismiss(d);
-                }
-            }
+            Action::MenuPick(f, _) => f(&mut self.state),
             &Action::SubMenu(menu, row) => {
                 let st = self.menu_state.entry(menu).or_default();
                 st.hl = Some(row);
@@ -2319,6 +2643,7 @@ impl<S: 'static> Ui<S> {
                 self.blur();
                 true
             }
+            KeyInput::Escape if self.field_key(key) => true,
             KeyInput::Escape => self.open_menu.take().is_some() | self.blur() | self.sel_key(key),
             KeyInput::Enter if self.open_menu.is_some() => {
                 self.open_menu = None;

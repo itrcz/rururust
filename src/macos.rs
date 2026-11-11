@@ -4,6 +4,7 @@
 //! owns; when AppKit hands back something unexpected (no button, no superview) it does nothing.
 
 use crate::app::Backdrop;
+pub(crate) mod voice;
 use objc2::rc::Retained;
 use objc2::runtime::NSObject;
 use objc2::{declare_class, msg_send_id, mutability, sel, ClassType, DeclaredClass};
@@ -13,7 +14,7 @@ use objc2_app_kit::{
     NSAutoresizingMaskOptions, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
     NSViewFrameDidChangeNotification, NSWindow, NSWindowButton, NSWindowOrderingMode, NSWindowStyleMask,
 };
-use objc2_foundation::{MainThreadMarker, NSNotification, NSNotificationCenter, NSPoint, NSRect};
+use objc2_foundation::{MainThreadMarker, NSNotification, NSNotificationCenter, NSPoint, NSRect, NSObjectNSDelayedPerforming};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
@@ -48,6 +49,53 @@ fn ns_window(window: &Window) -> Option<Retained<NSWindow>> {
     content_view(window)?.window()
 }
 
+/// Enable native movement only during an explicit, hit-tested drag request.
+/// Leaving it enabled between events also lets AppKit handle title-bar double clicks,
+/// so one gesture can zoom twice: once natively and once through WindowRequest::Zoom.
+pub(crate) fn drag_window(window: &Window) {
+    let custom = ns_window(window)
+        .filter(|win| win.styleMask().contains(NSWindowStyleMask::FullSizeContentView));
+    if let Some(win) = &custom { win.setMovable(true); }
+    let _ = window.drag_window();
+    if let Some(win) = &custom { win.setMovable(false); }
+}
+
+/// Leave winit's input callback before entering AppKit's synchronous zoom animation.
+/// Otherwise winit queues every nested resize until the zoom has already finished.
+pub(crate) fn request_zoom(window: &Window) {
+    if let Some(win) = ns_window(window) {
+        // SAFETY: zoom: is NSWindow's standard one-object action. Delayed performing retains
+        // its target and runs it on this main run loop after the current handler returns.
+        unsafe { win.performSelector_withObject_afterDelay(sel!(zoom:), None, 0.0) };
+    }
+}
+
+/// Live resize is a direct manipulation, not a UI transition. AppKit stays the owner
+/// of the layer bounds; Metal presents the matching frame in the same transaction.
+pub(crate) fn sync_resize(window: &Window, surface: &wgpu::Surface<'_>, size_changed: bool) -> bool {
+    // SAFETY: content_view retains this window's NSView on the event-loop main thread.
+    let live = content_view(window).is_some_and(|view| unsafe { view.inLiveResize() });
+    // SAFETY: borrow wgpu's surface without destroying/replacing it or touching its
+    // drawable resources. The guard and layer lock stay held for these main-thread setters.
+    if let Some(surface) = unsafe { surface.as_hal::<wgpu::hal::api::Metal>() } {
+        let layer = surface.render_layer().lock();
+        // SAFETY: immutable QuartzCore constant, with the type declared by its bindings.
+        let gravity = unsafe { objc2_quartz_core::kCAGravityTopLeft };
+        if &*layer.contentsGravity() != gravity {
+            // If the compositor gets ahead of a frame, keep it at its native size instead
+            // of stretching every fixed-position icon with the window's new bounds.
+            layer.setContentsGravity(gravity);
+        }
+        let transaction = live || size_changed;
+        if layer.presentsWithTransaction() != transaction {
+            // wgpu waits until scheduling and presents in AppKit's transaction only while
+            // resizing; normal frames keep the asynchronous, vsynced presentation path.
+            layer.setPresentsWithTransaction(transaction);
+        }
+    }
+    live
+}
+
 impl Chrome {
     /// Puts the backdrop under the content. Call before the GPU surface is created, so the Metal
     /// layer (a sublayer of the content view) ends up above the effect view.
@@ -55,6 +103,12 @@ impl Chrome {
         let mut chrome = Chrome { effect: None, dark: None, keeper: None };
         let (Some(view), Some(mtm)) = (content_view(window), MainThreadMarker::new()) else { return chrome };
         let Some(win) = view.window() else { return chrome };
+        if win.styleMask().contains(NSWindowStyleMask::FullSizeContentView) {
+            // The custom title bar owns its gestures. AppKit would otherwise intercept a
+            // second click on its transparent chrome before ruru can hit-test the button.
+            // The runner enables native movement only for an explicit drag request.
+            win.setMovable(false);
+        }
         match backdrop {
             None => {}
             Some(Backdrop::Blur(radius)) => {
@@ -148,6 +202,8 @@ struct Place {
     height: Cell<f64>,
     /// The system's x of the close button, read before it is first moved.
     system_x: Cell<Option<f64>>,
+    step: Cell<Option<f64>>,
+    placing: Cell<bool>,
 }
 
 declare_class!(
@@ -182,7 +238,7 @@ declare_class!(
 
 impl Keeper {
     fn new(mtm: MainThreadMarker) -> Retained<Keeper> {
-        let this = mtm.alloc::<Keeper>().set_ivars(Place { height: Cell::new(0.0), system_x: Cell::new(None) });
+        let this = mtm.alloc::<Keeper>().set_ivars(Place { height: Cell::new(0.0), system_x: Cell::new(None), step: Cell::new(None), placing: Cell::new(false) });
         // SAFETY: NSObject's `init` on a freshly allocated object with its ivars set.
         unsafe { msg_send_id![super(this), init] }
     }
@@ -193,11 +249,19 @@ impl Keeper {
         // SAFETY: main-thread AppKit getters; the observer is removed in `Drop for Chrome` before
         // it is released, and the selector is the one `Keeper` implements.
         unsafe {
-            let Some(container) = close.superview().and_then(|bar| bar.superview()) else { return };
+            let Some(bar) = close.superview() else { return };
+            let Some(container) = bar.superview() else { return };
             let center = NSNotificationCenter::defaultCenter();
-            for v in [&*container, &**close] {
+            let mut views = vec![container, bar, Retained::into_super(Retained::into_super(close))];
+            for button in [NSWindowButton::NSWindowMiniaturizeButton, NSWindowButton::NSWindowZoomButton] {
+                if let Some(button) = win.standardWindowButton(button) {
+                    views.push(Retained::into_super(Retained::into_super(button)));
+                }
+            }
+            if let Some(content) = win.contentView() { views.push(content); }
+            for v in &views {
                 v.setPostsFrameChangedNotifications(true);
-                center.addObserver_selector_name_object(self, sel!(frameChanged:), Some(NSViewFrameDidChangeNotification), Some(v));
+                center.addObserver_selector_name_object(self, sel!(frameChanged:), Some(NSViewFrameDidChangeNotification), Some(&**v));
             }
         }
     }
@@ -215,6 +279,12 @@ impl Drop for Chrome {
 /// Moves the title bar container and the buttons where `p` says, touching only frames that differ
 /// (each move posts a frame change back to the keeper).
 fn place(win: &NSWindow, p: &Place) -> Option<f32> {
+    if p.placing.replace(true) { return None; }
+    struct Placing<'a>(&'a Cell<bool>);
+    impl Drop for Placing<'_> {
+        fn drop(&mut self) { self.0.set(false); }
+    }
+    let _placing = Placing(&p.placing);
     let buttons = [NSWindowButton::NSWindowCloseButton, NSWindowButton::NSWindowMiniaturizeButton, NSWindowButton::NSWindowZoomButton]
         .map(|b| win.standardWindowButton(b));
     let [Some(close), Some(mini), Some(zoom)] = buttons else { return None };
@@ -230,15 +300,17 @@ fn place(win: &NSWindow, p: &Place) -> Option<f32> {
         let (h, bh) = (p.height.get(), close.frame().size.height);
         let system_x = p.system_x.get().unwrap_or(close.frame().origin.x);
         p.system_x.set(Some(system_x));
-        let step = mini.frame().origin.x - close.frame().origin.x;
-        // The container hangs from the top of the window (AppKit's y goes up).
+        let step = p.step.get().unwrap_or(mini.frame().origin.x - close.frame().origin.x);
+        p.step.set(Some(step));
+        // The parent, not the container's previous frame, owns the current window top.
+        let parent = container.superview()?;
+        let bounds = parent.bounds();
+        objc2_quartz_core::CATransaction::begin();
+        objc2_quartz_core::CATransaction::setDisableActions(true);
         let mut frame: NSRect = container.frame();
-        let top = frame.origin.y + frame.size.height;
-        if frame.size.height != h {
-            frame.size.height = h;
-            frame.origin.y = top - h;
-            container.setFrame(frame);
-        }
+        frame.size.height = h;
+        frame.origin.y = if parent.isFlipped() { bounds.origin.y } else { bounds.origin.y + bounds.size.height - h };
+        if container.frame() != frame { container.setFrame(frame); }
         let y = (bar.frame().size.height - bh) / 2.0;
         let x = system_x.max((h - bh) / 2.0 + 1.0);
         for (i, b) in [&close, &mini, &zoom].into_iter().enumerate() {
@@ -247,6 +319,42 @@ fn place(win: &NSWindow, p: &Place) -> Option<f32> {
                 b.setFrameOrigin(at);
             }
         }
+        objc2_quartz_core::CATransaction::commit();
         Some((zoom.frame().origin.x + zoom.frame().size.width + 8.0) as f32)
+    }
+}
+
+
+/// Native directory chooser. Called only by an event handler on the AppKit main thread.
+pub(crate) fn pick_folder() -> Option<std::path::PathBuf> {
+    let mtm = MainThreadMarker::new()?;
+    // SAFETY: AppKit panel creation and its modal loop run on the main thread. The retained
+    // panel and URL live through conversion to an owned Rust path; no delegate is installed.
+    unsafe {
+        let panel = objc2_app_kit::NSOpenPanel::openPanel(mtm);
+        panel.setCanChooseFiles(false);
+        panel.setCanChooseDirectories(true);
+        panel.setAllowsMultipleSelection(false);
+        if panel.runModal() != objc2_app_kit::NSModalResponseOK { return None; }
+        panel.URL()?.path().map(|path| std::path::PathBuf::from(path.to_string()))
+    }
+}
+
+/// Native multi-file chooser; this function never reads file contents.
+pub(crate) fn pick_files()->Result<Vec<std::path::PathBuf>,String> {
+    let mtm=MainThreadMarker::new().ok_or("File selection must run on the main thread")?;
+    // SAFETY: panel creation and its nested modal loop run on AppKit's main thread.
+    // Retained panel/URLs outlive conversion to owned paths; no raw reference escapes.
+    unsafe {
+        let panel=objc2_app_kit::NSOpenPanel::openPanel(mtm);
+        panel.setCanChooseFiles(true);
+        panel.setCanChooseDirectories(false);
+        panel.setAllowsMultipleSelection(true);
+        if panel.runModal()!=objc2_app_kit::NSModalResponseOK {return Ok(Vec::new());}
+        let urls=panel.URLs();
+        urls.iter().map(|url| {
+            if !url.isFileURL() {return Err("Selected item is not a local file".into());}
+            url.path().map(|path|std::path::PathBuf::from(path.to_string())).ok_or_else(||"Selected file has no path".into())
+        }).collect()
     }
 }

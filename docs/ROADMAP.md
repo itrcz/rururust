@@ -23,6 +23,12 @@
 - **Аудит фундамента (решение 003)**: пакеты 1–6 — углы, пиксельная сетка (`Ui.scale`), тема, тени,
   текст в один буфер с LRU, типографика. `Theme` (решение 005): `App::theme`, `theme_auto`, `env.theme`.
 
+- **Grom integration**: text-tail cursor/morph, per-grapheme blur reveal, cube companion,
+  hover marquee/offset, focus-select and disabled controls, native file dialogs/drop and voice,
+  explicit/system appearance, stable lazy-scroll restoration, measured `Scroll.bottom_overlay`.
+- **Picker**: shared text/theme metrics for control and menu; measured label/chevron centering,
+  configurable padding, compact rows, keyboard and geometry regressions.
+
 ## В работе
 
 - **Ускорение рендера** (пакет 7 аудита, ветка `gpu-perf`): пропуск неизменившегося кадра, стекло по области.
@@ -32,8 +38,6 @@
 
 ## Следующее (по приоритету)
 
-1. **Кнопки окна macOS под высоту шапки** — наши иконки на ~8 pt ниже «светофора» (GAPS п. 4). Нужен
-   `unsafe` (NSWindow) — ждёт решения владельца.
 2. **Якорь скролла при вставке в начало ленты** — видимая строка должна стоять на месте; то же для выделения.
 3. **Групповая прозрачность** (offscreen-слои) — полупрозрачный контейнер сейчас просвечивает детьми.
 4. **IME и экранная клавиатура на web** — нужно скрытое DOM-поле; без него мобильный браузер непригоден для чата.
@@ -41,6 +45,14 @@
 6. **Мемоизация поддеревьев** — `view` вызывается целиком на каждый кадр; сначала замеры на 1k/10k узлов.
 7. **Accessibility** (AccessKit) — требование платформ, архитектурное решение сначала в `docs/`.
 8. **Горизонтальный скролл** — для кода и таблиц.
+
+### После ревью интеграции
+
+- Picker и generic Menu ещё имеют отдельные paint paths; объединять вместе с keyboard-navigation tests.
+- Перед оптимизацией больших историй измерить пересборку списка (O(total rows)) и подсветку больших
+  code blocks; текущая lazy-отрисовка не означает O(visible rows) для всей layout-процедуры.
+- Welcome-layout приложения всё ещё оценивает текст для скрытия приветствия в маленьком окне;
+  нижняя панель обычного чата уже использует фактически измеренную высоту.
 
 ## Позже
 

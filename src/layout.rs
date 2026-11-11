@@ -15,6 +15,8 @@ pub(crate) struct Lx<'a> {
     pub look: &'a Look,
     pub springs: &'a mut HashMap<(u64, u8), Spring>,
     pub frame: u64,
+    /// Window geometry is changing: layout follows it immediately, without springs.
+    pub resizing: bool,
     /// Set by a stack for a `.flex()` child just before laying it out: the axis along which
     /// the child takes its share, so it fills it without knowing its parent.
     pub along: Option<Axis>,
@@ -25,12 +27,14 @@ pub(crate) struct Lx<'a> {
     /// How far lazy lists moved their anchor row while re-measuring for a new width; the
     /// enclosing scroll view takes it into its offset (see `LNode::shift`).
     pub shift: f32,
+    /// A bottom-following scroll measures its lazy tail before selecting the first offset.
+    pub tail_viewport: Option<f32>,
 }
 
 impl Lx<'_> {
     fn spring(&mut self, id: u64, slot: u8, target: f32) -> f32 {
         let s = self.springs.entry((id, slot)).or_insert(Spring::new(target, target, self.look.theme.motion.smooth));
-        s.target = target;
+        if self.resizing { s.snap_to(target); } else { s.target = target; }
         s.used = self.frame;
         s.x
     }
@@ -43,11 +47,6 @@ impl Lx<'_> {
         s.used = self.frame;
         s.x
     }
-}
-
-/// A one-line label in the theme's body style (picker, its drop-down).
-pub(crate) fn body_spec<'a>(lx: &Lx, text: &'a str) -> TextSpec<'a> {
-    spec_in(&lx.look.theme.text.body, text)
 }
 
 pub(crate) fn spec_in<'a>(ts: &crate::theme::TextStyle, text: &'a str) -> TextSpec<'a> {
@@ -70,6 +69,8 @@ pub(crate) struct LNode {
     pub children: Vec<LNode>,
     /// Shaped-text cache key (Text nodes only).
     pub text: u64,
+    /// Natural width of a one-line hover marquee, shaped once during layout.
+    pub marquee_width: f32,
     /// Content height (Scroll nodes only).
     pub content_h: f32,
     /// Scroll nodes: how much the content above the visible rows grew (a lazy list re-wrapped
@@ -157,7 +158,7 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
     let mut node = LNode::default();
     let mut hug_h = false;
     let content: (f32, f32) = match &v.kind {
-        Kind::Empty | Kind::Spacer => (0.0, 0.0),
+        Kind::Empty | Kind::Spacer | Kind::Activity {..} => (0.0, 0.0),
         Kind::Text(t) => {
             let spec =
                 TextSpec {
@@ -171,7 +172,12 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
                 features: &t.features,
                 owner: id,
             };
-            if t.lines > 0 {
+            if v.style.hover_marquee.is_some() {
+                let (key,size,_) = lx.text.measure_lines(&spec,None,1,true);
+                node.text = key;
+                node.marquee_width = size.0;
+                (size.0.min(inner.0.unwrap_or(size.0)),size.1)
+            } else if t.lines > 0 {
                 let fade = t.truncate == Truncate::Fade;
                 let (key, size, cut) = lx.text.measure_lines(&spec, inner.0, t.lines, fade);
                 node.text = key;
@@ -196,11 +202,13 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
             (w, h)
         }
         Kind::TextField(f) => crate::ui::edit::layout_field(f, inner.0, lx.text, &mut node),
-        Kind::Picker { options, selected, .. } => {
-            let label = options.get(*selected).map_or("", |s| s.as_str());
-            let (key, size) = lx.text.measure(&body_spec(lx, label), None);
-            node.text = key;
-            (size.0 + 26.0, size.1)
+        Kind::Picker { label, .. } => {
+            let style=label.text_style();
+            let reserved=style.size*1.5;
+            let (key,size,_)=lx.text.measure_lines(&spec_in(&style,&label.content),inner.0.map(|w|(w-reserved).max(1.0)),1,false);
+            node.text=key;
+            node.texts.push((key,size));
+            (size.0+reserved,size.1)
         }
         Kind::Tabs { labels, .. } => {
             let mut widest = 0.0f32;
@@ -227,45 +235,58 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
             // Rows are built during paint (only the visible ones); here we just need the
             // total height: measured rows as measured, the rest at the estimate.
             let w = inner.0.unwrap_or(0.0);
+            // Do not pass the outer tail budget into a nested list inside one row.
+            let tail_viewport = lx.tail_viewport.take();
             let cache = lx.text.lists.entry(id).or_default();
             cache.heights.resize(*count, f32::NAN);
-            if cache.width != w {
+            {
                 let was = std::mem::replace(&mut cache.width, w);
-                // Rows wrap differently at another width. Forgetting every height would swap
-                // the total for estimates and make a resizing window jump each frame; the old
-                // heights stay as estimates, and the rows that were on screen are measured
-                // again right here (an extra layout of a few lazy rows, like paint does), so
-                // the end of a feed stays on the bottom and the anchor row stays put.
+                // Measure visible rows BEFORE the enclosing scroll chooses its offset.
+                // Content can change at the same width (streamed markdown), not just on
+                // resize. Measuring only in paint left the scroll range one frame behind,
+                // making the bottom bounce on every added line. Offscreen rows stay lazy.
+                let (seen, anchor) = (cache.seen, cache.anchor);
+                let est = |h: f32| if h.is_nan() { *row_h } else { h };
+                let old: Vec<f32> = cache.heights.iter().map(|&h| est(h)).collect();
+                let mut measure = |i: usize| {
+                    let mut rv = row(i);
+                    crate::theme::apply(&mut rv, lx.look);
+                    layout(&rv, (Some(w + pad_w), None), lx, child_id(id, i, rv.key)).size.1
+                };
+                let mut fresh = HashMap::new();
                 if was > 0.0 {
-                    let (seen, anchor) = (cache.seen, cache.anchor);
-                    let est = |h: f32| if h.is_nan() { *row_h } else { h };
-                    let old: Vec<f32> = cache.heights.iter().map(|&h| est(h)).collect();
                     let (a, b) = (seen.0.min(*count), (seen.1 + 2).min(*count));
                     let on_screen: f32 = old[a..seen.1.min(*count)].iter().sum();
-                    let mut measure = |i: usize| {
-                        let mut rv = row(i);
-                        crate::theme::apply(&mut rv, lx.look);
-                        layout(&rv, (Some(w + pad_w), None), lx, child_id(id, i, rv.key)).size.1
-                    };
-                    let mut fresh: Vec<(usize, f32)> = (a..b).map(|i| (i, measure(i))).collect();
+                    for i in a..b { fresh.insert(i, measure(i)); }
                     // Narrower rows grow: cover the old screen height upwards too.
-                    let mut covered: f32 = fresh.iter().map(|f| f.1).sum();
+                    let mut covered: f32 = fresh.values().sum();
                     let mut i = a;
                     while i > 0 && covered < on_screen + 2.0 * row_h {
                         i -= 1;
                         let h = measure(i);
                         covered += h;
-                        fresh.push((i, h));
-                    }
-                    let cache = lx.text.lists.entry(id).or_default();
-                    for (i, h) in fresh {
-                        if i < anchor {
-                            lx.shift += h - old[i];
-                        }
-                        cache.heights[i] = h;
+                        fresh.insert(i, h);
                     }
                 }
+                // The first visible frame must already use the real tail height. Estimates
+                // can be much smaller than a single markdown message, so painting and then
+                // correcting the offset on the following frame causes a visible top→bottom
+                // jump. Only measure enough final rows to cover one viewport.
+                if let Some(viewport) = tail_viewport {
+                    let mut covered = 0.0;
+                    for i in (0..*count).rev() {
+                        let h = *fresh.entry(i).or_insert_with(|| measure(i));
+                        covered += h;
+                        if covered >= viewport { break; }
+                    }
+                }
+                let cache = lx.text.lists.entry(id).or_default();
+                for (i, h) in fresh {
+                    if was > 0.0 && i < anchor { lx.shift += h - old[i]; }
+                    cache.heights[i] = h;
+                }
             }
+            lx.tail_viewport = tail_viewport;
             let cache = lx.text.lists.entry(id).or_default();
             (w, cache.heights.iter().map(|h| if h.is_nan() { *row_h } else { *h }).sum())
         }
@@ -290,22 +311,31 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
             node.children.push(c);
             (w, h)
         }
-        Kind::Scroll { child, .. } => {
+        Kind::Scroll { child, stick, bottom_overlay, .. } => {
             let outer = std::mem::take(&mut lx.shift);
+            // Measure the floating layer before content: its true wrapped height defines
+            // both the visible tail budget and the empty space at the content's end.
+            let outer_tail=lx.tail_viewport.take();
+            let overlay=bottom_overlay.as_ref().map(|view|layout(view,inner,lx,child_id(id,1,view.key)));
+            let overlay_h=overlay.as_ref().map_or(0.0,|node|node.size.1);
+            lx.shift=0.0;
+            lx.tail_viewport=if *stick {inner.1.map(|h|(h-overlay_h).max(0.0))} else {None};
             let c = layout(child, (inner.0, None), lx, child_id(id, 0, child.key));
+            lx.tail_viewport = outer_tail;
             node.shift = std::mem::replace(&mut lx.shift, outer);
-            node.content_h = c.size.1;
+            node.content_h = c.size.1+overlay_h;
             // A scroll fills what it is offered, except in height under a max limit: there it
             // hugs the content up to the limit, then scrolls (a menu list "as tall as its
             // rows, at most 320"). `.height()` still fixes it.
             hug_h = !matches!(dim_h, Dim::Fixed(_)) && st.max.1.is_finite();
             let h = match inner.1 {
-                Some(o) if hug_h => c.size.1.min(o),
+                Some(o) if hug_h => node.content_h.min(o),
                 Some(o) => o,
-                None => c.size.1,
+                None => node.content_h,
             };
             let s = (inner.0.unwrap_or(c.size.0), h);
             node.children.push(c);
+            if let Some(overlay)=overlay {node.children.push(overlay);}
             s
         }
         Kind::Stack { children, .. } if split.is_some() && children.len() == 2 => {
@@ -437,7 +467,12 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
     // Place children now that the final size is known.
     match &v.kind {
         Kind::Stack { .. } if split.is_some() && node.children.len() == 2 => {} // placed above
-        Kind::Scroll { .. } => node.children[0].pos = (pad[0], pad[1]),
+        Kind::Scroll { .. } => {
+            node.children[0].pos = (pad[0], pad[1]);
+            if let Some(overlay)=node.children.get_mut(1) {
+                overlay.pos=(pad[0]+(laid.0-pad_w-overlay.size.0)*0.5,laid.1-pad[3]-overlay.size.1);
+            }
+        }
         Kind::Stack { axis: Axis::Z, align, children, .. } => {
             for (n, c) in node.children.iter_mut().zip(children) {
                 let (ax, ay) = c.style.place.unwrap_or((*align, *align));

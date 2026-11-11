@@ -165,6 +165,9 @@ pub struct Glass {
     pub dispersion: f32,
     /// Brightness of the specular rim line.
     pub rim: f32,
+    /// Restrict rim light and bevel highlights to the top and bottom edges.
+    /// Refraction still follows the complete outline.
+    pub horizontal_light: bool,
 }
 
 impl Glass {
@@ -178,6 +181,7 @@ impl Glass {
             depth: 30.0,
             dispersion: 0.2,
             rim: 0.3,
+            horizontal_light: false,
         }
     }
     /// Nearly transparent glass for small controls over rich content.
@@ -247,6 +251,21 @@ impl Default for Glass {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TextReveal {
+    pub duration: f32,
+    pub center_stagger: Option<f32>,
+}
+
+/// An adornment after the last text leaf. `reserve` keeps layout stable while
+/// `size` changes. A positive cycle period morphs square → triangle → circle,
+/// briefly rotating during transitions and sleeping between them.
+#[derive(Clone,Copy,Debug)]
+pub struct TextCursor {
+    pub size:f32,pub reserve:f32,pub gap:f32,pub radius:f32,pub color:Color,
+    pub cycle_period:f32,pub transition_duration:f32,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Style {
     pub padding: [f32; 4], // left, top, right, bottom
@@ -254,13 +273,28 @@ pub(crate) struct Style {
     pub height: Dim,
     pub bg: Option<Fill>,
     pub radius: f32,
+    pub animate_radius: bool,
+    pub square_corners: u8,
+    pub corner_mask: Option<(Color, u8)>,
+    pub backdrop_corner_mask: Option<(Color, u8)>,
     pub border: Option<(f32, Color)>,
+    pub border_hidden: u8,
+    pub border_fade: Option<(Color, f32, bool)>,
     /// Drop shadows, key then ambient (`.shadow()`, `.shadow_with()`).
     pub shadow: [Option<Shadow>; 2],
     /// Inner shadow or rim (`.shadow_with(Shadow::..inset())`).
     pub inset: Option<Shadow>,
     pub glass: Option<Glass>,
+    pub glass_fade: f32,
     pub opacity: f32,
+    pub press_scale: f32,
+    pub reveal: Option<bool>,
+    pub text_reveal: Option<TextReveal>,
+    pub text_shimmer: Option<(f32, Color)>,
+    pub text_cursor: Option<TextCursor>,
+    pub hover_marquee: Option<(f32, f32, f32)>,
+    pub hover_scope: bool,
+    pub hover_offset: Option<(f32,f32)>,
     pub fg: Option<Color>,
     pub place: Option<(Align, Align)>,
     pub sticky: bool,
@@ -321,11 +355,26 @@ impl Default for Style {
             height: Dim::Auto,
             bg: None,
             radius: 0.0,
+            animate_radius: false,
+            square_corners: 0,
+            corner_mask: None,
+            backdrop_corner_mask: None,
             border: None,
+            border_hidden: 0,
+            border_fade: None,
             shadow: [None; 2],
             inset: None,
             glass: None,
+            glass_fade: 0.0,
             opacity: 1.0,
+            press_scale: 0.98,
+            reveal: None,
+            text_reveal: None,
+            text_shimmer: None,
+            text_cursor: None,
+            hover_marquee: None,
+            hover_scope: false,
+            hover_offset: None,
             fg: None,
             place: None,
             sticky: false,
@@ -366,6 +415,8 @@ pub struct Span {
     pub background: Option<Color>,
     /// A picture shown in the line instead of text; see [`Span::icon`].
     pub icon: Option<Image>,
+    /// Invisible inline advance in points; omitted when copied.
+    pub space: Option<f32>,
     /// Where the run links to; see [`Span::link`].
     pub link: Option<String>,
     /// OpenType features of this run on top of the text's; see [`Span::feature`].
@@ -414,6 +465,8 @@ impl Span {
     pub fn icon(img: &Image) -> Self {
         Span { icon: Some(img.clone()), ..Default::default() }
     }
+    /// Reserves an invisible fixed-width slot in the line without adding copied text.
+    pub fn space(width:f32)->Self {Self {space:Some(width.max(0.0)),..Default::default()}}
     /// Makes the run a link: the pointer turns into a hand over it, it is underlined while
     /// hovered, and a click calls the nearest [`View::on_link`] above it, or, without one,
     /// asks the runner to open the URL ([`WindowRequest::OpenUrl`](crate::WindowRequest::OpenUrl),
@@ -446,6 +499,8 @@ pub struct Env {
     /// Width at the leading edge of that zone taken by the window buttons (the macOS traffic
     /// lights): start your own toolbar buttons after it.
     pub window_buttons: f32,
+    /// Latest operating-system appearance, independent of the application's override.
+    pub system_dark: bool,
     /// The theme in use (`App::theme`): `env.theme.color.accent`, `env.theme.text.body`.
     pub theme: Rc<crate::theme::Theme>,
 }
@@ -521,6 +576,17 @@ const T_LH: u8 = 4;
 const T_TRACK: u8 = 8;
 
 impl TextData {
+    fn plain(content: String) -> Self {
+        Self {
+            spans: Vec::new(), content, size: 17.0, weight: Weight::Regular,
+            center: false, lines: 0, truncate: Truncate::Ellipsis,
+            line_height: crate::text::LINE_HEIGHT, tracking: 0.0,
+            features: Vec::new(), role: TextRole::Body, set: 0,
+        }
+    }
+    pub(crate) fn text_style(&self) -> crate::theme::TextStyle {
+        crate::theme::TextStyle {size:self.size,weight:self.weight,line_height:self.line_height,tracking:self.tracking}
+    }
     /// Takes the theme's style for everything no modifier set.
     pub(crate) fn theme(&mut self, ts: &crate::theme::TextStyle) {
         if self.set & T_SIZE == 0 {
@@ -651,19 +717,29 @@ pub(crate) enum OverlayMode {
     Drawer,
 }
 
+/// Appearance and entrance motion of a centered modal. Text is never scaled.
+#[derive(Clone, Copy, Default)]
+pub struct ModalStyle {
+    /// Initial downward offset in points; the panel rises into place while fading in.
+    pub rise: f32,
+    /// Glass over the background, below the scrim and the dialog contents.
+    pub backdrop: Option<Glass>,
+}
+
 pub(crate) enum Kind<S> {
     /// Picture; `true` = template (only its alpha is used, tinted with the text color).
     Image(Image, bool),
     TextField(crate::ui::edit::Field<S>),
-    Picker { options: Vec<String>, selected: usize, on_select: Rc<dyn Fn(&mut S, usize)> },
+    Picker { options: Vec<String>, selected: usize, on_select: Rc<dyn Fn(&mut S, usize)>, label: TextData },
     Tabs { labels: Vec<String>, selected: usize, on_select: Box<dyn Fn(&mut S, usize)> },
     Empty,
+    Activity { stroke: f32, period: f32 },
     Spacer,
     Stack { axis: Axis, spacing: f32, align: Align, children: Vec<View<S>> },
     Text(TextData),
-    Scroll { child: Box<View<S>>, refresh: Option<(bool, Box<dyn Fn(&mut S)>)>, indicator: Indicator, stick: bool, bar_insets: (f32, f32) },
+    Scroll { child: Box<View<S>>, refresh: Option<(bool, Box<dyn Fn(&mut S)>)>, indicator: Indicator, stick: bool, bar_insets: (f32, f32), bottom_overlay: Option<Box<View<S>>> },
     List { count: usize, row_h: f32, row: Box<dyn Fn(usize) -> View<S>> },
-    Overlay { open: bool, mode: OverlayMode, child: Box<View<S>>, on_dismiss: Option<Box<dyn Fn(&mut S)>> },
+    Overlay { open: bool, mode: OverlayMode, child: Box<View<S>>, on_dismiss: Option<Box<dyn Fn(&mut S)>>, style: ModalStyle },
     Toggle(bool, Box<dyn Fn(&mut S, bool)>),
     /// Value, number of stops (0 = continuous), handler, look (default when `None`).
     Slider(f32, u32, Box<dyn Fn(&mut S, f32)>, Option<Box<SliderStyle>>),
@@ -696,6 +772,7 @@ pub(crate) struct Extras<S> {
     pub tip_at: Option<Placement>,
     pub shortcuts: Vec<(Shortcut, Box<dyn Fn(&mut S)>)>,
     pub secondary: Option<Box<dyn Fn(&mut S)>>,
+    pub pointer: Option<Box<dyn Fn(&mut S, Option<(f32, f32)>)>>,
     /// Makes a two-child `hstack` a [`split`].
     pub split: Option<Split<S>>,
 }
@@ -711,6 +788,11 @@ pub(crate) struct Split<S> {
     pub reset: Option<f32>,
     /// The panel is on the right.
     pub trailing: bool,
+    pub highlight_main_border: bool,
+    pub highlight_fade: Option<f32>,
+    pub resize_grip: bool,
+    pub grip_bottom: Option<f32>,
+    pub hide_collapsed_divider: bool,
 }
 
 /// A node of the UI tree, generic over the app state `S`.
@@ -718,6 +800,7 @@ pub struct View<S> {
     pub(crate) kind: Kind<S>,
     pub(crate) style: Style,
     pub(crate) on_tap: Option<Box<dyn Fn(&mut S)>>,
+    pub(crate) on_double_tap: Option<Box<dyn Fn(&mut S)>>,
     pub(crate) on_link: Option<Rc<dyn Fn(&mut S, &str)>>,
     pub(crate) key: Option<u64>,
     pub(crate) extra: Option<Box<Extras<S>>>,
@@ -725,11 +808,20 @@ pub struct View<S> {
 
 impl<S> View<S> {
     pub(crate) fn new(kind: Kind<S>) -> Self {
-        View { kind, style: Style::default(), on_tap: None, on_link: None, key: None, extra: None }
+        View { kind, style: Style::default(), on_tap: None, on_double_tap: None, on_link: None, key: None, extra: None }
     }
 
     fn extras(&mut self) -> &mut Extras<S> {
-        self.extra.get_or_insert_with(|| Box::new(Extras { pop: None, tip: None, tip_text: None, tip_at: None, shortcuts: Vec::new(), secondary: None, split: None }))
+        self.extra.get_or_insert_with(|| Box::new(Extras { pop: None, tip: None, tip_text: None, tip_at: None, shortcuts: Vec::new(), secondary: None, pointer: None, split: None }))
+    }
+
+    /// Observes mouse motion anywhere in the window while this view is visible. The
+    /// position is in this view's local coordinates (and can lie outside its bounds);
+    /// `None` means the mouse left the window. Does not capture clicks or drags.
+    /// Unlike hover, this explicitly opts the visible view into redraws on movement.
+    pub fn track_pointer(mut self, f: impl Fn(&mut S, Option<(f32, f32)>) + 'static) -> Self {
+        self.extras().pointer = Some(Box::new(f));
+        self
     }
 
     // ---- layout ----
@@ -813,7 +905,8 @@ impl<S> View<S> {
     /// sidebar(s).width(if s.sidebar { 280.0 } else { 0.0 }).animate()
     /// ```
     ///
-    /// Sizes set by `.fill*()` follow the parent (window resizes) without animating.
+    /// Window resizing snaps all layout springs to their current targets. At a fixed
+    /// window size, sizes set by `.fill*()` also follow the parent without animating.
     pub fn animate(mut self) -> Self {
         self.style.animate = true;
         self
@@ -864,8 +957,45 @@ impl<S> View<S> {
         self.style.set |= SET_RADIUS;
         self
     }
+    /// Animate changes to the corner radius; the background, clipping and border stay aligned.
+    pub fn animate_radius(mut self) -> Self {
+        self.style.animate_radius = true;
+        self
+    }
+    /// Select rounded corners, clockwise from top left. Uses the radius set by `.radius()`.
+    /// The same corners apply to the background, border, shadows and child clipping.
+    pub fn round_corners(mut self, corners: [bool; 4]) -> Self {
+        self.style.square_corners = corners.iter().enumerate()
+            .fold(0, |mask, (i, round)| mask | if *round { 0 } else { 1 << i });
+        self
+    }
+    /// Cover the exterior of selected rounded corners with a solid color, after painting
+    /// this view and its children. Corners run clockwise from top left. Uses the view's exact
+    /// measured size and radius; useful around glass without hiding its backdrop inside.
+    pub fn mask_corners(mut self, color: Color, corners: [bool; 4]) -> Self {
+        let square = corners.iter().enumerate()
+            .fold(0, |mask, (i, round)| mask | if *round { 0 } else { 1 << i });
+        self.style.corner_mask = Some((color, square));
+        self
+    }
+    /// Cover the backdrop outside selected rounded corners before this view's shadows,
+    /// material and children. Unlike `.mask_corners()`, this preserves soft surface shadows.
+    /// Corners run clockwise from top left and follow the measured size and radius.
+    pub fn mask_backdrop_corners(mut self, color: Color, corners: [bool; 4]) -> Self {
+        let square = corners.iter().enumerate()
+            .fold(0, |mask, (i, round)| mask | if *round { 0 } else { 1 << i });
+        self.style.backdrop_corner_mask = Some((color, square));
+        self
+    }
     pub fn border(mut self, width: f32, color: Color) -> Self {
         self.style.border = Some((width, color));
+        self
+    }
+    /// Select visible border edges, clockwise from top: top, right, bottom, left.
+    /// Adjacent enabled edges share their rounded corner. Hidden edges do not inset child clips.
+    pub fn border_edges(mut self, edges: [bool; 4]) -> Self {
+        self.style.border_hidden = edges.iter().enumerate()
+            .fold(0, |mask, (i, visible)| mask | if *visible { 0 } else { 1 << i });
         self
     }
     /// A soft drop shadow `y` points below the view. Replaces the first (key) shadow.
@@ -902,6 +1032,12 @@ impl<S> View<S> {
         self.style.glass = Some(glass);
         self
     }
+    /// Smoothly fades the glass material to the unchanged backdrop over the bottom `height`
+    /// points. Content stays opaque; useful for pinned headers over scrolling content.
+    pub fn glass_fade(mut self, height: f32) -> Self {
+        self.style.glass_fade = if height.is_finite() { height.max(0.0) } else { 0.0 };
+        self
+    }
     /// Continuous corners, like iOS app icons: the curve eases into the straight edges instead
     /// of a circular arc meeting them (`.radius()` sets the size). Corners are circular by
     /// default, as on macOS; glass always has continuous ones.
@@ -916,6 +1052,51 @@ impl<S> View<S> {
         self.style.clip = true;
         self
     }
+    /// Attaches a square cursor to the last text descendant, including rich text and
+    /// Markdown code. The reserved inline slot wraps with text and is not copied.
+    /// Set `cycle_period` to zero for a static square; remove the modifier on completion.
+    pub fn text_cursor(mut self,mut cursor:TextCursor)->Self {
+        cursor.size=cursor.size.max(0.0);cursor.reserve=cursor.reserve.max(cursor.size);
+        cursor.gap=cursor.gap.max(0.0);
+        fn attach<S>(v:&mut View<S>,cursor:TextCursor)->bool {
+            match &mut v.kind {
+                Kind::Text(t)=>{
+                    if v.style.text_cursor.is_some() {t.spans.pop();}
+                    if t.spans.is_empty() && !t.content.is_empty() {t.spans.push(Span::new(t.content.clone()));}
+                    t.spans.push(Span::space(cursor.reserve+cursor.gap));v.style.text_cursor=Some(cursor);true
+                }
+                Kind::Stack {children,..}=>children.iter_mut().rev().any(|child|attach(child,cursor)),
+                Kind::Scroll {child,..}|Kind::Overlay {child,..}=>attach(child,cursor),
+                _=>false,
+            }
+        }
+        attach(&mut self,cursor);self
+    }
+
+    /// Sweep a soft highlight across a plain text label without changing its layout.
+    /// Only visible labels request animation frames. Pass zero to disable the effect.
+    pub fn text_shimmer(mut self, seconds: f32, highlight: Color) -> Self {
+        self.style.text_shimmer = (seconds.is_finite() && seconds > 0.0).then_some((seconds, highlight));
+        self
+    }
+
+    /// Fade newly appended text in from a soft blur over `seconds`. Inherited by text
+    /// descendants; shaping, selection and layout are unchanged. Apply only to live text.
+    pub fn text_reveal(mut self, seconds: f32) -> Self {
+        self.style.text_reveal = Some(TextReveal {duration:seconds.max(0.0),center_stagger:None});
+        self
+    }
+    /// Reveal fixed-position graphemes from the center outwards, each fading from blur.
+    /// `seconds` is each letter's reveal time; `stagger` is the delay between outward pairs.
+    /// Rebuilding the same text keeps its progress. A new `.key()` restarts the appearance.
+    pub fn text_reveal_center(mut self, seconds: f32, stagger: f32) -> Self {
+        self.style.text_reveal = Some(TextReveal {
+            duration:if seconds.is_finite() {seconds.max(0.0)}else{0.0},
+            center_stagger:Some(if stagger.is_finite() {stagger.max(0.0)}else{0.0}),
+        });
+        self
+    }
+
     pub fn opacity(mut self, o: f32) -> Self {
         self.style.opacity = o;
         self
@@ -926,8 +1107,9 @@ impl<S> View<S> {
         self
     }
 
-    /// Inside the vertical stack of a `scroll`: this child sticks to the top of the
-    /// viewport while its section is on screen and is pushed away by the next sticky one.
+    /// Inside a vertical stack beneath a `scroll`: pins to the viewport top while its
+    /// parent section is visible. Nested stacks/lazy rows inherit the scroll viewport;
+    /// the parent bottom and the next sticky sibling push the header away.
     pub fn sticky(mut self) -> Self {
         self.style.sticky = true;
         self
@@ -946,6 +1128,13 @@ impl<S> View<S> {
         if let Kind::Scroll { stick, .. } = &mut self.kind {
             *stick = true;
         }
+        self
+    }
+    /// Scroll only: place a view over the viewport's bottom, measured once at layout time.
+    /// Its height is reserved after the content and added to the scrollbar's bottom inset.
+    /// Content still scrolls behind the overlay, allowing translucent composers/toolbars.
+    pub fn bottom_overlay(mut self, overlay: View<S>) -> Self {
+        if let Kind::Scroll {bottom_overlay,..}=&mut self.kind {*bottom_overlay=Some(Box::new(overlay));}
         self
     }
     /// Scroll only: scroll bar visibility (default `Indicator::Auto`).
@@ -974,8 +1163,44 @@ impl<S> View<S> {
         }
         self
     }
-    /// Split only: a double click on the divider brings the panel back to `width` (and opens
-    /// it if collapsed).
+    /// Split only: remove the divider, highlight and resize target while collapsed.
+    /// A drag that already started may still reverse before release. Afterwards reopen
+    /// through application state (for example a sidebar button), instead of the window edge.
+    pub fn hide_collapsed_divider(mut self) -> Self {
+        if let Some(sp) = self.extra.as_mut().and_then(|x| x.split.as_mut()) {
+            sp.hide_collapsed_divider = true;
+        }
+        self
+    }
+    /// Split only: use the main pane's complete border as the resize highlight instead of a straight
+    /// divider. Keeps its radius and selected corners; defaults to the theme's divider style.
+    pub fn highlight_main_border(mut self) -> Self {
+        if let Some(split) = self.extras().split.as_mut() { split.highlight_main_border = true; }
+        self
+    }
+    /// Fade the main border's resize highlight into its resting color across `fraction`
+    /// of the main pane's width, starting at the divider. Enables main-border highlighting.
+    pub fn highlight_main_border_fade(mut self, fraction: f32) -> Self {
+        if let Some(sp) = self.extra.as_mut().and_then(|x| x.split.as_mut()) {
+            sp.highlight_main_border = true;
+            sp.highlight_fade = Some(fraction.clamp(0.01, 1.0));
+        }
+        self
+    }
+    /// Show a centered resize grip that stretches on hover and while dragging.
+    pub fn resize_grip(mut self) -> Self {
+        if let Some(sp) = self.extra.as_mut().and_then(|x| x.split.as_mut()) { sp.resize_grip = true; }
+        self
+    }
+    /// Place the resize grip's center `inset` points above the split's bottom edge.
+    pub fn resize_grip_at_bottom(mut self, inset: f32) -> Self {
+        if let Some(sp) = self.extra.as_mut().and_then(|x| x.split.as_mut()) {
+            sp.resize_grip = true;
+            sp.grip_bottom = Some(inset.max(0.0));
+        }
+        self
+    }
+    /// Split only: a double click on the divider restores `width` and opens a collapsed panel.
     pub fn reset_width(mut self, width: f32) -> Self {
         if let Some(sp) = self.extra.as_mut().and_then(|x| x.split.as_mut()) {
             sp.reset = Some(width);
@@ -992,7 +1217,7 @@ impl<S> View<S> {
 
     // ---- text ----
     pub fn font_size(mut self, s: f32) -> Self {
-        if let Kind::Text(t) = &mut self.kind {
+        if let Kind::Text(t) | Kind::Picker { label:t, .. } = &mut self.kind {
             t.size = s;
             t.set |= T_SIZE;
         }
@@ -1003,31 +1228,33 @@ impl<S> View<S> {
         self
     }
     pub fn weight(mut self, w: Weight) -> Self {
-        if let Kind::Text(t) = &mut self.kind {
+        if let Kind::Text(t) | Kind::Picker { label:t, .. } = &mut self.kind {
             t.weight = w;
             t.set |= T_WEIGHT;
         }
+        if let Kind::TextField(f) = &mut self.kind { f.weight = w as u16; f.weighted = true; }
         self
     }
-    /// Text only: size, line height, weight and letter spacing at once, usually from the
+    /// Text, text fields and pickers: size, line height, weight and letter spacing at once, usually from the
     /// theme: `text("Settings").style(env.theme.text.title)`.
     pub fn style(mut self, ts: crate::theme::TextStyle) -> Self {
-        if let Kind::Text(t) = &mut self.kind {
+        if let Kind::Text(t) | Kind::Picker { label:t, .. } = &mut self.kind {
             t.set = 0;
             t.theme(&ts);
             t.set = T_SIZE | T_WEIGHT | T_LH | T_TRACK;
         }
         if let Kind::TextField(f) = &mut self.kind {
             (f.size, f.line_height, f.tracking) = (ts.size, ts.line_height, ts.tracking);
+            f.weight = ts.weight as u16; f.weighted = true;
             (f.sized, f.lh_set, f.track_set) = (true, true, true);
         }
         self
     }
-    /// Text and text fields: line height as a multiple of the font size (1.3 unless set).
+    /// Text, text fields and pickers: line height as a multiple of the font size (1.3 unless set).
     /// Reading text usually wants 1.4–1.6: `text(body).font_size(14.0).line_height(1.625)`;
     /// a multi-line field grows by `round(size × k)` per row.
     pub fn line_height(mut self, k: f32) -> Self {
-        if let Kind::Text(t) = &mut self.kind {
+        if let Kind::Text(t) | Kind::Picker { label:t, .. } = &mut self.kind {
             t.line_height = k.max(0.5);
             t.set |= T_LH;
         }
@@ -1036,10 +1263,10 @@ impl<S> View<S> {
         }
         self
     }
-    /// Text and text fields: extra space between letters in em (0.01 = 1 % of the font
+    /// Text, text fields and pickers: extra space between letters in em (0.01 = 1 % of the font
     /// size); negative tightens. Small text often reads better a little looser.
     pub fn letter_spacing(mut self, em: f32) -> Self {
-        if let Kind::Text(t) = &mut self.kind {
+        if let Kind::Text(t) | Kind::Picker { label:t, .. } = &mut self.kind {
             t.tracking = em;
             t.set |= T_TRACK;
         }
@@ -1079,6 +1306,34 @@ impl<S> View<S> {
         }
         self
     }
+    /// Show a long single-line label once from start to end while hovered, then stop.
+    /// `speed` is points/second; `trailing_inset` reserves space for overlaid hover actions;
+    /// `fade_width` softens the moving text's trailing edge. At rest the full width is used,
+    /// with a hard clip. Short labels never animate. Leaving resets the text immediately.
+    /// Put `.hover_scope()` on a surrounding row to keep scrolling over its action buttons.
+    pub fn hover_marquee(mut self, speed: f32, trailing_inset: f32, fade_width: f32) -> Self {
+        if let Kind::Text(t) = &mut self.kind {
+            t.lines = 1;
+            self.style.hover_marquee = Some((
+                if speed.is_finite() {speed.max(1.0)}else{1.0},
+                if trailing_inset.is_finite() {trailing_inset.max(0.0)}else{0.0},
+                if fade_width.is_finite() {fade_width.max(0.0)}else{0.0},
+            ));
+        }
+        self
+    }
+    /// Use this container's hover area for descendant `.hover_marquee()` labels.
+    /// The scope observes the pointer and never intercepts child clicks.
+    pub fn hover_scope(mut self) -> Self {
+        self.style.hover_scope = true;
+        self
+    }
+    /// Translates this view while an ancestor `.hover_scope()` is hovered, without
+    /// changing layout. Its hit region follows the animated presentation position.
+    pub fn hover_offset(mut self, x:f32, y:f32)->Self {
+        self.style.hover_offset=Some((x,y));self
+    }
+
     /// Center lines of multi-line text.
     pub fn centered(mut self) -> Self {
         if let Kind::Text(t) = &mut self.kind {
@@ -1113,12 +1368,33 @@ impl<S> View<S> {
         self
     }
     /// Makes the view tappable, with a springy press animation.
+    /// Consumes the click: a parent's tap or window-drag gesture does not run as well.
     pub fn on_tap(mut self, f: impl Fn(&mut S) + 'static) -> Self {
         self.on_tap = Some(Box::new(f));
         self
     }
+    /// Runs on the second nearby click. A normal tap still runs on the first click.
+    /// Consumes the gesture instead of a parent window-drag or tap action.
+    pub fn on_double_tap(mut self, f: impl Fn(&mut S) + 'static) -> Self {
+        self.on_double_tap = Some(Box::new(f));
+        self
+    }
+    /// Fade and zoom a view in or out with the theme's bouncy spring, keeping its layout
+    /// slot. Keep the node in the tree and change `shown`: `button("New", |_| {}).reveal(shown)`.
+    /// A hidden or disappearing subtree does not receive pointer input or show attachments.
+    pub fn reveal(mut self, shown: bool) -> Self {
+        self.style.reveal = Some(shown);
+        self
+    }
+    /// Scale while pressed (default 0.98). Use 1.0 to keep labels stationary while
+    /// retaining the dimmed press feedback, e.g. `button("Model", |_| {}).press_scale(1.0)`.
+    pub fn press_scale(mut self, scale: f32) -> Self {
+        self.style.press_scale = scale.clamp(0.0, 1.0);
+        self
+    }
     /// Pressing on this view moves the window, as a title bar does; a double click zooms it.
     /// Buttons and fields inside keep working: they sit above the drag area.
+    /// Clicking a control or dismissing a popover also breaks the double-click sequence.
     /// Has no effect where windows don't move (web, mobile, touch).
     ///
     /// ```ignore
@@ -1364,7 +1640,8 @@ pub fn hstack<S>(children: impl Children<S>) -> View<S> {
 }
 /// A side panel and a main area with a divider the user drags to resize the panel, like a
 /// sidebar. The app keeps the width: `on_resize` gets every new one while dragging, 1:1 with
-/// the pointer; any other change of `width` (a button, a reset) glides on a spring. The
+/// the pointer; state changes (a button, a reset) glide on a spring. Window resizing
+/// applies the new width and constraints immediately, without animation. The
 /// panel's `.min_width()` / `.max_width()` bound the drag, and its content is laid out at
 /// least that wide, cut rather than squeezed while the panel closes. Over the divider (a
 /// hairline of the theme's `control.border` width in `divider` color, 8 points to grab) the pointer turns into
@@ -1381,7 +1658,7 @@ pub fn hstack<S>(children: impl Children<S>) -> View<S> {
 /// ```
 pub fn split<S>(width: f32, on_resize: impl Fn(&mut S, f32) + 'static, panel: View<S>, main: View<S>) -> View<S> {
     let mut v = stack(Axis::H, (panel.fill(), main.fill())).fill();
-    v.extras().split = Some(Split { width, on_resize: Rc::new(on_resize), collapse: None, reset: None, trailing: false });
+    v.extras().split = Some(Split { width, on_resize: Rc::new(on_resize), collapse: None, reset: None, trailing: false, highlight_main_border: false, highlight_fade: None, resize_grip: false, grip_bottom: None, hide_collapsed_divider: false });
     v
 }
 /// Children layered back to front.
@@ -1389,20 +1666,7 @@ pub fn zstack<S>(children: impl Children<S>) -> View<S> {
     stack(Axis::Z, children)
 }
 pub fn text<S>(content: impl Into<String>) -> View<S> {
-    View::new(Kind::Text(TextData {
-        spans: Vec::new(),
-        content: content.into(),
-        size: 17.0,
-        weight: Weight::Regular,
-        center: false,
-        lines: 0,
-        truncate: Truncate::Ellipsis,
-        line_height: crate::text::LINE_HEIGHT,
-        tracking: 0.0,
-        features: Vec::new(),
-        role: TextRole::Body,
-        set: 0,
-    }))
+    View::new(Kind::Text(TextData::plain(content.into())))
 }
 /// Text made of differently styled runs (bold, italic, code, colored) that wrap together.
 pub fn rich_text<S>(spans: Vec<Span>) -> View<S> {
@@ -1429,9 +1693,15 @@ pub fn spacer<S>() -> View<S> {
 pub fn rect<S>() -> View<S> {
     View::new(Kind::Empty)
 }
+/// A continuously rotating, tapered activity ring. Inherits the foreground color.
+/// `period` is seconds per revolution; non-positive values show a static ring.
+/// Animation stops automatically when clipped off screen or removed from the tree.
+pub fn activity_indicator<S>(size: f32, stroke: f32, period: f32) -> View<S> {
+    View::new(Kind::Activity {stroke:stroke.max(0.0),period:period.max(0.0)}).size(size.max(0.0),size.max(0.0))
+}
 /// Vertically scrolling container.
 pub fn scroll<S>(child: View<S>) -> View<S> {
-    View::new(Kind::Scroll { child: Box::new(child), refresh: None, indicator: Indicator::Auto, stick: false, bar_insets: (0.0, 0.0) }).fill()
+    View::new(Kind::Scroll { child: Box::new(child), refresh: None, indicator: Indicator::Auto, stick: false, bar_insets: (0.0, 0.0), bottom_overlay: None }).fill()
 }
 pub fn button<S>(label: impl Into<String>, on_tap: impl Fn(&mut S) + 'static) -> View<S> {
     let mut label = text(label);
@@ -1461,7 +1731,19 @@ pub fn list<S>(count: usize, row_height: f32, row: impl Fn(usize) -> View<S> + '
     View::new(Kind::List { count, row_h: row_height.max(1.0), row: Box::new(row) }).fill_width()
 }
 fn overlay<S>(open: bool, mode: OverlayMode, on_dismiss: Option<Box<dyn Fn(&mut S)>>, content: View<S>) -> View<S> {
-    View::new(Kind::Overlay { open, mode, child: Box::new(content), on_dismiss }).fill()
+    View::new(Kind::Overlay { open, mode, child: Box::new(content), on_dismiss, style: ModalStyle::default() }).fill()
+}
+
+impl<S> View<S> {
+    /// A modal's background glass and optional rise-in motion; no effect on other views.
+    /// `modal(open, close, content).modal_style(ModalStyle { rise: 18.0, backdrop: None })`
+    pub fn modal_style(mut self, value: ModalStyle) -> Self {
+        if let Kind::Overlay { mode: OverlayMode::Modal, style, .. } = &mut self.kind {
+            *style = value;
+            style.rise = if value.rise.is_finite() { value.rise.max(0.0) } else { 0.0 };
+        }
+        self
+    }
 }
 /// A centered dialog over a dimmed screen. Put it last in the root `zstack`. It blocks
 /// input to everything below; tapping outside calls `on_dismiss`.
@@ -1501,7 +1783,8 @@ pub fn text_field<S>(
 pub fn picker<S, T: AsRef<str>>(options: &[T], selected: usize, on_select: impl Fn(&mut S, usize) + 'static) -> View<S> {
     let options: Vec<String> = options.iter().map(|o| o.as_ref().to_string()).collect();
     let selected = selected.min(options.len().saturating_sub(1));
-    let mut v = View::new(Kind::Picker { options, selected, on_select: Rc::new(on_select) });
+    let label = TextData::plain(options.get(selected).cloned().unwrap_or_default());
+    let mut v = View::new(Kind::Picker { options, selected, on_select: Rc::new(on_select), label });
     v.style.role = Role::Picker;
     v
 }

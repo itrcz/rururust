@@ -383,6 +383,7 @@ impl TextSystem {
             (s.bold, s.italic, s.mono, s.weight, s.size.map(f32::to_bits)).hash(&mut h);
             s.color.map(|c| [c.r.to_bits(), c.g.to_bits(), c.b.to_bits(), c.a.to_bits()]).hash(&mut h);
             (s.background.is_some(), s.icon.is_some(), s.link.is_some()).hash(&mut h);
+            s.space.map(f32::to_bits).hash(&mut h);
             s.features.hash(&mut h);
         }
         spec.features.hash(&mut h);
@@ -473,6 +474,9 @@ impl TextSystem {
                 }
                 // Same runs as `shaped_text`, which byte offsets into the text refer to.
                 let slot = |em: f32| a.clone().letter_spacing(em);
+                if let Some(width)=s.space {
+                    runs.push((SLOT,slot(width/size.max(1.0))));continue;
+                }
                 if s.icon.is_some() {
                     runs.push((SLOT, slot(1.0 + ICON_GAP)));
                     continue;
@@ -679,6 +683,15 @@ impl TextSystem {
         (key, (size.0.min(w), size.1.min(max_h)), cut)
     }
 
+    /// Already shaped glyphs for the soft reveal painter; no second layout or shaping.
+    pub(crate) fn reveal_glyphs(&self, key: u64, pos: (f32, f32), scale: f32) -> Vec<(cosmic_text::PhysicalGlyph, f32, usize, Option<cosmic_text::Color>)> {
+        let Some(e) = self.get(key) else { return Vec::new() };
+        e.buffer.layout_runs().flat_map(|run| {
+            let base = e.starts.get(run.line_i).copied().unwrap_or(0);
+            run.glyphs.iter().map(move |g| (g.physical(pos, scale), run.line_y, base + g.start, g.color_opt))
+        }).collect()
+    }
+
     /// Byte index (in the whole text) closest to the point `(x, y)` of the shaped text `key`.
     /// Points above the text land at its start, below it at its end.
     pub(crate) fn hit(&self, key: u64, x: f32, y: f32) -> usize {
@@ -851,7 +864,7 @@ pub(crate) fn shaped_text<'a>(spans: &'a [Span], text: &'a str) -> std::borrow::
     }
     let mut out = String::new();
     for s in spans {
-        if s.icon.is_some() {
+        if s.icon.is_some() || s.space.is_some() {
             out.push_str(SLOT);
         } else if s.background.is_some() {
             out.push_str(SLOT);

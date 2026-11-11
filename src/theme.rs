@@ -178,8 +178,12 @@ pub struct Controls {
     pub border: f32,
     /// Width of the text field focus ring.
     pub focus_ring: f32,
+    /// Resize grip width, resting height and hovered height.
+    pub split_grip: (f32, f32, f32),
     /// Scroll bar thumb: thin, and wide while the pointer is over it.
     pub scrollbar: (f32, f32),
+    /// Opacity of the scroll bar track on hover; zero hides the track.
+    pub scrollbar_track_opacity: f32,
     pub tip_padding: (f32, f32),
     pub tip_radius: f32,
 }
@@ -292,7 +296,9 @@ impl Theme {
                 tab_drop: Color::WHITE.alpha(0.13),
                 border: 0.5,
                 focus_ring: 1.5,
+                split_grip: (3.0, 24.0, 38.0),
                 scrollbar: (5.0, 9.0),
+                scrollbar_track_opacity: 0.06,
                 tip_padding: (9.0, 5.0),
                 tip_radius: 9.0,
             },
@@ -558,8 +564,13 @@ pub(crate) fn apply<S>(v: &mut View<S>, look: &Look) {
             TextRole::Headline => &t.text.headline,
         }),
         Kind::TextField(f) => f.theme(&t.text.body),
+        Kind::Picker {label,..} => label.theme(&t.text.body),
         Kind::Stack { children, .. } => children.iter_mut().for_each(|c| apply(c, look)),
-        Kind::Scroll { child, .. } | Kind::Overlay { child, .. } => apply(child, look),
+        Kind::Scroll {child,bottom_overlay,..} => {
+            apply(child,look);
+            if let Some(overlay)=bottom_overlay {apply(overlay,look);}
+        }
+        Kind::Overlay { child, .. } => apply(child, look),
         _ => {}
     }
     if let Some(x) = &mut v.extra {

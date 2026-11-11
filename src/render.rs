@@ -6,7 +6,7 @@
 
 use crate::text::TextSystem;
 use crate::types::{Color, Rect};
-use crate::ui::{Cmd, DrawList, Quad, TextCmd, KIND_GLASS, KIND_IMAGE};
+use crate::ui::{Cmd, DrawList, Quad, TextCmd, KIND_GLASS, KIND_IMAGE, KIND_SHADOW};
 use crate::view::Image;
 use std::collections::HashMap;
 use glyphon::{Cache, ColorMode, Resolution, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport};
@@ -159,6 +159,33 @@ pub struct RenderStats {
 const FUSE_GAP: f32 = 13.0;
 const FUSE_K: f32 = 26.0;
 
+// All panes in a fused group must evaluate the same SDF and optical surface. Otherwise a
+// tall field and a short button use different bevel caps and expose their quad boundaries.
+fn normalize_fused_depth(quads: &mut [Quad], links: &[(usize, usize)]) {
+    if links.is_empty() { return; }
+    let mut parents: Vec<usize> = (0..quads.len()).collect();
+    fn root(parents: &[usize], mut i: usize) -> usize {
+        while parents[i] != i { i = parents[i]; }
+        i
+    }
+    for &(a, b) in links {
+        let (a, b) = (root(&parents, a), root(&parents, b));
+        parents[b] = a;
+    }
+    let mut depths = vec![f32::INFINITY; quads.len()];
+    for &(a, b) in links {
+        for i in [a, b] {
+            let q = &quads[i];
+            let depth = q.c1[1].min(q.rect[2].min(q.rect[3]) * 0.3);
+            let group = root(&parents, i);
+            depths[group] = depths[group].min(depth);
+        }
+    }
+    for &(a, b) in links {
+        for i in [a, b] { quads[i].c1[1] = depths[root(&parents, i)]; }
+    }
+}
+
 struct Level {
     view: wgpu::TextureView,
     bind: wgpu::BindGroup,
@@ -201,7 +228,7 @@ pub struct Renderer {
     image_layout: wgpu::BindGroupLayout,
     image_none: wgpu::BindGroup,
     /// Uploaded pictures by id, with the frame they were last drawn in.
-    images: HashMap<u64, (wgpu::BindGroup, u64)>,
+    images: HashMap<u64, (wgpu::BindGroup, u64, std::sync::Weak<crate::view::ImageData>)>,
     frame: u64,
     pub stats: RenderStats,
     /// The last frame drawn, flattened, and the one being looked at (see `unchanged`).
@@ -500,7 +527,7 @@ impl Renderer {
             layout: &self.image_layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }],
         });
-        self.images.insert(img.0.id, (bind, frame));
+        self.images.insert(img.0.id, (bind, frame, std::sync::Arc::downgrade(&img.0)));
     }
 
     fn instance_buffer(device: &wgpu::Device, cap: usize) -> wgpu::Buffer {
@@ -742,11 +769,17 @@ impl Renderer {
 
         // Liquid: panes that sit very close to each other (and look at the same snapshot)
         // are fused into one shape by the shader. Each pane learns its two nearest neighbours.
+        let mut fused = Vec::new();
         for a in 0..panes.len() {
             let (qa, snap, ra) = panes[a];
+            if quads[qa].p0[2] > 0.0 || (quads[qa].np[3] as u32) & 240 != 0 { continue; }
             let mut near = [(f32::MAX, 0usize); 2];
             for (b, p) in panes.iter().enumerate() {
-                if b == a || p.1 != snap {
+                if b == a || p.1 != snap || quads[p.0].p0[2] > 0.0
+                    || (quads[p.0].np[3] as u32) & 240 != 0
+                    || (quads[qa].np[3] as u32 & 512) != (quads[p.0].np[3] as u32 & 512)
+                    || quads[qa].c0 != quads[p.0].c0 || quads[qa].c1 != quads[p.0].c1
+                    || quads[qa].p1 != quads[p.0].p1 {
                     continue;
                 }
                 let dx = (ra.x - (p.2.x + p.2.w)).max(p.2.x - (ra.x + ra.w)).max(0.0);
@@ -764,6 +797,7 @@ impl Renderer {
                 if gap == f32::MAX {
                     break;
                 }
+                fused.push((qa, qb));
                 let (rect, radius) = (quads[qb].rect, quads[qb].p0[0]);
                 let q = &mut quads[qa];
                 if slot == 0 {
@@ -776,6 +810,8 @@ impl Renderer {
             }
         }
 
+        normalize_fused_depth(&mut quads, &fused);
+
         // ---- 2. upload
         self.frame += 1;
         for b in &batches {
@@ -783,10 +819,10 @@ impl Renderer {
                 self.upload_image(img);
             }
         }
-        if self.images.len() > 64 {
-            let frame = self.frame;
-            self.images.retain(|_, e| e.1 + 600 > frame);
-        }
+        // Procedural images can replace their pixels each frame. Keep textures only
+        // while their source is still alive, instead of retaining hundreds of old poses.
+        let frame = self.frame;
+        self.images.retain(|_, e| e.2.strong_count() > 0 && e.1 + 600 > frame);
 
         if quads.len() > self.instance_cap {
             self.instance_cap = quads.len().next_power_of_two();
@@ -1077,7 +1113,7 @@ fn union(a: &Rect, b: &Rect) -> Rect {
 /// (mirrors `vs` and `fs` in `quad.wgsl`).
 fn glass_reach(q: &Quad, s: f32) -> (PxBox, f32) {
     // Drawn: the quad grown as the vertex shader grows it, inside its clip.
-    let grow = 1.0 + q.p0[2] * s * 3.0 + q.np[2] * s * 0.5;
+    let grow = 1.0 + q.np[2] * s * 0.5;
     let drawn = PxBox::of(q.rect, s).grow(grow).intersect(&PxBox::of(q.clip, s).grow(1.0));
     if drawn.is_empty() {
         return (PxBox::EMPTY, f32::MIN);
@@ -1141,7 +1177,7 @@ fn text_reach(t: &TextCmd) -> Rect {
 fn snap_key(out: &mut Vec<u32>, list: &DrawList, quads: &[Quad], upto: usize, area: IBox, scale: f32) {
     let r = Rect::new(area.x0 as f32 / scale, area.y0 as f32 / scale, (area.x1 - area.x0) as f32 / scale, (area.y1 - area.y0) as f32 / scale)
         .inflate(1.0);
-    let quad_reach = |q: &Quad| Rect::new(q.rect[0], q.rect[1], q.rect[2], q.rect[3]).inflate(q.p0[2] * 3.0 + q.np[2] * 0.5 + 1.0);
+    let quad_reach = |q: &Quad| Rect::new(q.rect[0], q.rect[1], q.rect[2], q.rect[3]).inflate(if q.p0[3] == KIND_SHADOW { q.p0[2] * 3.0 + 1.0 } else { q.np[2] * 0.5 + 1.0 });
     let cmds = &list.cmds[..upto];
     let mut qi = 0;
     let mut all = false;
@@ -1269,4 +1305,17 @@ mod tests {
         frame_words(&mut a, (100, 100), 1.0, &list, Color::BLACK);
         assert_ne!(a, b, "scale counts");
     }
+    #[test]
+    fn fused_glass_uses_the_smallest_bevel_cap_across_the_group() {
+        let mut quads = vec![<Quad as bytemuck::Zeroable>::zeroed(); 4];
+        for (q, height) in quads.iter_mut().zip([180.0, 42.0, 30.0, 200.0]) {
+            q.rect = [0.0, 0.0, 400.0, height]; q.c1[1] = 30.0;
+        }
+        normalize_fused_depth(&mut quads, &[(0, 1), (1, 2)]);
+        assert_eq!(quads.iter().map(|q| q.c1[1]).collect::<Vec<_>>(), vec![9.0, 9.0, 9.0, 30.0]);
+        for q in &mut quads { q.c1[1] = 0.0; }
+        normalize_fused_depth(&mut quads, &[(0, 1)]);
+        assert_eq!(quads[0].c1[1], 0.0, "flat glass stays flat");
+    }
+
 }

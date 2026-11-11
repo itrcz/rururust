@@ -67,8 +67,14 @@ const MAC_TITLEBAR: f32 = 28.0;
 #[cfg(target_os = "macos")]
 const MAC_BUTTONS: f32 = 78.0;
 
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "companion.rs"]
+mod companion;
+
 pub struct App<S> {
     ui: Ui<S>,
+    #[cfg(not(target_arch = "wasm32"))]
+    companions: Vec<Box<dyn companion::Pending>>,
     title: String,
     size: (f32, f32),
     min_size: Option<(f32, f32)>,
@@ -80,6 +86,8 @@ pub struct App<S> {
     titlebar_height: Option<f32>,
     /// Light and dark theme to follow the system appearance with (`theme_auto`).
     auto: Option<(Theme, Theme)>,
+    file_drop: Option<Box<dyn Fn(&mut S, std::path::PathBuf)>>,
+    file_hover: Option<Box<dyn Fn(&mut S, bool)>>,
 }
 
 impl<S: 'static> App<S> {
@@ -87,6 +95,8 @@ impl<S: 'static> App<S> {
     pub fn new<M>(state: S, view: impl ViewFn<S, M>) -> Self {
         App {
             ui: Ui::new(state, view),
+            #[cfg(not(target_arch = "wasm32"))]
+            companions: Vec::new(),
             title: "ruru".into(),
             size: (420.0, 760.0),
             min_size: None,
@@ -96,11 +106,35 @@ impl<S: 'static> App<S> {
             titlebar: Titlebar::Standard,
             titlebar_height: None,
             auto: None,
+            file_drop: None,
+            file_hover: None,
         }
     }
     pub fn title(mut self, t: impl Into<String>) -> Self {
         self.title = t.into();
         self
+    }
+    /// Receives each native file dropped onto this window. The application decides
+    /// whether to copy, stage, reject, or open the file; the runner never reads it.
+    pub fn on_file_drop(mut self, handler:impl Fn(&mut S,std::path::PathBuf)+'static)->Self {
+        self.file_drop=Some(Box::new(handler));self
+    }
+    /// Native file-drag highlight. `false` follows a drop or a cancelled drag.
+    pub fn on_file_hover(mut self, handler:impl Fn(&mut S,bool)+'static)->Self {
+        self.file_hover=Some(Box::new(handler));self
+    }
+    fn file_event(&mut self,event:&WindowEvent)->Option<bool> {
+        match event {
+            WindowEvent::HoveredFile(_) => Some(if let Some(f)=&self.file_hover {f(&mut self.ui.state,true);true}else{false}),
+            WindowEvent::HoveredFileCancelled => Some(if let Some(f)=&self.file_hover {f(&mut self.ui.state,false);true}else{false}),
+            WindowEvent::DroppedFile(path) => {
+                let mut changed=false;
+                if let Some(f)=&self.file_hover {f(&mut self.ui.state,false);changed=true;}
+                if let Some(f)=&self.file_drop {f(&mut self.ui.state,path.clone());changed=true;}
+                Some(changed)
+            }
+            _=>None,
+        }
     }
     /// Initial window size in points (desktop only).
     pub fn size(mut self, w: f32, h: f32) -> Self {
@@ -139,6 +173,11 @@ impl<S: 'static> App<S> {
     pub fn theme_with(mut self, f: impl Fn(&S) -> Theme + 'static) -> Self {
         self.ui.theme_with(f);
         self
+    }
+    /// Derives the application's theme from state and live operating-system appearance.
+    /// Explicit light/dark choices may ignore the second argument; System follows it.
+    pub fn theme_with_system(mut self,f:impl Fn(&S,bool)->Theme+'static)->Self {
+        self.ui.theme_with_system(f);self
     }
 
     /// Follows the system appearance: `light` or `dark`, switched when the user changes it.
@@ -202,6 +241,18 @@ impl<S: 'static> App<S> {
         self
     }
 
+    /// Adds an independently sized desktop window with its own state and view.
+    /// Use distinct state types and `Link<T>` to exchange updates. Closing the companion
+    /// calls `close` and leaves the main application running. Hidden windows do not render.
+    /// `visible` returns `None` while closed; changing the `Some` activation number brings
+    /// the window forward again without stealing focus for ordinary state updates.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn companion<T: 'static>(mut self, app: App<T>, visible: impl Fn(&T) -> Option<u64> + 'static, close: impl Fn(&mut T) + 'static) -> Self {
+        assert!(app.companions.is_empty(), "companion windows must be attached to the main app");
+        self.companions.push(Box::new(companion::Setup { app, visible: Box::new(visible), close: Box::new(close) }));
+        self
+    }
+
     pub fn run(self) {
         #[cfg(target_arch = "wasm32")]
         {
@@ -216,22 +267,8 @@ impl<S: 'static> App<S> {
         });
         #[cfg(target_arch = "wasm32")]
         crate::task::set_spawner(wasm_bindgen_futures::spawn_local);
-        let runner = Runner {
-            app: self,
-            window: None,
-            gfx: Rc::new(RefCell::new(None)),
-            cursor: (0.0, 0.0),
-            shown_cursor: Cursor::Default,
-            mods: Default::default(),
-            wake_at: None,
-            transparent: false,
-            clipboard: Clipboard::new(&event_loop),
-            ime: (false, None),
-            #[cfg(target_os = "macos")]
-            chrome: None,
-            #[cfg(target_os = "macos")]
-            buttons: None,
-        };
+        let runner = Runner::new(self, &event_loop, true);
+
         #[cfg(not(target_arch = "wasm32"))]
         {
             let mut runner = runner;
@@ -379,6 +416,9 @@ async fn init_gfx(window: Arc<Window>, transparent: bool) -> Gfx {
 struct Runner<S> {
     app: App<S>,
     window: Option<Arc<Window>>,
+    visible: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    companions: Vec<Box<dyn companion::Running>>,
     gfx: Rc<RefCell<Option<Gfx>>>,
     cursor: (f32, f32),
     /// Pointer shape last given to the window.
@@ -546,6 +586,35 @@ fn open_url(url: &str) {
 }
 
 impl<S: 'static> Runner<S> {
+    fn new(#[allow(unused_mut)] mut app: App<S>, event_loop: &EventLoop<Wake>, visible: bool) -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        let companions = std::mem::take(&mut app.companions).into_iter().map(|c| c.start(event_loop)).collect();
+        Self {
+            app,
+            window: None,
+            visible,
+            #[cfg(not(target_arch = "wasm32"))]
+            companions,
+            gfx: Rc::new(RefCell::new(None)),
+            cursor: (0.0, 0.0),
+            shown_cursor: Cursor::Default,
+            mods: Default::default(),
+            wake_at: None,
+            transparent: false,
+            clipboard: Clipboard::new(&event_loop),
+            ime: (false, None),
+            #[cfg(target_os = "macos")]
+            chrome: None,
+            #[cfg(target_os = "macos")]
+            buttons: None,
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn update_companions(&mut self, event_loop: &ActiveEventLoop) -> Option<web_time::Instant> {
+        self.companions.iter_mut().filter_map(|c| c.update(event_loop, self.window.as_deref())).min()
+    }
+
     /// Carries out what the UI asked of the window and keeps IME / clipboard in sync with it.
     /// Must run while a press is still being handled: AppKit starts a window move from the
     /// current mouse-down event.
@@ -568,9 +637,17 @@ impl<S: 'static> Runner<S> {
         for r in std::mem::take(&mut self.app.ui.requests) {
             match r {
                 WindowRequest::DragWindow => {
+                    #[cfg(target_os = "macos")]
+                    crate::macos::drag_window(w);
+                    #[cfg(not(target_os = "macos"))]
                     let _ = w.drag_window();
                 }
-                WindowRequest::Zoom => w.set_maximized(!w.is_maximized()),
+                WindowRequest::Zoom => {
+                    #[cfg(target_os = "macos")]
+                    crate::macos::request_zoom(w);
+                    #[cfg(not(target_os = "macos"))]
+                    w.set_maximized(!w.is_maximized());
+                }
                 WindowRequest::SetClipboard(t) => self.clipboard.set(t),
                 WindowRequest::OpenUrl(url) => open_url(&url),
             }
@@ -660,6 +737,7 @@ impl<S: 'static> Runner<S> {
     }
 
     fn redraw(&mut self) {
+        if !self.visible { self.wake_at = None; return; }
         let Some(window) = &self.window else { return };
         let mut slot = self.gfx.borrow_mut();
         let Some(gfx) = slot.as_mut() else { return };
@@ -667,7 +745,13 @@ impl<S: 'static> Runner<S> {
         if size.width == 0 || size.height == 0 {
             return;
         }
-        if (gfx.config.width, gfx.config.height) != (size.width, size.height) {
+        let size_changed = (gfx.config.width, gfx.config.height) != (size.width, size.height);
+        if std::env::var_os("RURU_TRACE_WINDOW").is_some() {
+            eprintln!("frame {:?} {}x{} changed={size_changed}", std::time::SystemTime::now(), size.width, size.height);
+        }
+        #[cfg(target_os = "macos")]
+        { self.app.ui.resizing = crate::macos::sync_resize(window, &gfx.surface, size_changed); }
+        if size_changed {
             gfx.config.width = size.width;
             gfx.config.height = size.height;
             gfx.surface.configure(&gfx.renderer.device, &gfx.config);
@@ -682,13 +766,11 @@ impl<S: 'static> Runner<S> {
             ui.titlebar = if full { 0.0 } else { self.app.titlebar_height.unwrap_or(MAC_TITLEBAR) };
             ui.window_buttons = if full { 0.0 } else { self.buttons.unwrap_or(MAC_BUTTONS) };
         }
-        #[cfg(target_os = "macos")]
-        if let Some(chrome) = &mut self.chrome {
-            chrome.set_dark(ui.clear_color().luminance() < 0.5);
-        }
         let started = web_time::Instant::now();
         ui.scale = scale;
         ui.frame((size.width as f32 / scale, size.height as f32 / scale));
+        #[cfg(target_os = "macos")]
+        if let Some(chrome)=&mut self.chrome {chrome.set_dark(ui.theme().dark);}
         let bg = ui.clear_color();
         let clear = if self.transparent { bg } else { Color { a: 1.0, ..bg } };
 
@@ -744,6 +826,7 @@ impl<S: 'static> Runner<S> {
 
     /// With `theme_auto`, takes the theme that matches the system appearance.
     fn follow_system(&mut self, system: Option<winit::window::Theme>) {
+        self.app.ui.system_dark=system!=Some(winit::window::Theme::Light);
         if let Some((light, dark)) = &self.app.auto {
             let t = if system == Some(winit::window::Theme::Light) { light } else { dark };
             self.app.ui.set_theme(t.clone());
@@ -794,7 +877,11 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        match self.wake_at {
+        #[cfg(not(target_arch = "wasm32"))]
+        let next = self.wake_at.into_iter().chain(self.update_companions(event_loop)).min();
+        #[cfg(target_arch = "wasm32")]
+        let next = self.wake_at;
+        match next {
             Some(t) if t <= web_time::Instant::now() => {
                 self.wake_at = None;
                 if let Some(w) = &self.window {
@@ -814,6 +901,7 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
         self.transparent = self.app.transparent && !cfg!(target_arch = "wasm32");
         #[allow(unused_mut)]
         let mut attrs = Window::default_attributes()
+            .with_visible(self.visible)
             .with_title(self.app.title.clone())
             .with_inner_size(LogicalSize::new(self.app.size.0 as f64, self.app.size.1 as f64))
             .with_transparent(self.transparent);
@@ -873,7 +961,20 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
         self.window = Some(window);
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.window.as_ref().is_none_or(|w| w.id() != id) {
+            if let Some(child) = self.companions.iter_mut().find(|c| c.id() == Some(id)) {
+                child.event(event_loop, id, event);
+            }
+            return;
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = id;
+        if let Some(dirty)=self.app.file_event(&event) {
+            if dirty {if let Some(window)=&self.window {window.request_redraw();}}
+            return;
+        }
         #[cfg(target_os = "macos")]
         if matches!(
             event,
@@ -902,6 +1003,14 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
                 self.redraw();
                 false
             }
+            #[cfg(target_os = "macos")]
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                // Draw in the resize callback, before AppKit commits the resized layer.
+                // Deferring to another redraw can present old pixels in the new bounds.
+                self.redraw();
+                false
+            }
+            #[cfg(not(target_os = "macos"))]
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => true,
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x as f32 / scale, position.y as f32 / scale);
@@ -1024,4 +1133,39 @@ fn key_char(logical: &Key, physical: PhysicalKey) -> Option<char> {
         KeyCode::Backslash => '\\',
         _ => return None,
     })
+}
+
+
+/// Opens the native directory chooser from a UI event handler. Returns `None` on cancel.
+/// Currently available on macOS; other targets return `None` without opening a dialog.
+pub fn pick_folder() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "macos")] { crate::macos::pick_folder() }
+    #[cfg(not(target_os = "macos"))] { None }
+}
+
+/// Opens a native multi-file chooser on the UI thread. Cancellation returns an empty
+/// vector. Platforms without a native implementation return an explicit error.
+pub fn pick_files()->Result<Vec<std::path::PathBuf>,String> {
+    #[cfg(target_os="macos")] {crate::macos::pick_files()}
+    #[cfg(not(target_os="macos"))] {Err("Native file selection is not available on this platform".into())}
+}
+
+#[cfg(test)]
+mod file_tests {
+    use super::*;
+    #[test]
+    fn native_file_events_are_opt_in_keep_paths_and_clear_hover() {
+        #[derive(Default)] struct Files {hovered:bool,paths:Vec<std::path::PathBuf>}
+        let mut app=App::new(Files::default(),|_:&Files|crate::rect())
+            .on_file_hover(|s,on|s.hovered=on).on_file_drop(|s,path|s.paths.push(path));
+        let path=std::path::PathBuf::from("/tmp/quoted name ' image.png");
+        assert_eq!(app.file_event(&WindowEvent::HoveredFile(path.clone())),Some(true));assert!(app.ui.state.hovered);
+        assert_eq!(app.file_event(&WindowEvent::DroppedFile(path.clone())),Some(true));assert!(!app.ui.state.hovered);
+        assert_eq!(app.ui.state.paths,vec![path.clone()]);
+        app.file_event(&WindowEvent::HoveredFile(path.clone()));app.file_event(&WindowEvent::HoveredFileCancelled);
+        assert!(!app.ui.state.hovered);assert_eq!(app.ui.state.paths.len(),1);
+        let mut plain=App::new((),|_:&()|crate::rect());
+        assert_eq!(plain.file_event(&WindowEvent::DroppedFile(path)),Some(false));
+        assert_eq!(plain.file_event(&WindowEvent::RedrawRequested),None);
+    }
 }

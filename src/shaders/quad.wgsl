@@ -17,7 +17,7 @@ struct Instance {
     @location(2) c0: vec4f,
     @location(3) c1: vec4f,
     @location(4) border: vec4f,
-    @location(5) p0: vec4f, // radius, border width, shadow sigma, kind
+    @location(5) p0: vec4f, // radius, border width, shadow sigma / glass fade, kind
     @location(6) p1: vec4f, // gradient dir, clip radius, opacity
     @location(7) n0: vec4f, // glass: neighbour pane to fuse with (x, y, w, h)
     @location(8) n1: vec4f, // glass: second neighbour
@@ -45,7 +45,7 @@ fn vs(@builtin(vertex_index) vi: u32, in: Instance) -> VOut {
     let corner = vec2f(f32(vi & 1u), f32((vi >> 1u) & 1u));
     let r = in.rect * s;
     // Room for AA, the shadow falloff, and the liquid neck between fused panes.
-    let grow = 1.0 + in.p0.z * s * 3.0 + in.np.z * s * 0.5;
+    let grow = 1.0 + select(0.0, in.p0.z * s * 3.0, in.p0.w == 1.0) + in.np.z * s * 0.5;
     let xy = r.xy - grow + corner * (r.zw + 2.0 * grow);
 
     var o: VOut;
@@ -63,7 +63,11 @@ fn vs(@builtin(vertex_index) vi: u32, in: Instance) -> VOut {
     let b = in.n1 * s;
     o.n0 = vec4f(a.xy + a.zw * 0.5, a.zw * 0.5);
     o.n1 = vec4f(b.xy + b.zw * 0.5, b.zw * 0.5);
-    // w: the clip's square corners (a bit mask), not a length.
+    if in.p0.w == 0.0 && (u32(in.np.w + 0.5) & 16384u) != 0u {
+        o.n0 = in.n0; // Border gradient target color.
+        o.n1 = in.n1; // Relative fade length and direction, not geometry.
+    }
+    // w: packed rendering flags, not a length.
     o.np = vec4f(in.np.xyz * s, in.np.w);
     return o;
 }
@@ -97,6 +101,33 @@ fn sdg_shape(p: vec2f, half: vec2f, r_in: f32, soft: f32, cont: bool) -> vec3f {
 
 fn sd_shape(p: vec2f, half: vec2f, r_in: f32, cont: bool) -> f32 {
     return sdg_shape(p, half, r_in, 1.0, cont).x;
+}
+
+// Signed distance to a triangle.
+fn sd_triangle(p: vec2f, a: vec2f, b: vec2f, c: vec2f) -> f32 {
+    let e0=b-a; let e1=c-b; let e2=a-c;
+    let v0=p-a; let v1=p-b; let v2=p-c;
+    let q0=v0-e0*clamp(dot(v0,e0)/dot(e0,e0),0.0,1.0);
+    let q1=v1-e1*clamp(dot(v1,e1)/dot(e1,e1),0.0,1.0);
+    let q2=v2-e2*clamp(dot(v2,e2)/dot(e2,e2),0.0,1.0);
+    let inside=min(min(e0.x*v0.y-e0.y*v0.x,e1.x*v1.y-e1.y*v1.x),e2.x*v2.y-e2.y*v2.x)>=0.0;
+    return sqrt(min(min(dot(q0,q0),dot(q1,q1)),dot(q2,q2)))*select(1.0,-1.0,inside);
+}
+fn sd_morph(p:vec2f, half:vec2f, radius:f32, phase:f32, rotation:f32)->f32 {
+    let q=vec2f(cos(rotation)*p.x+sin(rotation)*p.y,-sin(rotation)*p.x+cos(rotation)*p.y);
+    let extent=min(half.x,half.y)*0.86;
+    let square=sd_round_box(q,vec2f(extent),min(radius,extent));
+    // Offset the three edges inward before expanding by the corner radius. This
+    // rounds the tips without growing the silhouette or changing the other shapes.
+    let roundness=clamp(radius,0.0,extent*0.35);
+    let tip=-extent+sqrt(5.0)*roundness;
+    let base=extent-roundness;
+    let side=extent-(1.0+sqrt(5.0))*0.5*roundness;
+    let triangle=sd_triangle(q,vec2f(0.0,tip),vec2f(side,base),vec2f(-side,base))-roundness;
+    let circle=length(q)-extent;
+    if phase<1.0 {return mix(square,triangle,phase);}
+    if phase<2.0 {return mix(triangle,circle,phase-1.0);}
+    return mix(circle,square,phase-2.0);
 }
 
 // Quadratic smooth minimum (Inigo Quilez): the blended distance, and how much of `b` to
@@ -219,7 +250,8 @@ fn fs(in: VOut) -> @location(0) vec4f {
     let p = in.xy - in.rect.xy;
     let half = in.rect.zw;
     // A negative radius marks continuous corners; glass always has them.
-    let radius = abs(in.p0.x);
+    let corner = select(select(1u, 2u, p.x > 0.0), select(8u, 4u, p.x > 0.0), p.y > 0.0);
+    let radius = select(abs(in.p0.x), 0.0, (u32(in.np.w + 0.5) & (corner << 4u)) != 0u);
     let kind = in.p0.w;
     let cont = in.p0.x < 0.0 || kind == 2.0;
 
@@ -247,9 +279,14 @@ fn fs(in: VOut) -> @location(0) vec4f {
     }
     let clip = clamp(0.5 - dc, 0.0, 1.0);
     let alpha = clip * in.p1.w;
+    if kind == 4.0 {
+        let distance=sd_morph(p,half,radius,in.p1.x,in.p1.y);
+        return premul(in.c0)*clamp(0.5-max(distance,dc),0.0,1.0)*in.p1.w;
+    }
     // Shape cut by the clip as one distance: where the edges coincide (a border on a clipped
     // panel) the edge is antialiased once, not twice, and keeps its weight around the corners.
-    var cover = clamp(0.5 - max(d, dc), 0.0, 1.0);
+    let fill_d = select(d, max(-d, sd_round_box(p, half, 0.0)), kind == 0.0 && (u32(in.np.w + 0.5) & 256u) != 0u);
+    var cover = clamp(0.5 - max(fill_d, dc), 0.0, 1.0);
     let opacity = in.p1.w;
 
     if kind == 1.0 {
@@ -315,16 +352,18 @@ fn fs(in: VOut) -> @location(0) vec4f {
 
         // Specular rim: a crisp line that takes its colour from what is behind the glass,
         // strongest on the edge facing the light (top-left), weaker on the opposite one.
-        let facing = dot(nrm, vec2f(-0.5145, -0.8575));
+        let horizontal_light = (u32(in.np.w + 0.5) & 512u) != 0u;
+        let edge_light = select(1.0, pow(abs(nrm.y), 6.0), horizontal_light);
+        let facing = dot(nrm, select(vec2f(-0.5145, -0.8575), vec2f(0.0, -1.0), horizontal_light));
         let splay = 0.12;
         let lit = splay + (1.0 - splay) * pow(max(facing, 0.0), 2.0);
         let back = splay + (0.4 - splay) * pow(max(-facing, 0.0), 2.0);
         let line = exp(d / (0.55 * g.scale));
         let l2 = dot(bg, vec3f(0.3, 0.59, 0.11));
-        let highlight = (vec3f(l2) + (bg - vec3f(l2)) * 2.2) * 1.45 + vec3f(0.05);
-        bg = mix(bg, highlight, clamp(line * select(back, lit, facing > 0.0) * in.c1.z * 2.5, 0.0, 1.0));
+        let highlight = select((vec3f(l2) + (bg - vec3f(l2)) * 2.2) * 1.45 + vec3f(0.05), vec3f(1.0), horizontal_light);
+        bg = mix(bg, highlight, clamp(line * edge_light * select(back, lit, facing > 0.0) * in.c1.z * 2.5, 0.0, 1.0));
         // Faint lift across the bevel gives the slab some thickness.
-        bg += (1.0 - t) * (1.0 - t) * 0.05;
+        bg += (1.0 - t) * (1.0 - t) * select(0.05, 0.0075 * edge_light, horizontal_light) * clamp(in.c1.y, 0.0, 1.0);
         bg += (noise(in.xy) - 0.5) / 255.0; // dither away banding
         col = vec4f(clamp(bg, vec3f(0.0), vec3f(1.0)) * ga, ga);
     } else if kind == 3.0 {
@@ -334,6 +373,21 @@ fn fs(in: VOut) -> @location(0) vec4f {
         let texels = (in.c0.z - in.c0.x) * f32(textureDimensions(img).x);
         let lod = max(log2(texels / max(half.x * 2.0, 1.0)), 0.0);
         col = textureSampleLevel(img, samp, uv, lod);
+        // Streaming text masks: a compact Gaussian kernel whose radius smoothly falls
+        // to zero. Only new glyphs pay for these taps; ordinary images stay one sample.
+        if in.n0.x > 0.01 {
+            let step = vec2f(in.n0.x) / vec2f(textureDimensions(img));
+            var blurred = vec4f(0.0);
+            var total = 0.0;
+            for (var y = -2; y <= 2; y += 1) {
+                for (var x = -2; x <= 2; x += 1) {
+                    let weight = exp(-0.5 * f32(x*x + y*y));
+                    blurred += textureSampleLevel(img, samp, uv + vec2f(f32(x), f32(y)) * step, lod) * weight;
+                    total += weight;
+                }
+            }
+            col = blurred / total;
+        }
         if in.c1.y > 0.5 {
             // Template glyph: its alpha is the shape, the colour comes from the text colour.
             col = vec4f(in.c1.zw, in.p1.x, 1.0) * (in.p1.y * col.a);
@@ -346,7 +400,15 @@ fn fs(in: VOut) -> @location(0) vec4f {
     }
 
     let bw = in.p0.y;
-    if bw > 0.0 {
+    let border_side = select(select(1u, 4u, dg.z > 0.0), select(8u, 2u, dg.y > 0.0), abs(dg.y) > abs(dg.z));
+    let border_hidden = (u32(in.np.w + 0.5) >> 10u) & 15u;
+    if bw > 0.0 && (border_hidden & border_side) == 0u {
+        var border_color = in.border;
+        if (u32(in.np.w + 0.5) & 16384u) != 0u {
+            let from_edge = select(p.x + half.x, half.x - p.x, in.n1.y > 0.5);
+            let blend = smoothstep(0.0, max(2.0*half.x*in.n1.x, 1.0), from_edge);
+            border_color = mix(in.border, in.n0, blend);
+        }
         var band = clamp(d + bw + 0.5, 0.0, 1.0);
         if bw <= 2.5 {
             // A thin light line on a curve straddles two pixels at half coverage; blended in
@@ -355,18 +417,22 @@ fn fs(in: VOut) -> @location(0) vec4f {
             // space: even brightness around the corner. Under the line: the fill here, and
             // beyond the shape's edge assumed as dark as the fill over black.
             let under = luma(col.rgb / max(col.a, 1e-4)) * col.a;
-            let over = mix(under, luma(in.border.rgb), in.border.a);
+            let over = mix(under, luma(border_color.rgb), border_color.a);
             band = lin_cover(band, under, over);
             cover = lin_cover(cover, under, over);
         }
-        let b = premul(in.border) * band;
+        let b = premul(border_color) * band;
         col = b + col * (1.0 - b.a);
     }
     if kind == 2.0 {
         // Glass is drawn without blending: it already contains the backdrop, and blending
         // it over a translucent scene (transparent window) would count that backdrop twice.
         // Its edge is blended here against the snapshot, which is what lies underneath.
-        let k = cover * opacity;
+        var fade = 1.0;
+        if in.p0.z > 0.0 {
+            fade = smoothstep(0.0, in.p0.z, in.rect.y + in.rect.w - in.xy.y);
+        }
+        let k = cover * opacity * fade;
         if k <= 0.0 {
             discard;
         }

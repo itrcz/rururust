@@ -512,6 +512,9 @@ fn window_drag_asks_the_window_to_move_but_not_through_buttons() {
     });
     ui.titlebar = 28.0;
     ui.frame((400.0, 300.0));
+    assert!(ui.window_drag_at((100.0, 10.0)));
+    assert!(!ui.window_drag_at((380.0, 10.0)), "buttons block native title-bar gestures");
+    assert!(!ui.window_drag_at((100.0, 200.0)));
 
     ui.pointer_down((100.0, 10.0), false);
     ui.pointer_up((100.0, 10.0));
@@ -535,6 +538,43 @@ fn window_drag_asks_the_window_to_move_but_not_through_buttons() {
 }
 
 // ---- clip, truncate, hover, size limits, animate, padding
+
+#[test]
+fn controls_and_popover_dismissal_interrupt_titlebar_double_clicks() {
+    use ruru::WindowRequest;
+    let mut ui = Ui::new(false, |open: &bool| {
+        hstack((
+            button("More", |open: &mut bool| *open = true)
+                .size(40.0, 28.0)
+                .popover(*open, Placement::bottom(), |open| *open = false, text("Menu").size(100.0, 100.0)),
+            spacer(),
+        ))
+        .height(28.0)
+        .window_drag()
+    });
+    ui.frame((400.0, 300.0));
+    let background = (100.0, 10.0);
+    let button = (20.0, 10.0);
+    let click = |ui: &mut Ui<bool>, pos| {
+        ui.pointer_down(pos, false);
+        ui.pointer_up(pos);
+        ui.frame((400.0, 300.0));
+    };
+    click(&mut ui, background);
+    assert_eq!(std::mem::take(&mut ui.requests), vec![WindowRequest::DragWindow]);
+    click(&mut ui, button);
+    assert!(ui.state);
+    assert!(!ui.window_drag_at(background), "an open popover blocks native dragging below it");
+    assert!(ui.requests.is_empty());
+    click(&mut ui, background); // dismiss only, even above a draggable header
+    assert!(!ui.state);
+    assert!(ui.window_drag_at(background));
+    assert!(ui.requests.is_empty());
+    click(&mut ui, background);
+    assert_eq!(std::mem::take(&mut ui.requests), vec![WindowRequest::DragWindow]);
+    click(&mut ui, background);
+    assert_eq!(std::mem::take(&mut ui.requests), vec![WindowRequest::Zoom]);
+}
 
 fn quads(ui: &Ui<impl Sized>, color: Color) -> Vec<[f32; 4]> {
     ui.list
@@ -1463,6 +1503,44 @@ fn markdown_copies_as_plain_text_and_its_links_are_live() {
 
 // ---------------------------------------------------------------- popovers, menus, tooltips
 
+#[test]
+fn independent_window_states_receive_only_their_links_and_escape_works_in_a_field() {
+    struct Main(u32);
+    struct Inspector { open: bool, query: String }
+    let mut main = Ui::new(Main(0), |s: &Main| text(s.0.to_string()));
+    let mut inspector = Ui::new(Inspector { open: true, query: String::new() }, |s: &Inspector|
+        text_field(&s.query, "Filter", |s: &mut Inspector, v| s.query = v).size(200.0, 40.0)
+            .shortcut(Shortcut::named(KeyInput::Escape), |s: &mut Inspector| s.open = false));
+    ruru::link::<Main>().send(|s| s.0 = 7);
+    ruru::link::<Inspector>().send(|s| s.query = "stream".into());
+    assert!(inspector.pump());
+    assert_eq!(main.state.0, 0);
+    assert!(main.pump());
+    assert_eq!(main.state.0, 7);
+    assert_eq!(inspector.state.query, "stream");
+    inspector.frame((200.0, 40.0));
+    inspector.pointer_down((20.0, 20.0), false); inspector.pointer_up((20.0, 20.0));
+    assert!(inspector.key_shortcut(ruru::ShortcutKey::Named(KeyInput::Escape)));
+    assert!(!inspector.state.open);
+    assert_eq!(main.state.0, 7);
+}
+
+#[test]
+fn menu_action_can_replace_its_popover_with_an_escape_dismissible_modal() {
+    let mut ui = Ui::new(1u8, |s: &u8| zstack((
+        rect().size(30.0, 30.0).popover(*s == 1, Placement::bottom(), |s: &mut u8| *s = 0,
+            menu(vec![MenuItem::action("Open inspector", |s: &mut u8| *s = 2)])),
+        modal(*s == 2, |s: &mut u8| *s = 0, text("Inspector").padding(30.0)),
+    )).fill());
+    ui.frame((400.0, 400.0));
+    ui.key(KeyInput::Down);
+    ui.key(KeyInput::Enter);
+    assert_eq!(ui.state, 2, "source dismissal must happen before the action");
+    ui.frame((400.0, 400.0));
+    ui.key(KeyInput::Escape);
+    assert_eq!(ui.state, 0);
+}
+
 #[derive(Default)]
 struct M {
     log: Vec<&'static str>,
@@ -2065,9 +2143,13 @@ fn thumb(ui: &Ui<()>) -> Option<[f32; 4]> {
 }
 
 fn settle_bar(ui: &mut Ui<()>) {
-    for _ in 0..80 {
+    // Spring duration depends on frame time; an exact frame count can end just before
+    // settling under parallel test load. Keep a hard deadline and still require rest.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
         std::thread::sleep(std::time::Duration::from_millis(5));
         ui.frame((300.0, 400.0));
+        if !ui.animating || std::time::Instant::now() >= deadline { break; }
     }
 }
 
@@ -2626,6 +2708,13 @@ fn slider_style_sets_track_fill_and_knob() {
     ui.pointer_down((60.0, 12.0), false);
     ui.pointer_up((60.0, 12.0));
     assert_eq!(ui.state, 0.25);
+    ui.pointer_down((10.0,12.0),false);
+    ui.pointer_up((10.0,12.0));
+    ui.frame(W);
+    assert_eq!(ui.state,0.0);
+    assert!(quads(&ui,fill).is_empty(),"minimum must not leave a colored cap beside the knob");
+    assert_eq!(quads(&ui,track).len(),1);
+    assert_eq!(quads(&ui,knob).len(),1);
 }
 
 #[test]
@@ -3271,4 +3360,963 @@ fn menu_text_and_icon_settle_without_a_jump() {
             }
         }
     }
+}
+
+#[test]
+fn streaming_markdown_keeps_actions_at_bottom_in_the_same_frame() {
+    use ruru::Cmd;
+    let mut ui = Ui::new(String::from("Начало ответа.\n\n"), |s: &String| {
+        let source = s.clone();
+        scroll(list(2, 120.0, move |i| {
+            if i == 0 { return text(PARA.repeat(15)); }
+            vstack((ruru::markdown(&source), rect().size(48.0, 16.0).background(Color::RED)))
+                .spacing(16.0).align(Align::Start).fill_width()
+        }).padding_v(24.0)).stick_to_bottom()
+    });
+    let y = |ui: &Ui<String>| ui.list.cmds.iter().find_map(|c| match c {
+        Cmd::Quad(q) if q.c0 == [Color::RED.r, Color::RED.g, Color::RED.b, Color::RED.a] => Some(q.rect[1]), _ => None,
+    }).expect("action row remains visible");
+    for _ in 0..6 { ui.frame((340.0, 300.0)); }
+    let baseline = y(&ui);
+    let markdown = "- **Сначала замерить**: переносы длинной строки не должны сдвигать иконки.\n\n```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n\n| One | Two |\n| --- | --- |\n| cell | content |\n\nПоследний абзац.";
+    for ch in markdown.chars() {
+        ui.state.push(ch);
+        ui.frame((340.0, 300.0));
+        assert!((y(&ui) - baseline).abs() <= 0.5, "actions jump on {ch:?}: {} vs {baseline}", y(&ui));
+    }
+    // Reading above the end must not start following the stream again.
+    ui.wheel((160.0, 140.0), 100.0, ruru::WheelPhase::Line);
+    ui.frame((340.0, 300.0));
+    let before = ui.list.cmds.iter().find_map(|c| match c { Cmd::Text(t) => Some(t.pos.1), _ => None }).unwrap();
+    ui.state.push_str("\n\nЕщё один абзац.");
+    ui.frame((340.0, 300.0));
+    let after = ui.list.cmds.iter().find_map(|c| match c { Cmd::Text(t) => Some(t.pos.1), _ => None }).unwrap();
+    assert!((before - after).abs() < 1.0, "stream must not move a reader away from older text");
+}
+
+#[test]
+fn window_resize_updates_split_and_wrapped_text_without_settling_frames() {
+    const PANEL: Color = Color::hex(0x18406A);
+    const MAIN: Color = Color::hex(0x54321A);
+    for trailing in [false, true] {
+        let mut ui = Ui::new((), move |_: &(), env: &Env| {
+            let panel = rect().background(PANEL).min_width(100.0).max_width((env.width - 220.0).max(100.0));
+            let body = text(PARA.repeat(4)).fill_width().animate();
+            let main = vstack((body, rect().size(16.0, 16.0).background(Color::RED))).align(Align::Start).background(MAIN);
+            let view = split(320.0, |_: &mut (), _| {}, panel, main);
+            if trailing { view.trailing() } else { view }
+        });
+        ui.scale = 2.0;
+        ui.frame((800.0, 650.0));
+        for w in [700.0, 580.0, 500.0, 450.0, 510.0, 610.0, 800.0] {
+            ui.frame((w, 650.0));
+            let panel = quads(&ui, PANEL)[0];
+            let main = quads(&ui, MAIN)[0];
+            let expected = 320.0f32.min(w - 220.0);
+            assert_eq!(panel[2], expected, "sidebar must follow the new constraint in this frame");
+            let line = ui.theme().control.border;
+            let gap = if trailing { panel[0] - main[2] } else { main[0] - panel[2] };
+            assert!((gap - line).abs() < 0.51, "no unpainted gap beside the splitter: {gap}");
+            let before: Vec<_> = texts(&ui).iter().map(|t| (t.pos, t.size)).collect();
+            let marker = quads(&ui, Color::RED);
+            assert!(!ui.animating, "resizing must not schedule settling frames at width {w}");
+            ui.frame((w, 650.0));
+            assert_eq!(texts(&ui).iter().map(|t| (t.pos, t.size)).collect::<Vec<_>>(), before);
+            assert_eq!(quads(&ui, Color::RED), marker, "actions must not drift after the resize");
+        }
+    }
+}
+
+#[test]
+fn live_resize_snaps_pending_animation_and_state_changes_resume_afterwards() {
+    let mut ui = Ui::new(100.0, |s: &f32| rect().size(*s, 50.0).background(Color::RED).animate().place(Align::Start, Align::Start));
+    ui.frame((400.0, 300.0));
+    ui.state = 200.0;
+    ui.frame((400.0, 300.0));
+    assert!(ui.animating);
+    ui.resizing = true;
+    ui.frame((400.0, 300.0));
+    assert_eq!(quads(&ui, Color::RED)[0][2], 200.0);
+    assert!(!ui.animating);
+    ui.state = 250.0;
+    ui.frame((400.0, 300.0));
+    assert_eq!(quads(&ui, Color::RED)[0][2], 250.0, "even between native resize events");
+    ui.resizing = false;
+    ui.state = 300.0;
+    ui.frame((400.0, 300.0));
+    assert_eq!(quads(&ui, Color::RED)[0][2], 250.0);
+    assert!(ui.animating, "ordinary UI transitions are still animated");
+}
+
+#[test]
+fn press_scale_one_keeps_geometry_but_retains_feedback_and_click() {
+    let mut ui = Ui::new(0, |_: &i32| button("Stationary", |s: &mut i32| *s += 1)
+        .size(200.0, 60.0).press_scale(1.0));
+    ui.frame((200.0, 60.0));
+    let label = |ui: &Ui<i32>| ui.list.cmds.iter().find_map(|c| match c {
+        ruru::Cmd::Text(t) => Some((t.pos, t.size, t.scale, t.color.a)), _ => None,
+    }).unwrap();
+    let before = label(&ui);
+    ui.pointer_down((100.0, 30.0), false);
+    for _ in 0..15 {
+        std::thread::sleep(std::time::Duration::from_millis(8));
+        ui.frame((200.0, 60.0));
+        let held = label(&ui);
+        assert_eq!((held.0, held.1, held.2), (before.0, before.1, before.2));
+    }
+    assert!(label(&ui).3 < before.3);
+    ui.pointer_up((100.0, 30.0));
+    assert_eq!(ui.state, 1);
+}
+
+#[test]
+fn reveal_zooms_fades_bounces_and_disables_hidden_input_without_moving_layout() {
+    let mut ui = Ui::new((false, 0), |s: &(bool, i32)| hstack((
+        rect().size(40.0, 40.0).background(Color::hex(0x12AB34))
+            .on_tap(|s: &mut (bool, i32)| s.1 += 1).reveal(s.0),
+        text("Neighbor"),
+    )));
+    let size = (200.0, 80.0);
+    ui.frame(size);
+    let neighbor = |ui: &Ui<(bool, i32)>| ui.list.cmds.iter().find_map(|c| match c {
+        ruru::Cmd::Text(t) => Some(t.pos), _ => None,
+    }).unwrap();
+    let original = neighbor(&ui);
+    let mut at = (35.0, 40.0);
+    ui.pointer_down(at, false);
+    ui.pointer_up(at);
+    assert_eq!(ui.state.1, 0);
+    let mut zoom = Vec::new();
+    for shown in [true, false] {
+        ui.state.0 = shown;
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(8));
+            ui.frame(size);
+            assert_eq!(neighbor(&ui), original, "visibility must not move adjacent content");
+            if let Some(q) = ui.list.cmds.iter().find_map(|c| match c {
+                ruru::Cmd::Quad(q) if q.c0 == [18.0 / 255.0, 171.0 / 255.0, 52.0 / 255.0, 1.0] => Some(q), _ => None,
+            }) {
+                zoom.push((shown, q.rect[2], q.p1[3]));
+                if shown { at = (q.rect[0] + q.rect[2] / 2.0, q.rect[1] + q.rect[3] / 2.0); }
+            }
+            if !shown {
+                ui.pointer_down(at, false);
+                ui.pointer_up(at);
+                assert_eq!(ui.state.1, 1, "disappearing views must not receive clicks");
+            }
+            if !ui.animating { break; }
+        }
+        assert!(!ui.animating, "visibility animation settles");
+        if shown {
+            ui.pointer_down(at, false);
+            ui.pointer_up(at);
+            assert_eq!(ui.state.1, 1, "visible view receives clicks");
+        }
+    }
+    assert!(zoom.iter().any(|(shown, width, alpha)| *shown && *width < 39.0 && *alpha > 0.0 && *alpha < 1.0));
+    assert!(zoom.iter().any(|(shown, width, _)| *shown && *width > 40.0), "entry has a small bounce");
+    assert!(zoom.iter().any(|(shown, width, alpha)| !*shown && *width < 39.0 && *alpha > 0.0 && *alpha < 1.0));
+    assert!(!ui.list.cmds.iter().any(|c| matches!(c, ruru::Cmd::Quad(q) if q.c0 == [18.0 / 255.0, 171.0 / 255.0, 52.0 / 255.0, 1.0])));
+}
+
+#[test]
+fn modal_blocks_background_hover_cursor_and_tooltips() {
+    let mut ui = Ui::new(false, |open: &bool| {
+        zstack((
+            rect().fill().hover(Color::RED).cursor(Cursor::Pointer).tooltip("Background tooltip"),
+            modal(*open, |open: &mut bool| *open = false,
+                rect().size(120.0, 80.0).background(Color::BLUE).hover(Color::GREEN).cursor(Cursor::Text)),
+        )).fill()
+    });
+    let size = (400.0, 300.0);
+    ui.frame(size);
+    ui.pointer_move((10.0, 10.0));
+    assert_eq!(ui.cursor, Cursor::Pointer);
+    ui.state = true;
+    ui.frame(size);
+    ui.pointer_move((20.0, 10.0));
+    assert_eq!(ui.cursor, Cursor::Default, "the scrim blocks the background cursor");
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(16));
+        ui.frame(size);
+    }
+    assert!(!ui.list.cmds.iter().any(|c| matches!(c, ruru::Cmd::Text(_))), "background tooltip stays hidden");
+    assert!(!ui.list.cmds.iter().any(|c| matches!(c, ruru::Cmd::Quad(q) if q.c0[0] == 1.0 && q.c0[1] == 0.0 && q.c0[3] > 0.01)),
+        "background hover is not painted through the scrim");
+    ui.pointer_move((200.0, 150.0));
+    assert_eq!(ui.cursor, Cursor::Text, "dialog controls still hover");
+    ui.pointer_move((10.0, 10.0));
+    ui.pointer_down((10.0, 10.0), false);
+    ui.pointer_up((10.0, 10.0));
+    assert!(!ui.state);
+    for _ in 0..90 {
+        std::thread::sleep(std::time::Duration::from_millis(16));
+        ui.frame(size);
+    }
+    ui.pointer_move((20.0, 10.0));
+    assert_eq!(ui.cursor, Cursor::Pointer, "background hover returns after dismissal");
+}
+
+#[test]
+fn modal_text_geometry_stays_fixed_while_fading_in_and_out() {
+    let mut ui = Ui::new(false, |open: &bool| {
+        modal(*open, |open: &mut bool| *open = false,
+            vstack((text_field("Search query", "Search", |_: &mut bool, _| {}),
+                text("A long search result whose glyphs must not drift horizontally")))
+                .width(600.0).padding(20.0))
+    });
+    let size = (800.0, 500.0);
+    for scale in [1.0, 1.5, 2.0] {
+        ui.scale = scale;
+        ui.frame(size);
+        let mut reference = None;
+        let mut fading_frames = 0;
+        for open in [true, false] {
+            ui.state = open;
+            for _ in 0..90 {
+                std::thread::sleep(std::time::Duration::from_millis(16));
+                ui.frame(size);
+                let text: Vec<_> = ui.list.cmds.iter().filter_map(|cmd| match cmd {
+                    ruru::Cmd::Text(t) => Some((t.pos, t.size, t.scale)), _ => None,
+                }).collect();
+                if !text.is_empty() {
+                    if let Some(reference) = &reference { assert_eq!(&text, reference); }
+                    else { reference = Some(text); }
+                    if ui.animating { fading_frames += 1; }
+                }
+                if !ui.animating { break; }
+            }
+            assert!(!ui.animating, "modal animation settles");
+        }
+        assert!(fading_frames > 5, "verify intermediate frames as well as the final frame");
+    }
+}
+
+#[test]
+fn modal_rise_keeps_text_scale_and_x_fixed_above_a_blurred_backdrop() {
+    let mut ui = Ui::new(false, |open: &bool| {
+        zstack((
+            text("Background content"),
+            modal(*open, |open: &mut bool| *open = false,
+                text("Search results").padding(20.0).width(300.0).height(120.0))
+                .modal_style(ModalStyle { rise: 18.0, backdrop: Some(Glass { frost: 12.0, ..Glass::dark() }) }),
+        )).fill()
+    });
+    let size = (600.0, 400.0);
+    ui.scale = 2.0;
+    ui.frame(size);
+    ui.state = true;
+    let mut geometry = Vec::new();
+    for _ in 0..90 {
+        std::thread::sleep(std::time::Duration::from_millis(16));
+        ui.frame(size);
+        if let Some((glass_index, glass)) = ui.list.cmds.iter().enumerate().find_map(|(i, c)| match c {
+            ruru::Cmd::Quad(q) if q.p0[3] == 2.0 => Some((i, q)), _ => None,
+        }) {
+            assert_eq!(glass.rect, [0.0, 0.0, size.0, size.1], "blur covers the background");
+            assert!(glass.p1[0] <= 12.0);
+            if let Some(t) = ui.list.cmds[glass_index + 1..].iter().find_map(|c| match c {
+                ruru::Cmd::Text(t) => Some(t), _ => None,
+            }) { geometry.push((t.pos, t.size, t.scale)); }
+        }
+        if !ui.animating { break; }
+    }
+    assert!(!ui.animating);
+    assert!(geometry.len() > 5);
+    let end = geometry.last().unwrap();
+    assert!(geometry[0].0.1 > end.0.1 + 5.0, "panel starts below its resting position");
+    for frame in &geometry {
+        assert_eq!(frame.0.0, end.0.0, "no horizontal drift");
+        assert_eq!(frame.1, end.1, "text box does not scale");
+        assert_eq!(frame.2, 1.0, "glyph size stays fixed");
+    }
+    assert!(geometry.windows(2).all(|p| p[1].0.1 <= p[0].0.1), "rise never reverses or overshoots");
+}
+
+#[test]
+fn text_shimmer_reuses_geometry_moves_highlight_and_stops_when_removed() {
+    let mut ui = Ui::new(true, |active: &bool| {
+        let label = text("Thinking…").font_size(18.0);
+        if *active { label.text_shimmer(0.2, Color::WHITE) } else { label }
+    });
+    ui.frame((300.0, 100.0));
+    assert!(ui.animating);
+    let base = ui.list.cmds.iter().find_map(|c| match c { ruru::Cmd::Text(t) => Some((t.key, t.pos, t.size)), _ => None }).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(90));
+    ui.frame((300.0, 100.0));
+    let runs: Vec<_> = ui.list.cmds.iter().filter_map(|c| match c { ruru::Cmd::Text(t) => Some(t), _ => None }).collect();
+    assert!(runs.len() > 1);
+    for run in runs { assert_eq!((run.key, run.pos, run.size), base); }
+    ui.state = false;
+    ui.frame((300.0, 100.0));
+    assert!(!ui.animating);
+    assert_eq!(ui.list.cmds.iter().filter(|c| matches!(c, ruru::Cmd::Text(_))).count(), 1);
+}
+
+#[cfg(feature = "markdown")]
+#[test]
+fn code_header_pins_inside_nested_lazy_row_copies_source_and_uses_outer_scroll() {
+    use ruru::{CodeHeaderStyle, CodeBlockStyle, MarkdownStyle, Cmd};
+    let source = (0..80).map(|i| format!("const cell{i} = 'Привет';\n")).collect::<String>();
+    let markdown = format!("```javascript\n{source}```");
+    let view_source = markdown.clone();
+    let mut ui = Ui::new((), move |_: &()| {
+        let source = view_source.clone();
+        let style = MarkdownStyle { code_block: CodeBlockStyle {
+            header: Some(CodeHeaderStyle { height:40.0, ..Default::default() }),
+            background:Color::BLUE, ..Default::default()
+        }, ..Default::default() };
+        scroll(vstack((rect().height(60.0), list(1, 1800.0, move |_| vstack(markdown_styled(&source, &style)).fill_width()), rect().height(300.0))).fill_width()).fill()
+    });
+    let size = (420.0, 300.0);
+    for _ in 0..4 { ui.frame(size); }
+    let header_y = |ui: &Ui<()>| ui.list.cmds.iter().filter_map(|c| match c {
+        Cmd::Quad(q) if q.c0 == [Color::BLUE.r,Color::BLUE.g,Color::BLUE.b,Color::BLUE.a] && (q.rect[3]-40.0).abs() < 0.1 => Some(q.rect[1]), _ => None,
+    }).last().unwrap();
+    assert!((header_y(&ui)-60.0).abs()<1.0);
+    ui.wheel((200.0, 160.0), -240.0, ruru::WheelPhase::Line);
+    for _ in 0..4 { ui.frame(size); }
+    assert!(header_y(&ui).abs()<1.0, "nested code header must pin to the viewport");
+    ui.pointer_down((390.0,20.0),false); ui.pointer_up((390.0,20.0));
+    assert!(ui.requests.iter().any(|r| matches!(r,ruru::WindowRequest::SetClipboard(s) if s == &source)));
+    let before: Vec<_> = ui.list.cmds.iter().filter_map(|c| match c { Cmd::Text(t) if t.size.1 > 300.0 => Some(t.pos.1), _=>None }).collect();
+    ui.wheel((200.0, 160.0), -90.0, ruru::WheelPhase::Line); ui.frame(size);
+    let after: Vec<_> = ui.list.cmds.iter().filter_map(|c| match c { Cmd::Text(t) if t.size.1 > 300.0 => Some(t.pos.1), _=>None }).collect();
+    assert_ne!(before,after,"wheel over code must move the conversation");
+    ui.wheel((200.0,160.0),-100000.0,ruru::WheelPhase::Line);
+    for _ in 0..4 { ui.frame(size); }
+    assert!(!ui.list.cmds.iter().any(|c| matches!(c, Cmd::Quad(q) if q.c0 == [Color::BLUE.r,Color::BLUE.g,Color::BLUE.b,Color::BLUE.a] && (q.rect[3]-40.0).abs()<0.1 && q.rect[1] >= 0.0)), "header must leave with its own code section");
+}
+
+#[test]
+fn code_glass_is_one_fading_surface_and_keeps_the_cards_corner_clip() {
+    use ruru::{CodeHeaderStyle, CodeBlockStyle, MarkdownStyle, Cmd};
+    let mut ui = Ui::new((), |_: &()| {
+        let style = MarkdownStyle { code_block: CodeBlockStyle {
+            header: Some(CodeHeaderStyle { glass:Some(ruru::Glass { depth:0.0,rim:0.0,..Default::default() }), fade:22.0,..Default::default() }),
+            radius:14.0, border:Some((0.5,Color::WHITE)), ..Default::default()
+        },..Default::default() };
+        scroll(markdown_styled("```rust\nfn main() {}\n```",&style).fill_width()).fill()
+    });
+    ui.frame((420.0,300.0));
+    let panes: Vec<_> = ui.list.cmds.iter().filter_map(|c| match c {Cmd::Quad(q) if q.p0[3] == 2.0=>Some(q),_=>None}).collect();
+    assert_eq!(panes.len(),1,"a fade is one continuous glass surface");
+    assert_eq!(panes[0].p0[2],22.0);
+    assert!(panes[0].p1[2].abs()>10.0,"header must inherit rounded card clipping");
+    assert_eq!((panes[0].np[3] as u32)&3,0,"both top corners must remain rounded");
+}
+
+#[test]
+fn selected_round_corners_apply_to_surface_and_nested_clipping() {
+    let mut ui = Ui::new((), |_: &()| zstack(
+        zstack(rect().fill().background(Color::WHITE)).fill().clip()
+    ).size(200.0, 120.0).background(Color::BLACK).radius(16.0)
+        .round_corners([true, false, false, false]).clip());
+    ui.frame((300.0, 200.0));
+    let quads: Vec<_> = ui.list.cmds.iter().filter_map(|c| match c {
+        ruru::Cmd::Quad(q) => Some(q), _ => None,
+    }).collect();
+    assert_eq!((quads[0].np[3] as u32) >> 4, 14, "surface rounds top left only");
+    assert_eq!((quads[1].np[3] as u32) & 15, 14, "child clip keeps the same corners");
+    assert_eq!((quads[1].np[3] as u32) >> 4, 0, "own shape does not inherit corner selection");
+    assert_eq!(quads[1].p1[2].abs(), 16.0);
+}
+
+#[test]
+fn corner_mask_tracks_measured_surface_without_changing_children() {
+    let mut ui = Ui::new((), |_: &()| zstack(rect().size(10.0,10.0).background(Color::WHITE))
+        .size(100.0,80.0).background(Color::BLACK).radius(20.0)
+        .mask_corners(Color::BLACK,[false,false,true,true]));
+    ui.frame((200.0,160.0));
+    let quads: Vec<_> = ui.list.cmds.iter().filter_map(|c| match c {
+        ruru::Cmd::Quad(q) => Some(q), _ => None,
+    }).collect();
+    assert_eq!(quads[0].np[3] as u32, 0);
+    assert_eq!(quads[1].np[3] as u32, 0);
+    assert_eq!(quads[2].np[3] as u32, 256 | (3 << 4));
+    assert_eq!(quads[2].rect, quads[0].rect);
+}
+
+#[test]
+fn backdrop_corner_mask_precedes_shadows_material_and_children() {
+    let mut ui = Ui::new(80.0f32, |height: &f32| zstack(rect().size(10.0,10.0).background(Color::WHITE))
+        .size(100.0,*height).radius(20.0).smooth().glass_with(Glass::regular())
+        .shadow(Color::BLACK.alpha(0.1),12.0,3.0)
+        .mask_backdrop_corners(Color::BLACK,[false,false,true,true]));
+    for height in [80.0,140.0] {
+        ui.state=height;ui.frame((200.0,180.0));
+        let quads: Vec<_> = ui.list.cmds.iter().filter_map(|c|match c {ruru::Cmd::Quad(q)=>Some(q),_=>None}).collect();
+        assert_eq!(quads[0].np[3] as u32,256 | (3 << 4));
+        assert_eq!(quads[1].p0[3],1.0,"shadow follows the backdrop mask");
+        assert_eq!(quads[2].p0[3],2.0,"glass follows the shadow");
+        assert_eq!(quads[0].rect,quads[2].rect);
+        assert_eq!(quads[0].rect[3],height);
+        assert_eq!(quads[0].p0[0].abs(),quads[2].p0[0]);
+        assert_eq!(quads[3].rect[2..],[10.0,10.0],"children keep their layout");
+    }
+    for _ in 0..80 {ui.frame((200.0,180.0));}
+    assert!(!ui.animating,"a static mask never schedules redraws");
+}
+
+#[test]
+fn horizontal_glass_light_is_opt_in_and_preserves_corner_flags() {
+    let mut ui = Ui::new((), |_: &()| hstack((
+        rect().size(100.0,50.0).glass_with(Glass::regular()),
+        rect().size(100.0,50.0).radius(12.0).round_corners([true,false,false,false])
+            .glass_with(Glass { horizontal_light: true, ..Glass::regular() }),
+    )));
+    ui.frame((300.0,100.0));
+    let quads: Vec<_> = ui.list.cmds.iter().filter_map(|c| match c {
+        ruru::Cmd::Quad(q) if q.p0[3] == 2.0 => Some(q), _ => None,
+    }).collect();
+    assert_eq!(quads[0].np[3] as u32 & 512, 0);
+    assert_eq!(quads[1].np[3] as u32, 512 | (14 << 4));
+    assert_eq!(quads[0].p1[1], quads[1].p1[1], "lighting does not disable refraction");
+}
+
+#[test]
+fn split_highlights_selected_border_edges_and_round_corner_during_resize() {
+    let mut ui = Ui::new(240.0f32, |w: &f32| split(*w, |w: &mut f32, next| *w=next,
+        rect().min_width(100.0).max_width(400.0),
+        rect().background(Color::BLACK).radius(16.0).round_corners([true,false,false,false])
+            .border_edges([true,false,false,true]).clip(),
+    ).highlight_main_border());
+    let size=(800.0,400.0);
+    ui.frame(size);
+    let border = |ui: &Ui<f32>| ui.list.cmds.iter().find_map(|c| match c {
+        ruru::Cmd::Quad(q) if q.p0[1]>0.0 && q.rect[3]>300.0 => Some(*q), _=>None,
+    }).expect("complete pane border");
+    let before=border(&ui);
+    assert_eq!(before.rect,[241.0,0.0,559.0,400.0]);
+    assert_eq!((before.np[3] as u32 >> 4)&15,14);
+    assert_eq!((before.np[3] as u32 >> 10)&15,6,"right and bottom stay hidden");
+    ui.pointer_move((240.5,200.0));
+    let settle=|ui: &mut Ui<f32>| {
+        for _ in 0..250 {
+            ui.frame(size);
+            if !ui.animating {break;}
+            std::thread::sleep(std::time::Duration::from_millis(4));
+        }
+        assert!(!ui.animating,"border light settles without idle redraws");
+    };
+    settle(&mut ui);
+    let accent=Theme::default().color.accent;
+    let lit=border(&ui);
+    assert!(lit.border.iter().zip([accent.r,accent.g,accent.b,accent.a]).all(|(a,b)|(a-b).abs()<1e-4));
+    ui.pointer_down((240.5,200.0),false);
+    ui.pointer_move((280.5,220.0));
+    ui.frame(size);
+    assert_eq!(ui.state,280.0);
+    assert_eq!(border(&ui).rect,[281.0,0.0,519.0,400.0]);
+    assert_eq!(border(&ui).border,lit.border,"selected edges stay lit while dragging");
+    assert_eq!((border(&ui).np[3] as u32 >> 10)&15,6);
+    assert!(!ui.list.cmds.iter().any(|c| matches!(c,ruru::Cmd::Quad(q) if q.rect[3]>300.0 && q.rect[2]<=1.0)),"no stray straight divider through the rounded corner");
+    ui.pointer_up((280.5,220.0));
+    ui.pointer_move((700.0,220.0));
+    settle(&mut ui);
+    assert_eq!(border(&ui).border,before.border);
+}
+
+#[test]
+fn hidden_border_edges_do_not_inset_children_or_change_their_borders() {
+    let mut ui = Ui::new((), |_: &()| zstack(rect().fill().background(Color::WHITE))
+        .size(100.0,80.0).border(2.0,Color::BLACK).border_edges([true,false,false,true]).clip());
+    ui.frame((200.0,160.0));
+    let quads: Vec<_> = ui.list.cmds.iter().filter_map(|c| match c {
+        ruru::Cmd::Quad(q) => Some(q), _=>None,
+    }).collect();
+    let child=quads.iter().find(|q|q.c0==[1.0;4]).unwrap();
+    let border=quads.iter().find(|q|q.p0[1]==2.0).unwrap();
+    assert_eq!(child.clip,[2.0,2.0,98.0,78.0]);
+    assert_eq!((child.np[3] as u32 >> 10)&15,0);
+    assert_eq!((border.np[3] as u32 >> 10)&15,6);
+}
+
+#[test]
+fn split_gradient_and_grip_follow_hover_drag_and_settle_on_both_sides() {
+    for trailing in [false,true] {
+        let mut ui=Ui::new(240.0f32,move |w: &f32| {
+            let split=split(*w,|w: &mut f32,next|*w=next,rect().min_width(100.0).max_width(400.0),
+                rect().background(Color::BLACK).radius(16.0).border_edges([true,false,false,true]).clip())
+                .highlight_main_border_fade(0.2).resize_grip();
+            if trailing {split.trailing()} else {split}
+        });
+        let size=(800.0,400.0);
+        ui.frame(size);
+        let grip=|ui: &Ui<f32>|ui.list.cmds.iter().find_map(|c|match c {
+            ruru::Cmd::Quad(q) if q.p0[3]==0.0 && q.p0[1]==0.0 && q.rect[2]<5.0 && q.rect[3]>20.0=>Some(*q),_=>None,
+        }).expect("resize grip");
+        let border=|ui: &Ui<f32>|ui.list.cmds.iter().find_map(|c|match c {
+            ruru::Cmd::Quad(q) if q.p0[1]>0.0 && q.rect[3]>300.0=>Some(*q),_=>None,
+        }).unwrap();
+        let settle=|ui: &mut Ui<f32>| {
+            for _ in 0..250 {
+                ui.frame(size);
+                if !ui.animating {break;}
+                std::thread::sleep(std::time::Duration::from_millis(4));
+            }
+            assert!(!ui.animating,"grip returns to zero idle redraws");
+        };
+        let rest=grip(&ui);
+        assert_eq!(rest.rect[3],Theme::default().control.split_grip.1);
+        assert_eq!(border(&ui).n1,[0.2,if trailing {1.0}else{0.0},0.0,0.0]);
+        assert_ne!(border(&ui).np[3] as u32 & 16384,0);
+        let base=border(&ui).border;
+        let at=(rest.rect[0]+rest.rect[2]*0.5,200.0);
+        ui.pointer_move(at);settle(&mut ui);
+        assert!(grip(&ui).rect[3]>rest.rect[3]);
+        assert_eq!(border(&ui).n0,base,"fade target stays the resting border color");
+        assert_ne!(border(&ui).border,base,"corner lights up");
+        assert_eq!(ui.cursor,Cursor::ResizeH);
+        let hover_h=grip(&ui).rect[3];
+        ui.pointer_down(at,false);ui.pointer_move((at.0+20.0,at.1));settle(&mut ui);
+        assert!((ui.state-if trailing {220.0}else{260.0}).abs()<1.0);
+        assert!(grip(&ui).rect[3]>hover_h,"held grip stretches further");
+        ui.pointer_up((at.0+20.0,at.1));ui.pointer_move((400.0,300.0));settle(&mut ui);
+        assert_eq!(grip(&ui).rect[3],rest.rect[3]);
+        assert_eq!(border(&ui).border,base);
+    }
+}
+
+#[test]
+fn animated_radius_keeps_surface_border_and_clip_together_and_settles() {
+    let mut ui=Ui::new(true,|rounded: &bool| zstack(rect().fill().background(Color::WHITE))
+        .size(200.0,100.0).background(Color::BLACK).border(1.0,Color::WHITE)
+        .radius(if *rounded {16.0}else{0.0}).animate_radius().clip());
+    let size=(300.0,200.0);ui.frame(size);
+    for target in [false,true] {
+        ui.state=target;
+        let mut intermediate=false;
+        for _ in 0..200 {
+            ui.frame(size);
+            let quads: Vec<_>=ui.list.cmds.iter().filter_map(|c|match c {ruru::Cmd::Quad(q)=>Some(q),_=>None}).collect();
+            let radius=quads[0].p0[0].abs();
+            if radius>0.1 && radius<15.9 {intermediate=true;}
+            assert_eq!(quads.last().unwrap().p0[0].abs(),radius);
+            assert!((quads[1].p1[2].abs()-(radius-1.0).max(0.0)).abs()<0.01);
+            if !ui.animating {break;}
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(intermediate,"radius must pass through intermediate values");
+        assert!(!ui.animating,"no idle redraws after rounding settles");
+    }
+}
+
+#[test]
+fn resize_grip_can_align_with_a_footer_without_overflowing_during_drag() {
+    let mut ui=Ui::new(240.0f32,|w:&f32|split(*w,|w:&mut f32,v|*w=v,rect().min_width(100.0),rect())
+        .resize_grip_at_bottom(22.0));
+    let size=(800.0,400.0);ui.frame(size);
+    let grip=|ui:&Ui<f32>|ui.list.cmds.iter().find_map(|c|match c {
+        ruru::Cmd::Quad(q) if q.rect[2]>2.0 && q.rect[2]<5.0 && q.rect[3]>=24.0 && q.rect[3]<50.0=>Some(q.rect),_=>None,
+    }).unwrap();
+    assert_eq!(grip(&ui)[1]+grip(&ui)[3]/2.0,378.0);
+    ui.pointer_move((240.5,378.0));ui.pointer_down((240.5,378.0),false);
+    for _ in 0..100 {
+        ui.frame(size);let r=grip(&ui);
+        assert!((r[1]+r[3]/2.0-378.0).abs()<1.0);
+        assert!(r[1]+r[3]<=400.0);
+        if !ui.animating {break;}
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(grip(&ui)[3]>38.0);
+}
+
+#[test]
+fn double_tap_inline_editor_focuses_selects_commits_and_cancels() {
+    struct Edit { active: bool, value: String, saved: String, blurs: usize, taps: usize }
+    let mut ui = Ui::new(Edit { active:false,value:"Original title".into(),saved:String::new(),blurs:0,taps:0 }, |s:&Edit| {
+        let title = if s.active {
+            text_field(&s.value,"",|s:&mut Edit,v|s.value=v).autofocus().select_on_focus()
+                .on_submit(|s:&mut Edit|{s.saved=s.value.clone();s.active=false;})
+                .on_blur(|s:&mut Edit|{s.saved=s.value.clone();s.active=false;s.blurs+=1;})
+                .on_cancel(|s:&mut Edit|s.active=false)
+        } else {
+            text(&s.value).on_tap(|s:&mut Edit|s.taps+=1).on_double_tap(|s:&mut Edit|s.active=true)
+        };
+        vstack((title.size(200.0,40.0),button("Other",|_:&mut Edit|{}).size(200.0,40.0)))
+            .place(Align::Start,Align::Start)
+    });
+    let size=(400.0,200.0);ui.frame(size);
+    let at=(80.0,20.0);
+    ui.pointer_down(at,false);ui.pointer_up(at);ui.frame(size);
+    assert!(!ui.state.active);assert_eq!(ui.state.taps,1);
+    ui.pointer_down(at,false);ui.pointer_up(at);ui.frame(size);
+    assert!(ui.state.active);assert!(ui.has_focus());
+    assert!(ui.animating,"autofocus schedules the selection paint");ui.frame(size);
+    assert_eq!(ui.selection_text().as_deref(),Some("Original title"));
+    assert!(ui.text_input("Renamed"));ui.frame(size);
+    assert_eq!(ui.state.value,"Renamed");
+    assert!(ui.key(KeyInput::Enter));ui.frame(size);
+    assert_eq!(ui.state.saved,"Renamed");assert_eq!(ui.state.blurs,0);
+    for _ in 0..2 { ui.pointer_down(at,false);ui.pointer_up(at);ui.frame(size); }
+    ui.frame(size);assert!(ui.state.active,"second activation");assert!(ui.has_focus(),"second focus");assert_eq!(ui.selection_text().as_deref(),Some("Renamed"));
+    ui.text_input("Cancelled");ui.frame(size);ui.key(KeyInput::Escape);ui.frame(size);
+    assert!(!ui.state.active);assert_eq!(ui.state.saved,"Renamed");assert_eq!(ui.state.blurs,0);
+    ui.state.active=true;ui.frame(size);ui.frame(size);
+    ui.text_input("Blur saved");ui.frame(size);
+    ui.pointer_down((80.0,60.0),false);ui.pointer_up((80.0,60.0));ui.frame(size);
+    assert_eq!(ui.state.saved,"Blur saved");assert_eq!(ui.state.blurs,1);
+    assert!(!ui.has_focus());
+}
+
+#[test]
+fn intrinsic_field_uses_shaped_width_and_matching_weight() {
+    let mut ui=Ui::new(String::from("Wide WWW / Узкий iii"),|value:&String|vstack((
+        text(value).font_size(17.0).weight(Weight::Medium).lines(1),
+        text_field(value,"",|v:&mut String,s|*v=s).plain().font_size(17.0).weight(Weight::Medium).fit_content(),
+    )).align(Align::Start).place(Align::Start,Align::Start));
+    ui.frame((600.0,200.0));
+    let widths=|ui:&Ui<String>|ui.list.cmds.iter().filter_map(|c|match c {
+        ruru::Cmd::Text(t)=>Some(t.size.0),_=>None,
+    }).collect::<Vec<_>>();
+    let a=widths(&ui);assert_eq!(a.len(),2);
+    assert!((a[1]-a[0]-2.0).abs()<0.01,"field must match shaped label width plus caret space");
+    ui.state="i".into();ui.frame((600.0,200.0));let short=widths(&ui)[1];
+    assert!(short<a[1]);
+    ui.state="Очень длинное название чата ".repeat(8);ui.frame((180.0,200.0));
+    let field_text=ui.list.cmds.iter().filter_map(|c|match c {ruru::Cmd::Text(t)=>Some(t),_=>None}).last().unwrap();
+    assert!(field_text.clip.x+field_text.clip.w<=180.0,"long field remains clipped to offered width");
+}
+
+#[test]
+fn pointer_observation_is_opt_in_global_and_removed_with_hidden_view() {
+    #[derive(Default)] struct Tracking {enabled:bool,hidden:bool,points:Vec<Option<(f32,f32)>>,clicks:usize}
+    let mut ui=Ui::new(Tracking {enabled:true,..Tracking::default()},|s:&Tracking| {
+        let box_view=rect().size(60.0,60.0).on_tap(|s:&mut Tracking|s.clicks+=1).reveal(!s.hidden);
+        let box_view=if s.enabled {box_view.track_pointer(|s:&mut Tracking,pos|s.points.push(pos))} else {box_view};
+        zstack(box_view).fill()
+    });
+    ui.frame((200.0,200.0));
+    assert!(ui.pointer_move((195.0,20.0)),"observation extends outside mascot bounds");
+    assert_eq!(ui.state.points.last(),Some(&Some((125.0,-50.0))));
+    assert!(!ui.pointer_move((195.0,20.0)),"same position requests no extra frame");
+    assert!(ui.pointer_leave());assert_eq!(ui.state.points.last(),Some(&None));
+    ui.pointer_down((100.0,100.0),false);ui.pointer_up((100.0,100.0));assert_eq!(ui.state.clicks,1);
+    ui.state.hidden=true;ui.frame((200.0,200.0));let before=ui.state.points.len();
+    ui.pointer_move((190.0,190.0));assert_eq!(ui.state.points.len(),before,"reveal(false) removes observers immediately");
+    ui.state.hidden=false;ui.state.enabled=false;ui.frame((200.0,200.0));
+    ui.pointer_move((190.0,190.0));assert!(!ui.pointer_move((189.0,190.0)),"ordinary views stay idle on pointer motion");
+}
+
+#[test]
+fn timer_scheduled_by_timer_keeps_its_wakeup_and_then_stops() {
+    let mut ui=Ui::new(0usize,|_:&usize|rect().fill());
+    ruru::after(0.0,|s:&mut usize|{*s+=1;ruru::after(0.01,|s:&mut usize|*s+=1);});
+    ui.frame((200.0,200.0));assert_eq!(ui.state,1);assert!(ui.wake_in.is_some());
+    std::thread::sleep(std::time::Duration::from_millis(20));ui.frame((200.0,200.0));
+    assert_eq!(ui.state,2);assert!(ui.wake_in.is_none());assert!(!ui.animating);
+}
+
+#[test]
+fn collapsed_split_can_hide_its_divider_without_interrupting_the_current_drag() {
+    for trailing in [false,true] {
+        let mut ui=Ui::new(Sp { w:300.0,closed:false },move |s:&Sp| {
+            let split=split(s.w,|s:&mut Sp,w|s.w=w,rect().min_width(200.0).max_width(400.0),
+                rect().background(MAIN).border(1.0,Theme::default().color.divider))
+                .collapsible(s.closed,120.0,|s:&mut Sp,closed|s.closed=closed)
+                .hide_collapsed_divider().highlight_main_border_fade(0.2).resize_grip();
+            if trailing {split.trailing()}else{split}
+        });
+        let size=(800.0,400.0);ui.frame(size);
+        let point=|width:f32|(if trailing {800.0-width}else{width},200.0);
+        ui.pointer_down(point(300.5),false);
+        ui.pointer_move(point(90.0));ui.frame(size);
+        assert!(ui.state.closed);
+        ui.pointer_move(point(260.0));ui.frame(size);
+        assert!(!ui.state.closed,"the same held drag can reverse after crossing the collapse threshold");
+        ui.pointer_move(point(90.0));ui.frame(size);ui.pointer_up(point(90.0));settle_split(&mut ui);
+        assert!(ui.state.closed);
+        ui.pointer_move(point(0.5));ui.frame(size);
+        assert_ne!(ui.cursor,ruru::Cursor::ResizeH,"collapsed edge has no resize hover target");
+        let border=ui.list.cmds.iter().find_map(|c|match c {
+            ruru::Cmd::Quad(q) if q.p0[1]>0.0=>Some(*q),_=>None,
+        }).unwrap();
+        let hidden=(border.np[3] as u32 >> 10)&15;
+        assert_eq!(hidden & if trailing {2}else{8},if trailing {2}else{8},"shared border is hidden");
+        let divider=Theme::default().color.divider;
+        assert_eq!(border.border,[divider.r,divider.g,divider.b,divider.a],"no collapsed hover highlight");
+        assert!(!ui.list.cmds.iter().any(|c|matches!(c,ruru::Cmd::Quad(q) if q.rect[2]<=5.0 && q.rect[3]>20.0)),"no divider line or grip while hidden");
+        ui.pointer_down(point(0.5),false);ui.pointer_move(point(300.0));ui.pointer_up(point(300.0));ui.frame(size);
+        assert!(ui.state.closed,"a fresh edge gesture cannot reopen the sidebar");
+        ui.state.closed=false;settle_split(&mut ui);
+        assert!(!ui.state.closed,"an application control may still reopen it");
+        ui.pointer_move(point(ui.state.w+0.5));ui.frame(size);
+        assert_eq!(ui.cursor,ruru::Cursor::ResizeH,"opened divider remains resizable");
+    }
+}
+
+
+#[test]
+fn hover_marquee_uses_full_width_at_rest_scrolls_once_and_resets() {
+    let mut ui=Ui::new(0,|_:&i32| {
+        zstack((
+            text("A fairly long sidebar title that needs room").hover_marquee(5000.0,24.0,8.0).fill_width(),
+            text("x").size(20.0,24.0).on_tap(|s:&mut i32|*s+=1).place(Align::End,Align::Center),
+        )).size(120.0,24.0).hover_scope().place(Align::Start,Align::Start)
+    });
+    let size=(240.0,80.0);ui.frame(size);ui.frame(size);
+    let text=|ui:&Ui<i32>|ui.list.cmds.iter().find_map(|c|if let ruru::Cmd::Text(t)=c {Some((t.pos,t.clip,t.fade))}else{None}).unwrap();
+    let rest=text(&ui);
+    assert!(rest.2.is_none());assert_eq!(rest.1.x+rest.1.w,120.0);
+    assert!(!ui.animating && ui.wake_in.is_none());
+    // The action overlays the label, so hover must come from the entire row's scope.
+    ui.pointer_move((110.0,12.0));ui.frame(size);
+    let start=text(&ui);assert!(start.2.is_some());assert_eq!(start.1.x+start.1.w,96.0);
+    std::thread::sleep(std::time::Duration::from_millis(100));ui.frame(size);ui.frame(size);
+    let end=text(&ui);assert!(end.0.0<rest.0.0-20.0);assert!(end.2.is_none());
+    assert!(!ui.animating && ui.wake_in.is_none(),"the completed pass must sleep");
+    std::thread::sleep(std::time::Duration::from_millis(100));ui.frame(size);
+    assert_eq!(text(&ui).0,end.0,"never loop while hovered");
+    ui.pointer_down((110.0,12.0),false);ui.pointer_up((110.0,12.0));
+    assert_eq!(ui.state,1,"hover scope does not intercept the action");
+    ui.pointer_move((220.0,60.0));
+    for _ in 0..40 {ui.frame(size);std::thread::sleep(std::time::Duration::from_millis(8));}
+    assert_eq!(text(&ui).0,rest.0);assert!(text(&ui).2.is_none());
+    assert_eq!(text(&ui).1.w,120.0);
+}
+
+#[test]
+fn hover_marquee_does_not_animate_or_fade_fitting_labels() {
+    let mut ui=Ui::new(0,|_:&i32| text("Short").hover_marquee(30.0,24.0,8.0).size(120.0,24.0).place(Align::Start,Align::Start));
+    let size=(240.0,80.0);ui.frame(size);ui.frame(size);
+    ui.pointer_move((60.0,12.0));ui.frame(size);ui.frame(size);
+    let text=ui.list.cmds.iter().find_map(|c|if let ruru::Cmd::Text(t)=c {Some(t)}else{None}).unwrap();
+    assert_eq!(text.pos.0,0.0);assert!(text.fade.is_none());
+    assert!(!ui.animating && ui.wake_in.is_none());
+}
+
+fn tail_cursor(waiting:bool)->TextCursor {
+    TextCursor {size:if waiting {16.0}else{7.0},reserve:16.0,gap:5.0,radius:1.5,
+        color:Color::rgba(0.91,0.13,0.37,1.0),cycle_period:if waiting {2.2}else{0.0},transition_duration:0.55}
+}
+fn tail_marker<S:'static>(ui:&Ui<S>)->Vec<[f32;4]> {
+    ui.list.cmds.iter().filter_map(|cmd|match cmd {ruru::Cmd::Quad(q) if q.c0[0]==0.91 && q.c0[1]==0.13=>Some(q.rect),_=>None}).collect()
+}
+#[test]
+fn text_cursor_wraps_at_right_edge_without_copying_its_slot() {
+    let mut ui=Ui::new((),|_:&()|text("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789").font_size(16.0)
+        .text_cursor(tail_cursor(false)).width(100.0).selectable().place(Align::Start,Align::Start));
+    ui.frame((200.0,200.0));ui.frame((200.0,200.0));
+    let markers=tail_marker(&ui);assert_eq!(markers.len(),1);
+    assert!(markers[0][0]+markers[0][2]<=100.01,"cursor must fit on its wrapped line: {:?}",markers[0]);
+    assert!(!ui.animating && ui.wake_in.is_none(),"typing cursor is static");
+    ui.key(KeyInput::SelectAll);
+    assert_eq!(clipboard(&mut ui).as_deref(),Some("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"));
+    for width in [40.0,53.0,67.0,81.0,100.0,127.0] {
+        let mut narrow=Ui::new(width,|w:&f32|text("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789").font_size(16.0)
+            .text_cursor(tail_cursor(true)).width(*w).place(Align::Start,Align::Start));
+        narrow.frame((200.0,400.0));
+        let marker=tail_marker(&narrow);assert_eq!(marker.len(),1);
+        assert!(marker[0][0]+marker[0][2]<=width+0.01,"cursor outside width {width}: {:?}",marker[0]);
+    }
+}
+#[test]
+fn text_cursor_targets_code_body_not_sticky_header_and_stops_when_removed() {
+    let mut ui=Ui::new(true,|enabled:&bool| {
+        let body=markdown("```rust\nlet value = 12;\n```");
+        let body=if *enabled {body.text_cursor(tail_cursor(true))}else{body};
+        body.width(300.0).place(Align::Start,Align::Start)
+    });
+    ui.frame((400.0,300.0));let marker=tail_marker(&ui);assert_eq!(marker.len(),1);
+    let texts:Vec<_>=ui.list.cmds.iter().filter_map(|c|match c {ruru::Cmd::Text(t)=>Some(t),_=>None}).collect();
+    assert!(marker[0][1]>=texts.iter().map(|t|t.pos.1).fold(0.0,f32::max));
+    assert!(ui.animating || ui.wake_in.is_some());
+    ui.state=false;ui.frame((400.0,300.0));ui.frame((400.0,300.0));
+    assert!(tail_marker(&ui).is_empty());assert!(!ui.animating && ui.wake_in.is_none());
+}
+#[test]
+fn text_cursor_offscreen_tail_does_not_morph_or_wake() {
+    let mut ui=Ui::new((),|_:&()|scroll(vstack((text("Visible"),rect().height(600.0),text("Tail").text_cursor(tail_cursor(true))))).fill());
+    ui.frame((200.0,100.0));ui.frame((200.0,100.0));
+    assert!(tail_marker(&ui).is_empty());assert!(!ui.animating && ui.wake_in.is_none());
+}
+#[test]
+fn text_cursor_empty_waiting_line_is_visible() {
+    let mut ui=Ui::new((),|_:&()|text("").font_size(16.0).text_cursor(tail_cursor(true)).place(Align::Start,Align::Start));
+    ui.frame((200.0,100.0));assert_eq!(tail_marker(&ui).len(),1);assert!(ui.animating || ui.wake_in.is_some());
+}
+
+#[test]
+fn text_cursor_waiting_holds_without_continuous_frames_between_morphs() {
+    let mut ui=Ui::new((),|_:&()|text("Still waiting").text_cursor(tail_cursor(true)).place(Align::Start,Align::Start));
+    ui.frame((300.0,100.0));
+    std::thread::sleep(std::time::Duration::from_millis(650));
+    ui.frame((300.0,100.0));ui.frame((300.0,100.0));
+    assert!(!ui.animating,"hold phase must sleep instead of drawing at display rate");
+    assert!(ui.wake_in.is_some_and(|delay|delay>0.5 && delay<2.2));
+}
+
+#[test]
+fn activity_indicator_animates_only_while_visible() {
+    use ruru::prelude::*;
+    let mut ui=ruru::Ui::new(0u8,|s:&u8| {
+        let activity=activity_indicator(16.0,1.5,2.4).color(Color::WHITE);
+        match *s {
+            0=>activity.place(Align::Start,Align::Start),
+            1=>vstack((rect().height(150.0),activity)).fill().clip(),
+            2=>rect(),
+            3=>activity.color(Color::CLEAR),
+            _=>activity_indicator(16.0,1.5,0.0),
+        }
+    });
+    ui.frame((100.0,100.0));assert!(ui.animating);
+    let first=ui.list.cmds.iter().filter_map(|c|match c {ruru::Cmd::Quad(q)=>Some(q.rect),_=>None}).collect::<Vec<_>>();
+    std::thread::sleep(std::time::Duration::from_millis(40));ui.frame((100.0,100.0));
+    let second=ui.list.cmds.iter().filter_map(|c|match c {ruru::Cmd::Quad(q)=>Some(q.rect),_=>None}).collect::<Vec<_>>();
+    assert_ne!(first,second,"ring advances between frames");
+    for state in 1..=4 {
+        ui.state=state;ui.frame((100.0,100.0));
+        assert!(!ui.animating,"invisible, removed and static indicators sleep");
+        assert!(ui.wake_in.is_none());
+    }
+}
+
+#[test]
+fn system_theme_provider_tracks_os_independently_of_explicit_overrides_and_stays_idle() {
+    let observed=std::rc::Rc::new(std::cell::Cell::new((false,false)));let capture=observed.clone();
+    let mut ui=Ui::new(None::<bool>,move |_:&Option<bool>,env:&Env| {
+        capture.set((env.system_dark,env.theme.dark));text("Appearance").color(env.theme.color.text)
+    });
+    ui.theme_with_system(|choice,system_dark|if choice.unwrap_or(system_dark){Theme::dark()}else{Theme::light()});
+    for (choice,system,expected) in [(None,true,true),(None,false,false),(Some(true),false,true),(Some(false),true,false),(None,true,true)] {
+        ui.state=choice;ui.system_dark=system;ui.frame((300.0,100.0));ui.frame((300.0,100.0));
+        assert_eq!(ui.theme().dark,expected);assert_eq!(observed.get(),(system,expected));
+        assert!(!ui.animating && ui.wake_in.is_none(),"appearance has no polling timer or idle frames");
+    }
+}
+#[test]
+fn theme_provider_observes_background_changes_in_the_same_frame() {
+    let mut ui=Ui::new(false,|_:&bool|text("Theme"));
+    ui.theme_with_system(|light,_|if *light {Theme::light()}else{Theme::dark()});
+    ui.frame((200.0,100.0));assert!(ui.theme().dark);
+    ruru::link::<bool>().send(|light|*light=true);ui.frame((200.0,100.0));
+    assert!(!ui.theme().dark,"the provider must run after inbox updates, not a frame later");
+}
+
+#[test]
+fn switching_keyed_sticky_lists_starts_at_the_real_bottom_in_first_frame() {
+    let mut ui = Ui::new(0usize, |selected: &usize| {
+        let selected = *selected;
+        let count = if selected == 1 { 2 } else { 60 };
+        zstack(scroll(zstack(list(count, 120.0, move |i| {
+            vstack((text(PARA.repeat(if selected == 1 { 18 } else { 1 + i % 5 })),
+                rect().height(2.0).fill_width().background(if i + 1 == count {Color::RED} else {Color::BLUE})))
+                .padding_v(8.0).fill_width()
+        }).fill_width().max_width(500.0)).padding_ltrb(16.0, 10.0, 16.0, 30.0))
+            .key(selected).stick_to_bottom().fill()).fill()
+    });
+    for selected in [0, 1, 0, 2, 1] {
+        ui.state = selected;
+        ui.frame((640.0, 500.0));
+        let bottom = quads(&ui, Color::RED).last().map(|r| r[1] + r[3]);
+        assert_eq!(bottom, Some(462.0), "first frame of chat {selected} must show its actual end");
+        // Start the next navigation while reading old messages in this chat.
+        ui.wheel((300.0, 250.0), 180.0, ruru::WheelPhase::Line);
+        ui.frame((640.0, 500.0));
+    }
+}
+
+#[test]
+fn first_sticky_list_frame_measures_only_the_tail_viewport() {
+    use std::sync::{Arc,atomic::{AtomicUsize,Ordering}};
+    let builds=Arc::new(AtomicUsize::new(0));
+    let rows=builds.clone();
+    let mut ui=Ui::new((),move |_:&()| {
+        let rows=rows.clone();
+        scroll(list(10_000,120.0,move |_| {
+            rows.fetch_add(1,Ordering::Relaxed);
+            text(PARA.repeat(4)).fill_width()
+        })).stick_to_bottom()
+    });
+    ui.frame((600.0,500.0));
+    assert!(builds.load(Ordering::Relaxed)<20,"first-frame correction must not eagerly build the history");
+}
+
+#[test]
+fn scoped_hover_offset_keeps_layout_and_moves_the_hit_region_with_the_child() {
+    let mut ui=Ui::new(0u8,|_:&u8|zstack(
+        rect().size(20.0,20.0).background(Color::WHITE).on_tap(|s:&mut u8|*s+=1)
+            .hover_offset(-40.0,0.0).place(Align::End,Align::Center)
+    ).size(160.0,40.0).hover_scope().place(Align::Start,Align::Start));
+    let size=(200.0,100.0);ui.frame(size);
+    let position=|ui:&Ui<u8>|ui.list.cmds.iter().find_map(|cmd|match cmd {ruru::Cmd::Quad(q) if q.c0==[1.0,1.0,1.0,1.0]=>Some(q.rect),_=>None}).unwrap();
+    let rest=position(&ui);assert_eq!(rest,[140.0,10.0,20.0,20.0]);
+    ui.pointer_move((10.0,20.0));
+    for _ in 0..80 {ui.frame(size);if !ui.animating {break;}std::thread::sleep(std::time::Duration::from_millis(5));}
+    assert_eq!(position(&ui),[100.0,10.0,20.0,20.0]);
+    ui.pointer_down((110.0,20.0),false);ui.pointer_up((110.0,20.0));assert_eq!(ui.state,1);
+    ui.pointer_down((150.0,20.0),false);ui.pointer_up((150.0,20.0));assert_eq!(ui.state,1,"old presentation position is not clickable");
+    ui.pointer_move((180.0,80.0));
+    for _ in 0..80 {ui.frame(size);if !ui.animating {break;}std::thread::sleep(std::time::Duration::from_millis(5));}
+    assert_eq!(position(&ui),rest);assert!(!ui.animating);
+}
+
+
+#[test]
+fn picker_typography_and_menu_follow_custom_style_without_scaling_to_control_height() {
+    let mut ui=Ui::new((32.0,0usize),|s:&(f32,usize)|picker(&["English","Русский"],s.1,|s:&mut (f32,usize),i|s.1=i)
+        .size(150.0,s.0).font_size(14.0).line_height(1.5).weight(Weight::Medium));
+    let mut theme=Theme::dark();theme.text.body.size=22.0;
+    theme.control.picker_padding=(10.0,3.0);theme.control.picker_row=30.0;
+    ui.set_theme(theme);
+    for height in [32.0,52.0] {
+        ui.state.0=height;ui.frame((400.0,300.0));
+        let texts:Vec<_>=ui.list.cmds.iter().filter_map(|c|match c {ruru::Cmd::Text(t)=>Some(t),_=>None}).collect();
+        assert_eq!(texts[0].size.1,21.0,"explicit typography overrides the theme and stays fixed");
+        assert!((texts[0].pos.1+texts[0].size.1/2.0-height/2.0).abs()<=0.5,"label centers in the measured control");
+        assert_eq!(texts[1].size.1,21.0,"chevron uses the same typographic scale");
+        assert!(texts[1].pos.1>=0.0 && texts[1].pos.1+texts[1].size.1<=height);
+    }
+    ui.pointer_down((50.0,20.0),false);ui.pointer_up((50.0,20.0));
+    ui.resizing=true;ui.frame((400.0,300.0));ui.resizing=false;
+    let texts:Vec<_>=ui.list.cmds.iter().filter_map(|c|match c {ruru::Cmd::Text(t)=>Some(t),_=>None}).collect();
+    assert_eq!(texts.len(),5,"control label/chevron plus two choices and the selected check");
+    assert!((texts[2].size.0/texts[2].scale-texts[0].size.0).abs()<0.01 && (texts[2].size.1/texts[2].scale-texts[0].size.1).abs()<0.01,"menu choice retains the control's explicit style through its opening animation");
+    assert!((texts[3].size.1/texts[3].scale-21.0).abs()<0.01,"selected check uses the same typography");
+    assert!(((texts[4].pos.1-texts[2].pos.1)/texts[4].scale-30.0).abs()<1.0,"theme controls menu row height");
+    let second=(texts[4].pos.0+4.0,texts[4].pos.1+5.0);
+    ui.pointer_down(second,false);ui.pointer_up(second);assert_eq!(ui.state.1,1);
+}
+
+#[test]
+fn picker_without_font_override_uses_the_theme_body_style() {
+    let mut ui=Ui::new((),|_:&()|picker(&["Choice"],0,|_:&mut (),_|{}).size(140.0,36.0));
+    let mut theme=Theme::dark();theme.text.body.size=12.0;theme.text.body.line_height=1.5;
+    ui.set_theme(theme);ui.frame((200.0,100.0));
+    let label=ui.list.cmds.iter().find_map(|c|match c {ruru::Cmd::Text(t)=>Some(t),_=>None}).unwrap();
+    assert_eq!(label.size.1,18.0);
+    assert!((label.pos.1+label.size.1/2.0-18.0).abs()<=0.5);
+}
+
+#[test]
+fn scroll_bottom_overlay_uses_wrapped_height_for_tail_and_scrollbar_without_losing_focus() {
+    #[derive(Default)] struct Draft {text:String}
+    let mut ui=Ui::new(Draft::default(),|s:&Draft|scroll(rect().height(1000.0).fill_width().background(Color::hex(0xAA0000)))
+        .stick_to_bottom().indicator(Indicator::Always).indicator_insets(3.0,5.0)
+        .bottom_overlay(zstack(text_field(&s.text,"Draft",|s:&mut Draft,v|s.text=v)
+            .font_size(14.0).line_height(1.4).multiline().max_lines(8).plain())
+            .padding(6.0).fill_width().background(Color::hex(0x0000AA))));
+    let size=(240.0,300.0);
+    let geometry=|ui:&Ui<Draft>,color:u32|ui.list.cmds.iter().find_map(|cmd|match cmd {
+        ruru::Cmd::Quad(q) if q.c0=={let c=Color::hex(color);[c.r,c.g,c.b,c.a]}=>Some(q.rect),_=>None,
+    }).unwrap();
+    let mut heights=vec![];
+    for draft in ["i".repeat(120),"W".repeat(120),"界".repeat(120),"👨‍👩‍👧‍👦".repeat(30)] {
+        ui.state.text=draft;ui.frame(size);
+        let content=geometry(&ui,0xAA0000);let overlay=geometry(&ui,0x0000AA);
+        assert!((content[1]+content[3]-overlay[1]).abs()<=0.5,"parked content ends exactly above the measured overlay");
+        assert_eq!(overlay[1]+overlay[3],size.1,"overlay is anchored to the bottom");
+        heights.push(overlay[3]);
+        let bars:Vec<_>=ui.list.cmds.iter().filter_map(|cmd|match cmd {
+            ruru::Cmd::Quad(q) if q.rect[0]>size.0-10.0 && q.rect[2]<8.0=>Some(q.rect),_=>None,
+        }).collect();
+        for bar in bars {assert!(bar[1]+bar[3]<=overlay[1]-4.0,"indicator respects measured overlay plus its explicit inset");}
+    }
+    assert!(heights[0]<heights[1],"narrow and wide glyphs must not share a character-count estimate");
+    ui.state.text="ab".into();ui.frame(size);
+    let overlay=geometry(&ui,0x0000AA);let at=(20.0,overlay[1]+12.0);
+    ui.pointer_down(at,false);ui.pointer_up(at);ui.key(ruru::KeyInput::End);ui.key(ruru::KeyInput::Left);
+    for _ in 0..3 {ui.frame(size);assert!(ui.has_focus());assert!(ui.text_input("x"));}
+    assert_eq!(ui.state.text,"axxxb");
 }

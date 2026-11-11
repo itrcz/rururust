@@ -542,9 +542,9 @@ pub(crate) struct LayerCtx<S> {
 }
 
 impl<S> Painter<'_, S> {
-    fn fade(&mut self, id: u64, target: f32) -> f32 {
+    pub(super) fn fade(&mut self, id: u64, target: f32) -> f32 {
         let s = self.springs.entry((id, SLOT_FADE)).or_insert(Spring::new(0.0, target, FADE));
-        s.target = target;
+        if self.resizing { s.snap_to(target); } else { s.target = target; }
         s.used = self.frame;
         s.x
     }
@@ -578,7 +578,7 @@ impl<S> Painter<'_, S> {
         let ((x, y), from) = place(l.anchor, size, l.placement, self.screen);
         // Grows a little out of the anchor while it fades in.
         let k = 0.94 + 0.06 * tc;
-        let xf = Xf { s: k, tx: from.0 * (1.0 - k), ty: from.1 * (1.0 - k), opacity: tc, clip: self.screen, clip_r: 0.0, clip_smooth: false, clip_sq: 0, px: self.px, fg: l.fg };
+        let xf = Xf { s: k, tx: from.0 * (1.0 - k), ty: from.1 * (1.0 - k), opacity: tc, text_reveal: None, hover_scope: None, clip: self.screen, clip_r: 0.0, clip_smooth: false, clip_sq: 0, shape_sq: 0, border_hidden: 0, px: self.px, fg: l.fg };
         let body = xf.rect(Rect::new(x, y, size.0, size.1));
         let tip = matches!(l.kind, LayerKind::Tooltip);
         if let (LayerKind::Popover(d), true) = (&l.kind, l.open) {
@@ -619,7 +619,7 @@ impl<S> Painter<'_, S> {
     }
 
     /// The anchor's attachments: its popover and tooltip go to the layer queue.
-    pub(super) fn attach(&mut self, x: crate::view::Extras<S>, ln: &LNode, xf: &Xf, id: u64, sr: Rect) {
+    pub(super) fn attach(&mut self, x: crate::view::Extras<S>, ln: &LNode, xf: &Xf, id: u64, sr: Rect, layout_anchor: Rect) {
         use crate::view::Opens;
         if let Some(f) = x.secondary {
             self.hit(xf, id ^ 0x5EC0, sr, Action::Secondary(Some(f), id));
@@ -636,8 +636,8 @@ impl<S> Painter<'_, S> {
             }
             if let Some(node) = &ln.pop {
                 let (open, dismiss, anchor) = match p.opens {
-                    Opens::State(open, f) => (open, Dismiss::App(f), sr),
-                    Opens::Tap => (managed_open, Dismiss::Managed, sr),
+                    Opens::State(open, f) => (open, Dismiss::App(f), layout_anchor),
+                    Opens::Tap => (managed_open, Dismiss::Managed, layout_anchor),
                     Opens::Context => (managed_open, Dismiss::Managed, Rect::new(self.ctx_at.0, self.ctx_at.1, 0.0, 0.0)),
                 };
                 self.layers.push(Layer {
@@ -660,7 +660,7 @@ impl<S> Painter<'_, S> {
                     id: tip_id(id),
                     view: *tip,
                     node: (**node).clone(),
-                    anchor: sr,
+                    anchor: layout_anchor,
                     placement,
                     open: self.tip == Some(id),
                     kind: LayerKind::Tooltip,
@@ -832,18 +832,13 @@ impl<S: 'static> Ui<S> {
         }
     }
 
-    /// Closes the topmost popover or menu; false if none is open.
+    /// Closes the topmost dismissible overlay; false if none is open.
     pub(super) fn dismiss_top(&mut self) -> bool {
-        let d = self.hits.iter().rev().find_map(|h| match &h.action {
-            Action::Outside(d) => Some(d.clone()),
-            _ => None,
-        });
-        match d {
-            Some(d) => {
-                self.run_dismiss(d);
-                true
-            }
-            None => false,
+        let hit = self.hits.iter().rposition(|h| matches!(h.action, Action::Outside(_) | Action::Block(_)));
+        match hit.map(|i| &self.hits[i].action) {
+            Some(Action::Outside(d)) => { self.run_dismiss(d.clone()); true }
+            Some(Action::Block(Some(f))) => { f(&mut self.state); true }
+            _ => false,
         }
     }
 
@@ -892,7 +887,7 @@ impl<S: 'static> Ui<S> {
             k => k,
         };
         let editing = matches!(key, ShortcutKey::Char('a' | 'c' | 'v' | 'x' | 'z' | 'y'));
-        if self.focus.is_some() && (!mods.command || editing) {
+        if self.focus.is_some() && ((!mods.command && key != ShortcutKey::Named(KeyInput::Escape)) || editing) {
             return false;
         }
         // Arrows, Enter and Escape belong to an open menu or popover.

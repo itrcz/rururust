@@ -442,6 +442,7 @@ impl<S: 'static> Ui<S> {
             height: self.size.1,
             titlebar: self.titlebar,
             window_buttons: self.window_buttons,
+            system_dark:self.system_dark,
             theme: self.theme_rc(),
         }
     }
@@ -466,7 +467,13 @@ fn find<S>(v: View<S>, id: u64, area: u64, path: &[(u64, usize)], c: &mut Collec
             let cid = child_id(id, i, ch.key);
             find(ch, cid, area, path, c)
         }),
-        Kind::Scroll { child, .. } | Kind::Overlay { child, .. } => {
+        Kind::Scroll {child,bottom_overlay,..} => {
+            let cid=child_id(id,0,child.key);
+            find(*child,cid,area,path,c).or_else(||bottom_overlay.and_then(|overlay| {
+                let cid=child_id(id,1,overlay.key);find(*overlay,cid,area,path,c)
+            }))
+        }
+        Kind::Overlay { child, .. } => {
             let cid = child_id(id, 0, child.key);
             find(*child, cid, area, path, c)
         }
@@ -484,7 +491,8 @@ fn count_text<S>(v: &View<S>) -> u32 {
     match &v.kind {
         Kind::Text(_) => 1,
         Kind::Stack { children, .. } => children.iter().map(count_text).sum(),
-        Kind::Scroll { child, .. } | Kind::Overlay { child, .. } => count_text(child),
+        Kind::Scroll {child,bottom_overlay,..} => count_text(child)+bottom_overlay.as_ref().map_or(0,|overlay|count_text(overlay)),
+        Kind::Overlay { child, .. } => count_text(child),
         _ => 0,
     }
 }
@@ -527,7 +535,11 @@ fn collect<S>(v: &View<S>, c: &mut Collect) -> Option<String> {
             let parts = children.iter().map(|ch| collect(ch, c)).collect();
             join(parts, v.style.copy_sep.unwrap_or(if *axis == Axis::H { " " } else { "\n" }))
         }
-        Kind::Scroll { child, .. } => collect(child, c),
+        Kind::Scroll {child,bottom_overlay,..} => {
+            let mut parts=vec![collect(child,c)];
+            if let Some(overlay)=bottom_overlay {parts.push(collect(overlay,c));}
+            join(parts,"\n")
+        }
         Kind::Overlay { open, child, .. } => {
             if *open {
                 collect(child, c)
