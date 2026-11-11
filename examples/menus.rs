@@ -99,7 +99,32 @@ fn say(s: &mut Demo, what: impl Into<String>) {
 }
 
 fn icon_button(img: &Image) -> View<Demo> {
-    zstack(icon(img).size(18.0, 18.0)).size(28.0, 28.0).radius(7.0).hover(Color::WHITE.alpha(0.1)).color(DIM)
+    // The glyph lights up with the highlight, as in a macOS toolbar.
+    zstack(icon(img).size(18.0, 18.0)).size(28.0, 28.0).radius(7.0).hover(Color::WHITE.alpha(0.1)).color(DIM).hover_color(Color::WHITE)
+}
+
+/// A macOS 26 dark menu: rows on a 28.5 pt step, small dimmed shortcuts, 9 pt separators, a
+/// close key shadow over a wide ambient one and a faint light rim inside the border.
+fn mac_menu() -> MenuStyle {
+    MenuStyle {
+        background: Color::hex(0x2E2D2D),
+        radius: 15.0,
+        border: Some((0.5, Color::WHITE.alpha(0.15))),
+        shadow: Some(Shadow::new(Color::BLACK.alpha(0.3), 3.0, 1.0)),
+        ambient: Some(Shadow::new(Color::BLACK.alpha(0.35), 24.0, 8.0).spread(-2.0)),
+        rim: Some(Shadow::new(Color::WHITE.alpha(0.05), 0.0, 0.0).spread(1.0).inset()),
+        padding: 4.5,
+        row_height: 28.5,
+        row_radius: 10.0,
+        row_padding: 8.0,
+        icon_gap: 7.0,
+        highlight: Color::hex(0x3F3E3E),
+        dim: Color::hex(0x959494),
+        separator: Color::hex(0x3F3E3E),
+        separator_height: 9.0,
+        shortcut_size: Some(11.5),
+        ..MenuStyle::default()
+    }
 }
 
 fn more_menu(s: &Demo) -> View<Demo> {
@@ -149,7 +174,16 @@ fn add_menu(s: &Demo, width: f32) -> View<Demo> {
         MenuItem::action("Documents", |s: &mut Demo| say(s, "Documents")).icon(&i.file).hint("Create and edit documents"),
         MenuItem::action("Spreadsheets", |s: &mut Demo| say(s, "Sheets")).icon(&i.copy).hint("Create and edit spreadsheets"),
     ])
-    .menu_style(MenuStyle { row_height: 26.0, font_size: 12.5, ..MenuStyle::default() })
+    .menu_style(MenuStyle {
+        row_height: 28.5,
+        highlight_inset: 2.25,
+        row_radius: 12.0,
+        section_size: Some(12.5),
+        section_weight: Weight::Regular,
+        section_color: Some(Color::hex(0x969696)),
+        section_gap: 6.0,
+        ..MenuStyle::default()
+    })
     .width(width)
 }
 
@@ -231,7 +265,15 @@ fn effort_popover(s: &Demo) -> View<Demo> {
             zstack(icon(&s.icons.reset).size(16.0, 16.0).color(DIM)).on_tap(|s: &mut Demo| s.effort = 0.75),
         )),
         text("GPT-6 Astra ›").font_size(12.0).color(DIM),
-        slider(s.effort, |s: &mut Demo, v| s.effort = v).steps(5),
+        slider(s.effort, |s: &mut Demo, v| s.effort = v).steps(5).slider_style(SliderStyle {
+            track_height: 24.0,
+            track: Color::hex(0x434242),
+            track_border: Some((1.0, Color::hex(0x535252))),
+            fill: Color::hex(0x4D81EF),
+            tick_on: Color::hex(0x83A7F4),
+            tick_off: Some(Color::hex(0x727171)),
+            ..SliderStyle::default()
+        }),
     ))
     .spacing(8.0)
     .padding(14.0)
@@ -276,7 +318,7 @@ fn view(s: &Demo, env: &Env) -> View<Demo> {
         spacer(),
         text(if s.pinned { "📌 Rust for cross-platform" } else { "Rust for cross-platform" }).font_size(13.0).weight(Weight::Semibold),
         spacer(),
-        icon_button(&s.icons.more).tooltip("More").menu_at(Placement::bottom().end(), more_menu(s)),
+        icon_button(&s.icons.more).tooltip("More").menu_at(Placement::bottom().end().gap(4.5).margin(6.5), more_menu(s).menu_style(mac_menu())),
     ))
     .padding_xy(12.0, 8.0)
     .height(44.0);

@@ -1,6 +1,6 @@
 use ruru::prelude::*;
 use ruru::{KeyInput, Ui};
-use ruru::{menu, MenuItem, Placement, Shortcut};
+use ruru::{menu, MenuItem, MenuStyle, Placement, Shortcut};
 
 struct S {
     n: i32,
@@ -2334,4 +2334,190 @@ fn menu_inside_scroll_and_clip_still_hovers() {
         assert!(ui.key(KeyInput::Enter));
         assert_eq!(ui.state.log, ["one"], "anchor {anchor:?}");
     }
+}
+
+// ---------------------------------------------------------------- styling knobs (menus, slider, hover, shadows)
+
+const PANEL: Color = Color::rgba(0.1, 0.2, 0.3, 1.0);
+
+fn styled_menu(st: MenuStyle) -> Ui<M> {
+    let mut ui = Ui::new(M::default(), move |_: &M| {
+        zstack(
+            menu(vec![
+                MenuItem::section("Add"),
+                MenuItem::action("One", |s: &mut M| s.log.push("one")).shortcut("⌘R").checked(true),
+                MenuItem::separator(),
+                MenuItem::section("More"),
+                MenuItem::action("Two", |s: &mut M| s.log.push("two")),
+            ])
+            .menu_style(MenuStyle { background: PANEL, border: None, shadow: None, ..st.clone() })
+            .place(Align::Start, Align::Start),
+        )
+        .fill()
+    });
+    ui.frame(W);
+    ui
+}
+
+fn panel_h(ui: &Ui<M>) -> f32 {
+    quads(ui, PANEL)[0][3]
+}
+
+#[test]
+fn menu_style_sets_separator_and_section_rows() {
+    let base = panel_h(&styled_menu(MenuStyle::default()));
+    // padding 5 ×2, sections 26 ×2, rows 28 ×2, separator 11
+    assert_eq!(base, 10.0 + 52.0 + 56.0 + 11.0);
+    let st = MenuStyle { separator_height: 9.0, section_height: Some(23.0), section_gap: 10.0, ..Default::default() };
+    // The gap goes above the second section only.
+    assert_eq!(panel_h(&styled_menu(st)), 10.0 + 46.0 + 10.0 + 56.0 + 9.0);
+}
+
+#[test]
+fn menu_style_sets_section_and_shortcut_text() {
+    let (sec, key) = (Color::hex(0x969696), Color::hex(0x7B7B7B));
+    let ui = styled_menu(MenuStyle::default());
+    let t = texts(&ui);
+    // section, check, label, shortcut, section, label
+    let (h_label, h_key, h_sec) = (t[2].size.1, t[3].size.1, t[0].size.1);
+    let st = MenuStyle { shortcut_size: Some(10.0), shortcut_color: Some(key), section_size: Some(13.0), section_weight: Weight::Regular, section_color: Some(sec), ..Default::default() };
+    let ui = styled_menu(st);
+    let t = texts(&ui);
+    assert_eq!(t[0].color, sec);
+    assert!(t[0].size.1 > h_sec, "section text at 13 pt is taller than at 11.5");
+    assert_eq!(t[3].color, key);
+    assert!(t[3].size.1 < h_key && h_key == h_label, "shortcut at 10 pt");
+}
+
+#[test]
+fn menu_style_sets_icon_gap_and_highlight_inset() {
+    let x = |ui: &Ui<M>| texts(ui)[2].pos.0;
+    let x0 = x(&styled_menu(MenuStyle::default()));
+    let mut ui = styled_menu(MenuStyle { icon_gap: 15.0, highlight_inset: 2.0, ..Default::default() });
+    assert_eq!(x(&ui) - x0, 7.0, "the label moves with the gap");
+    // Row One: under the 26 pt section, 5 pt padding: y 31..59.
+    ui.pointer_move((60.0, 45.0));
+    ui.frame(W);
+    // The separator has the same color; the highlight is the tall one.
+    let lit: Vec<_> = quads(&ui, Color::WHITE.alpha(0.09)).into_iter().filter(|r| r[3] > 2.0).collect();
+    assert_eq!(lit.len(), 1);
+    assert_eq!((lit[0][1], lit[0][3]), (33.0, 24.0), "28 pt row, 2 pt inset each side");
+}
+
+#[test]
+fn placement_margin_and_offset() {
+    let at = |p: Placement| {
+        let mut ui = Ui::new(M { pop: true, ..M::default() }, move |s: &M| {
+            zstack(
+                rect()
+                    .size(20.0, 20.0)
+                    .popover(s.pop, p, |s: &mut M| s.pop = false, rect().size(100.0, 50.0).background(PANEL))
+                    .place(Align::End, Align::Start),
+            )
+            .fill()
+        });
+        ui.frame(W);
+        settle(&mut ui);
+        let r = quads(&ui, PANEL)[0];
+        (r[0], r[1])
+    };
+    // Right edges aligned would cross the window edge: slid back in.
+    assert_eq!(at(Placement::bottom().end().gap(6.0)), (292.0, 26.0), "8 pt from the edge by default");
+    assert_eq!(at(Placement::bottom().end().margin(6.0)), (294.0, 26.0));
+    assert_eq!(at(Placement::bottom().end().margin(0.0).offset(-4.0, 2.0)), (296.0, 28.0));
+}
+
+fn tip_view_at(_: &M) -> View<M> {
+    zstack(rect().size(30.0, 30.0).tooltip("Back").tooltip_at(Placement::bottom().gap(2.0)).place(Align::Start, Align::Start)).fill()
+}
+
+#[test]
+fn tooltip_at_moves_the_tooltip() {
+    let mut ui = Ui::new(M::default(), tip_view_at);
+    ui.frame(W);
+    ui.pointer_move((15.0, 15.0));
+    ui.frame(W);
+    std::thread::sleep(std::time::Duration::from_millis(520));
+    ui.frame(W);
+    settle(&mut ui);
+    let t = texts(&ui);
+    let tip = t.last().expect("tooltip shown");
+    // The bubble starts 2 pt under the 30 pt anchor (6 by default).
+    assert_eq!(tip.pos.1, 37.0);
+}
+
+#[test]
+fn slider_style_sets_track_fill_and_knob() {
+    let (track, fill, knob) = (Color::hex(0x434242), Color::hex(0x4D81EF), Color::hex(0xEEEEEE));
+    let st = SliderStyle { track_height: 24.0, track, fill, knob, knob_size: 20.0, knob_shadow: None, track_border: Some((1.0, Color::hex(0x535252))), ..Default::default() };
+    let mut ui = Ui::new(0.5f32, move |v: &f32| zstack(slider(*v, |s: &mut f32, v| *s = v).slider_style(st).width(220.0).place(Align::Start, Align::Start)).fill());
+    ui.frame(W);
+    let t = quads(&ui, track);
+    assert_eq!(t.len(), 1);
+    assert_eq!(t[0], [0.0, 0.0, 220.0, 24.0], "the slider is as high as its tallest part");
+    let f = quads(&ui, fill);
+    assert_eq!(f[0][2], 200.0 * 0.5 + 10.0, "filled to the knob's center");
+    let k = quads(&ui, knob);
+    assert_eq!(k[0][2], 20.0);
+    // Value range: knob centers from 10 to 210.
+    ui.pointer_down((60.0, 12.0), false);
+    ui.pointer_up((60.0, 12.0));
+    assert_eq!(ui.state, 0.25);
+}
+
+#[test]
+fn hover_color_recolors_the_text() {
+    let gray = Color::hex(0x999999);
+    let mut ui = Ui::new(M::default(), move |_: &M| {
+        zstack(zstack(text("…")).size(40.0, 40.0).color(gray).hover_color(Color::WHITE).place(Align::Start, Align::Start)).fill()
+    });
+    ui.frame(W);
+    assert_eq!(texts(&ui)[0].color, gray);
+    ui.pointer_move((20.0, 20.0));
+    settle(&mut ui);
+    assert_eq!(texts(&ui)[0].color, Color::WHITE);
+    ui.pointer_move((200.0, 200.0));
+    settle(&mut ui);
+    assert_eq!(texts(&ui)[0].color, gray);
+}
+
+fn shadow_quads(ui: &Ui<impl Sized>) -> Vec<ruru::Quad> {
+    ui.list.cmds.iter().filter_map(|c| if let ruru::Cmd::Quad(q) = c { Some(*q) } else { None }).collect()
+}
+
+#[test]
+fn two_shadows_and_an_inset_rim() {
+    let key = Shadow::new(Color::BLACK.alpha(0.3), 6.0, 2.0);
+    let ambient = Shadow::new(Color::BLACK.alpha(0.2), 40.0, 16.0).offset(4.0, 16.0).spread(-4.0);
+    let rim = Shadow::new(Color::WHITE.alpha(0.12), 0.0, 0.0).spread(0.5).inset();
+    let mut ui = Ui::new(0, move |_: &i32| {
+        zstack(
+            zstack(rect().fill().background(Color::RED))
+                .size(100.0, 100.0)
+                .background(PANEL)
+                .radius(10.0)
+                .shadow_with(key)
+                .shadow_with(ambient)
+                .shadow_with(rim)
+                .place(Align::Center, Align::Center),
+        )
+        .fill()
+    });
+    ui.frame(W);
+    let q = shadow_quads(&ui);
+    let kinds: Vec<f32> = q.iter().map(|q| q.p0[3]).collect();
+    // key, ambient, panel, child, rim: the rim lies over the child.
+    assert_eq!(kinds, [1.0, 1.0, 0.0, 0.0, 1.0]);
+    assert_eq!(q[0].rect, [150.0, 152.0, 100.0, 100.0]);
+    assert_eq!(q[1].rect, [158.0, 170.0, 92.0, 92.0], "moved by (4, 16), shrunk by 4");
+    assert_eq!(q[1].p0[0], 6.0, "radius shrinks with the spread");
+    assert_eq!(q[4].rect, [150.0, 150.0, 100.0, 100.0]);
+    assert_eq!((q[4].border[0], q[4].c1[3]), (1.0, 0.5), "inset flag and spread");
+    // The old modifier is the first layer.
+    let ui = Ui::new(0, |_: &i32| zstack(rect().size(10.0, 10.0).background(PANEL).shadow(Color::BLACK, 8.0, 3.0)).fill());
+    let mut ui = ui;
+    ui.frame(W);
+    let q = shadow_quads(&ui);
+    assert_eq!(q.len(), 2);
+    assert_eq!((q[0].p0[3], q[0].c1), (1.0, [0.0, 3.0, 0.0, 0.0]));
 }

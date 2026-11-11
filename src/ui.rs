@@ -1,10 +1,10 @@
 //! Platform-independent core: owns the app state, rebuilds the view tree,
 //! lays it out, paints it into a `DrawList`, and routes pointer input.
 
-use crate::layout::{child_id, layout, LNode, Lx, FIELD_FONT, SLIDER_H, TABS_PAD};
+use crate::layout::{child_id, layout, LNode, Lx, FIELD_FONT, TABS_PAD};
 use crate::text::{TextSpec, TextSystem};
 use crate::types::{Color, Rect};
-use crate::view::{Axis, Cursor, Env, Fill, Glass, Image, Indicator, Kind, OverlayMode, Shadow, Truncate, View, ViewFn};
+use crate::view::{Axis, Cursor, Env, Fill, Glass, Image, Indicator, Kind, OverlayMode, Shadow, SliderStyle, Truncate, View, ViewFn};
 use std::any::Any;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -725,7 +725,7 @@ impl<S> Painter<'_, S> {
             px: self.px,
         };
         let r = Rect::new(x, y, w, h);
-        self.shadow(&xf, r, 18.0, Shadow { color: Color::BLACK.alpha(0.35), blur: 40.0, y: 12.0 }, true);
+        self.shadow(&xf, r, 18.0, Shadow::new(Color::BLACK.alpha(0.35), 40.0, 12.0), true);
         self.glass(&xf, r, 18.0, Glass::frosted(), None);
         for (i, (key, ts)) in rows.into_iter().enumerate() {
             let row = Rect::new(x + 6.0, y + 6.0 + ROW * i as f32, w - 12.0, ROW);
@@ -801,10 +801,19 @@ impl<S> Painter<'_, S> {
     }
 
     fn shadow(&mut self, xf: &Xf, r: Rect, radius: f32, sh: Shadow, knockout: bool) {
-        let mut q = self.quad(xf, Rect::new(r.x, r.y + sh.y, r.w, r.h), radius, KIND_SHADOW);
+        let (off, spread) = ([sh.x * xf.s, sh.y * xf.s], sh.spread * xf.s);
+        let mut q = if sh.inset {
+            // Drawn on the caster; the shader cuts out the moved, shrunk shape.
+            let mut q = self.quad(xf, r, radius, KIND_SHADOW);
+            q.border[0] = 1.0;
+            q
+        } else {
+            let at = Rect::new(r.x + sh.x, r.y + sh.y, r.w, r.h).inflate(sh.spread);
+            self.quad(xf, at, (radius + sh.spread).max(0.0), KIND_SHADOW)
+        };
         q.c0 = sh.color.arr();
-        // c1: offset back to the caster + knock-out flag (keeps translucent casters clean)
-        q.c1 = [0.0, sh.y * xf.s, if knockout { 1.0 } else { 0.0 }, 0.0];
+        // c1: offset back to the caster, knock-out flag (keeps translucent casters clean), spread
+        q.c1 = [off[0], off[1], if knockout && !sh.inset { 1.0 } else { 0.0 }, spread];
         q.p0[2] = sh.blur * xf.s * 0.5;
         self.list.cmds.push(Cmd::Quad(q));
     }
@@ -858,14 +867,14 @@ impl<S> Painter<'_, S> {
         }
 
         let sr = xf.rect_px(r);
-        let margin = st.shadow.map_or(0.0, |s| s.blur * 2.0 + s.y.abs());
+        let margin = st.shadow.iter().flatten().map(Shadow::reach).fold(0.0, f32::max);
         if !sr.inflate(margin * xf.s).intersects(&xf.clip) || xf.opacity <= 0.001 {
             return; // culled
         }
 
         self.smooth = st.smooth;
-        if let Some(sh) = st.shadow {
-            let translucent = st.glass.is_some() || !matches!(st.bg, Some(Fill::Solid(c)) if c.a >= 1.0);
+        let translucent = st.glass.is_some() || !matches!(st.bg, Some(Fill::Solid(c)) if c.a >= 1.0);
+        for sh in st.shadow.into_iter().flatten() {
             self.shadow(&xf, r, st.radius, sh, translucent);
         }
         // A container draws its border last, over its children, its hover and (for glass) its
@@ -875,6 +884,8 @@ impl<S> Painter<'_, S> {
             .border
             .filter(|_| st.clip || ln.clip || st.hover.is_some() || st.glass.is_some() || !ln.children.is_empty())
             .map(|b| (xf, b));
+        // Inner shadows lie over the children too, like the border.
+        let inset = st.inset.map(|sh| (xf, sh));
         if let Some(g) = st.glass {
             self.glass(&xf, r, st.radius, g, st.border.filter(|_| late_border.is_none()));
         }
@@ -892,13 +903,17 @@ impl<S> Painter<'_, S> {
             _ if v.on_tap.is_some() || tap_menu => Some(Cursor::Pointer),
             _ => None,
         });
-        if cursor.is_some() || st.hover.is_some() {
+        if cursor.is_some() || st.hover.is_some() || st.hover_fg.is_some() {
             self.zone(&xf, id, sr, cursor);
         }
-        if let Some(c) = st.hover {
-            let t = self.crisp(id, 9, if self.hovered.contains(&id) { 1.0 } else { 0.0 });
-            if t > 0.004 {
-                self.fill(&xf, r, st.radius, Fill::Solid(c.alpha(c.a * t.min(1.0))), None);
+        if st.hover.is_some() || st.hover_fg.is_some() {
+            let t = self.crisp(id, 9, if self.hovered.contains(&id) { 1.0 } else { 0.0 }).clamp(0.0, 1.0);
+            if let Some(c) = st.hover.filter(|_| t > 0.004) {
+                self.fill(&xf, r, st.radius, Fill::Solid(c.alpha(c.a * t)), None);
+            }
+            if let Some(c) = st.hover_fg {
+                // Text and template icons inside take the color with the highlight.
+                xf.fg = xf.fg.lerp(c, t);
             }
         }
         self.smooth = false;
@@ -1079,7 +1094,7 @@ impl<S> Painter<'_, S> {
                 let lh = (r.h - 2.0 * TABS_PAD) * (1.0 + 0.42 * p) * (1.0 - 0.18 * stretch / (tab_w * 0.6));
                 let lens = Rect::new(cx - lw * 0.5, r.y + (r.h - lh) * 0.5, lw, lh);
                 if p > 0.02 {
-                    let sh = Shadow { color: Color::BLACK.alpha(0.22 * p), blur: 18.0, y: 5.0 };
+                    let sh = Shadow::new(Color::BLACK.alpha(0.22 * p), 18.0, 5.0);
                     self.shadow(&Xf { px: 0.0, ..xf }, lens, lh * 0.5, sh, true);
                 }
                 let drop = Glass {
@@ -1269,34 +1284,44 @@ impl<S> Painter<'_, S> {
                 let knob = Rect::new(kx, r.y + 2.0, kw, r.h - 4.0);
                 // It slides and stretches on springs: drawn as is, not in pixel steps.
                 let kxf = Xf { px: 0.0, ..xf };
-                self.shadow(&kxf, knob, knob.h * 0.5, Shadow { color: Color::BLACK.alpha(0.25), blur: 8.0, y: 3.0 }, false);
+                self.shadow(&kxf, knob, knob.h * 0.5, Shadow::new(Color::BLACK.alpha(0.25), 8.0, 3.0), false);
                 self.fill(&kxf, knob, knob.h * 0.5, Fill::Solid(Color::WHITE), None);
                 self.hit(&xf, id, sr.inflate(6.0), Action::Toggle(on, f));
             }
             Kind::Menu { items, style } => self.paint_menu(items, style, ln, r, xf, id),
-            Kind::Slider(value, steps, f) => {
+            Kind::Slider(value, steps, f, style) => {
+                let st = style.map_or_else(SliderStyle::default, |b| *b);
                 let p = self.spring(id, 2, if self.pressed == Some(id) { 1.0 } else { 0.0 });
-                let knob_d = SLIDER_H;
+                let knob_d = st.knob_size;
                 let range = (r.w - knob_d).max(1.0);
                 let cy = r.y + r.h * 0.5;
                 let kx = r.x + range * value;
-                let track = Rect::new(r.x, cy - 3.0, r.w, 6.0);
-                self.fill(&xf, track, 3.0, Fill::Solid(Color::rgba(0.47, 0.47, 0.5, 0.36)), None);
-                let filled = Rect::new(r.x, cy - 3.0, kx - r.x + knob_d * 0.5, 6.0);
-                self.fill(&xf, filled, 3.0, Fill::Solid(Color::BLUE), None);
+                let (th, tr) = (st.track_height, st.track_height * 0.5);
+                let track = Rect::new(r.x, cy - tr, r.w, th);
+                self.fill(&xf, track, tr, Fill::Solid(st.track), st.track_border);
+                let filled = Rect::new(r.x, cy - tr, kx - r.x + knob_d * 0.5, th);
+                self.fill(&xf, filled, tr, Fill::Solid(st.fill), None);
+                let (ts, tk) = (st.tick_size, st.tick_size * 0.5);
                 for k in 0..steps {
                     let x = r.x + knob_d * 0.5 + range * k as f32 / (steps - 1) as f32;
                     let on = x <= kx + knob_d * 0.5;
-                    let c = if on { Color::WHITE.alpha(0.6) } else { xf.fg.alpha(0.35) };
-                    self.fill(&xf, Rect::new(x - 2.0, cy - 2.0, 4.0, 4.0), 2.0, Fill::Solid(c), None);
+                    let c = if on { st.tick_on } else { st.tick_off.unwrap_or(xf.fg.alpha(0.35)) };
+                    self.fill(&xf, Rect::new(x - tk, cy - tk, ts, ts), tk, Fill::Solid(c), None);
                 }
                 let d = knob_d * (1.0 + 0.12 * p);
                 let knob = Rect::new(kx + (knob_d - d) * 0.5, cy - d * 0.5, d, d);
-                self.shadow(&xf, knob, d * 0.5, Shadow { color: Color::BLACK.alpha(0.28), blur: 10.0, y: 3.0 }, false);
-                self.fill(&xf, knob, d * 0.5, Fill::Solid(Color::WHITE), None);
+                if let Some(sh) = st.knob_shadow {
+                    self.shadow(&xf, knob, d * 0.5, sh, false);
+                }
+                self.fill(&xf, knob, d * 0.5, Fill::Solid(st.knob), None);
                 let x0 = (r.x + knob_d * 0.5) * xf.s + xf.tx;
                 self.hit(&xf, id, sr.inflate(8.0), Action::Slider(x0, range * xf.s, steps, f));
             }
+        }
+        if let Some((ixf, sh)) = inset {
+            self.smooth = st.smooth;
+            self.shadow(&ixf, r, st.radius, sh, false);
+            self.smooth = false;
         }
         if let Some((bxf, b)) = late_border {
             self.smooth = st.smooth;

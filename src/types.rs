@@ -35,8 +35,9 @@ impl Rect {
     }
 }
 
-/// sRGB color with straight (non-premultiplied) alpha, components in 0..=1.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// sRGB color with straight (non-premultiplied) alpha, components in 0..=1. The default is
+/// transparent.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Color {
     pub r: f32,
     pub g: f32,

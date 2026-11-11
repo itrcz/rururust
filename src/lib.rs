@@ -48,8 +48,8 @@ pub use types::{Color, Rect};
 pub use ui::{after, copy_text, Cmd, DrawList, KeyInput, Quad, TextCmd, Ui, WheelPhase, WindowRequest};
 pub use view::{
     button, hstack, icon, image, list, modal, picker, rect, scroll, sheet, slider, snackbar, spacer, tab_bar, text,
-    text_field, toggle, vstack, zstack, Align, Children, Cursor, Dim, Fill, Glass, Image, Indicator, Shadow, Truncate,
-    View, Weight,
+    text_field, toggle, vstack, zstack, Align, Children, Cursor, Dim, Fill, Glass, Image, Indicator, Shadow, SliderStyle,
+    Truncate, View, Weight,
 };
 pub use view::{drawer, menu, rich_text, Env, Mods, SizeClass, Span, ViewFn};
 pub use ui::popup::{MenuItem, MenuStyle, Placement, Shortcut, ShortcutKey, Side};
@@ -63,8 +63,8 @@ pub mod prelude {
     pub use crate::{App, Titlebar};
     pub use crate::{
         after, button, copy_text, hstack, icon, image, list, modal, picker, rect, scroll, sheet, slider, snackbar, spacer,
-        tab_bar, text, text_field, toggle, vstack, zstack, Align, Color, Cursor, Fill, Glass, Image, Indicator, Truncate,
-        View, Weight,
+        tab_bar, text, text_field, toggle, vstack, zstack, Align, Color, Cursor, Fill, Glass, Image, Indicator, Shadow,
+        SliderStyle, Truncate, View, Weight,
     };
     #[cfg(feature = "markdown")]
     pub use crate::{markdown, markdown_styled, markdown_with, MarkdownStyle};

@@ -66,11 +66,93 @@ impl From<Color> for Fill {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+/// A soft shadow, as in CSS `box-shadow`: offset (`x`, `y`), `blur`, `spread` (grows the
+/// shape, or shrinks it when negative) and `color`, all in points. An `inset` one falls inside
+/// the view from its edge: with no blur and a `spread` of a hairline it is the light rim
+/// along the inner edge of a macOS menu.
+///
+/// ```ignore
+/// panel
+///     .shadow_with(Shadow::new(Color::BLACK.alpha(0.30), 6.0, 2.0))           // key: close and sharp
+///     .shadow_with(Shadow::new(Color::BLACK.alpha(0.25), 40.0, 16.0))         // ambient: wide and soft
+///     .shadow_with(Shadow::new(Color::WHITE.alpha(0.12), 0.0, 0.0).spread(0.5).inset()) // rim
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Shadow {
     pub color: Color,
     pub blur: f32,
+    pub x: f32,
     pub y: f32,
+    pub spread: f32,
+    pub inset: bool,
+}
+
+impl Shadow {
+    /// A drop shadow `y` points below the view (no sideways offset, no spread).
+    pub const fn new(color: Color, blur: f32, y: f32) -> Self {
+        Shadow { color, blur, x: 0.0, y, spread: 0.0, inset: false }
+    }
+    pub const fn offset(mut self, x: f32, y: f32) -> Self {
+        self.x = x;
+        self.y = y;
+        self
+    }
+    pub const fn spread(mut self, s: f32) -> Self {
+        self.spread = s;
+        self
+    }
+    /// Inside the view instead of under it: drawn over the background and the children.
+    pub const fn inset(mut self) -> Self {
+        self.inset = true;
+        self
+    }
+    /// How far it reaches outside the view's rect.
+    pub(crate) fn reach(&self) -> f32 {
+        if self.inset {
+            0.0
+        } else {
+            self.blur * 2.0 + self.x.abs().max(self.y.abs()) + self.spread.max(0.0)
+        }
+    }
+}
+
+/// Look of a [`slider`] (`.slider_style()`). The track and its filled part are capsules
+/// `track_height` high; the knob is a disc `knob_size` across, which is also the slider's
+/// height. Change the fields you need: `SliderStyle { fill: Color::GREEN, ..Default::default() }`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SliderStyle {
+    pub track_height: f32,
+    /// The empty part of the track.
+    pub track: Color,
+    /// Outline of the track (under the filled part).
+    pub track_border: Option<(f32, Color)>,
+    /// The part of the track left of the knob.
+    pub fill: Color,
+    pub knob: Color,
+    pub knob_size: f32,
+    pub knob_shadow: Option<Shadow>,
+    /// Stop marks (`.steps()`): diameter, color on the filled part, color on the empty part
+    /// (default: the text color at 35 %).
+    pub tick_size: f32,
+    pub tick_on: Color,
+    pub tick_off: Option<Color>,
+}
+
+impl Default for SliderStyle {
+    fn default() -> Self {
+        SliderStyle {
+            track_height: 6.0,
+            track: Color::rgba(0.47, 0.47, 0.5, 0.36),
+            track_border: None,
+            fill: Color::BLUE,
+            knob: Color::WHITE,
+            knob_size: 28.0,
+            knob_shadow: Some(Shadow::new(Color::BLACK.alpha(0.28), 10.0, 3.0)),
+            tick_size: 4.0,
+            tick_on: Color::WHITE.alpha(0.6),
+            tick_off: None,
+        }
+    }
 }
 
 /// Glass material: the content behind it is lightly frosted and refracted through a
@@ -189,7 +271,10 @@ pub(crate) struct Style {
     pub bg: Option<Fill>,
     pub radius: f32,
     pub border: Option<(f32, Color)>,
-    pub shadow: Option<Shadow>,
+    /// Drop shadows, key then ambient (`.shadow()`, `.shadow_with()`).
+    pub shadow: [Option<Shadow>; 2],
+    /// Inner shadow or rim (`.shadow_with(Shadow::..inset())`).
+    pub inset: Option<Shadow>,
     pub glass: Option<Glass>,
     pub opacity: f32,
     pub fg: Option<Color>,
@@ -208,6 +293,8 @@ pub(crate) struct Style {
     pub animate: bool,
     /// Highlight laid over the background while the pointer is over the view.
     pub hover: Option<Color>,
+    /// Text color while the pointer is over the view (`.hover_color()`).
+    pub hover_fg: Option<Color>,
     pub cursor: Option<Cursor>,
     /// Share of the free space along the parent stack's axis (`.flex()`); 0 = not set.
     pub flex: f32,
@@ -230,7 +317,8 @@ impl Default for Style {
             bg: None,
             radius: 0.0,
             border: None,
-            shadow: None,
+            shadow: [None; 2],
+            inset: None,
             glass: None,
             opacity: 1.0,
             fg: None,
@@ -243,6 +331,7 @@ impl Default for Style {
             smooth: false,
             animate: false,
             hover: None,
+            hover_fg: None,
             cursor: None,
             flex: 0.0,
             select: false,
@@ -522,8 +611,8 @@ pub(crate) enum Kind<S> {
     List { count: usize, row_h: f32, row: Box<dyn Fn(usize) -> View<S>> },
     Overlay { open: bool, mode: OverlayMode, child: Box<View<S>>, on_dismiss: Option<Box<dyn Fn(&mut S)>> },
     Toggle(bool, Box<dyn Fn(&mut S, bool)>),
-    /// Value, number of stops (0 = continuous), handler.
-    Slider(f32, u32, Box<dyn Fn(&mut S, f32)>),
+    /// Value, number of stops (0 = continuous), handler, look (default when `None`).
+    Slider(f32, u32, Box<dyn Fn(&mut S, f32)>, Option<Box<SliderStyle>>),
     Menu { items: Vec<MenuItem<S>>, style: Rc<MenuStyle> },
 }
 
@@ -547,6 +636,7 @@ pub(crate) struct Pop<S> {
 pub(crate) struct Extras<S> {
     pub pop: Option<Pop<S>>,
     pub tip: Option<Box<View<S>>>,
+    pub tip_at: Option<Placement>,
     pub shortcuts: Vec<(Shortcut, Box<dyn Fn(&mut S)>)>,
     pub secondary: Option<Box<dyn Fn(&mut S)>>,
 }
@@ -567,7 +657,7 @@ impl<S> View<S> {
     }
 
     fn extras(&mut self) -> &mut Extras<S> {
-        self.extra.get_or_insert_with(|| Box::new(Extras { pop: None, tip: None, shortcuts: Vec::new(), secondary: None }))
+        self.extra.get_or_insert_with(|| Box::new(Extras { pop: None, tip: None, tip_at: None, shortcuts: Vec::new(), secondary: None }))
     }
 
     // ---- layout ----
@@ -700,8 +790,29 @@ impl<S> View<S> {
         self.style.border = Some((width, color));
         self
     }
+    /// A soft drop shadow `y` points below the view. Replaces the first (key) shadow.
     pub fn shadow(mut self, color: Color, blur: f32, y: f32) -> Self {
-        self.style.shadow = Some(Shadow { color, blur, y });
+        self.style.shadow[0] = Some(Shadow::new(color, blur, y));
+        self
+    }
+    /// Adds a shadow layer: a view has up to two drop shadows, painted in the order given
+    /// (a third replaces the second), and one inset shadow. Each costs one quad.
+    ///
+    /// ```ignore
+    /// menu_panel
+    ///     .shadow_with(Shadow::new(Color::BLACK.alpha(0.3), 6.0, 2.0))
+    ///     .shadow_with(Shadow::new(Color::BLACK.alpha(0.25), 40.0, 16.0).spread(-4.0))
+    ///     .shadow_with(Shadow::new(Color::WHITE.alpha(0.12), 0.0, 0.0).spread(0.5).inset())
+    /// ```
+    pub fn shadow_with(mut self, sh: Shadow) -> Self {
+        let st = &mut self.style;
+        if sh.inset {
+            st.inset = Some(sh);
+        } else if st.shadow[0].is_none() {
+            st.shadow[0] = Some(sh);
+        } else {
+            st.shadow[1] = Some(sh);
+        }
         self
     }
     /// Frosted "liquid glass": blurs and refracts whatever is behind this view.
@@ -832,6 +943,17 @@ impl<S> View<S> {
         self.style.hover = Some(color);
         self
     }
+    /// Text color of this view and everything in it while the pointer is over it, faded
+    /// like [`hover`](View::hover): an icon button whose glyph lights up. Children that set
+    /// their own `.color()` keep it, so set the resting color on this view too.
+    ///
+    /// ```ignore
+    /// zstack(icon(&i.more)).size(28.0, 28.0).color(GRAY).hover(Color::hex(0x434343)).hover_color(Color::WHITE)
+    /// ```
+    pub fn hover_color(mut self, c: Color) -> Self {
+        self.style.hover_fg = Some(c);
+        self
+    }
     /// Pointer shape over this view. Tappable views show `Cursor::Pointer` and text fields
     /// `Cursor::Text` without being told; `.cursor(Cursor::Default)` turns that off.
     pub fn cursor(mut self, c: Cursor) -> Self {
@@ -897,11 +1019,25 @@ impl<S> View<S> {
     /// Slider only: snaps to `n` evenly spaced stops (both ends included) and marks them with
     /// dots: `slider(s.effort, |s, v| s.effort = v).steps(5)` gives 0, 0.25, … 1.
     pub fn steps(mut self, n: u32) -> Self {
-        if let Kind::Slider(v, steps, _) = &mut self.kind {
+        if let Kind::Slider(v, steps, ..) = &mut self.kind {
             *steps = if n >= 2 { n } else { 0 };
             if *steps > 0 {
                 *v = super::ui::popup::snap(*v, *steps);
             }
+        }
+        self
+    }
+    /// Slider only: its look (track, fill, knob, stop marks).
+    ///
+    /// ```ignore
+    /// slider(s.effort, |s, v| s.effort = v).steps(5).slider_style(SliderStyle {
+    ///     track_height: 24.0, fill: Color::hex(0x4D81EF), track: Color::hex(0x434242),
+    ///     track_border: Some((1.0, Color::hex(0x535252))), ..Default::default()
+    /// })
+    /// ```
+    pub fn slider_style(mut self, style: SliderStyle) -> Self {
+        if let Kind::Slider(.., st) = &mut self.kind {
+            *st = Some(Box::new(style));
         }
         self
     }
@@ -974,6 +1110,17 @@ impl<S> View<S> {
     /// A tooltip made of any view (style it yourself: background, padding, radius).
     pub fn tooltip_with(mut self, content: View<S>) -> Self {
         self.extras().tip = Some(Box::new(content));
+        self
+    }
+    /// Where this view's tooltip shows (default: below, centered, 6 pt away). Like a popover
+    /// it flips and slides to stay in the window.
+    ///
+    /// ```ignore
+    /// icon_button.tooltip("Back").tooltip_at(Placement::bottom().gap(2.0))
+    /// rail_item.tooltip("Search").tooltip_at(Placement::right().gap(8.0))
+    /// ```
+    pub fn tooltip_at(mut self, placement: Placement) -> Self {
+        self.extras().tip_at = Some(placement);
         self
     }
     /// Runs `f` when the key combination is pressed while this view is on screen, wherever the
@@ -1195,7 +1342,7 @@ pub fn toggle<S>(on: bool, on_change: impl Fn(&mut S, bool) + 'static) -> View<S
 }
 /// Slider with `value` in 0..=1. Fills the available width. [`steps`](View::steps) makes it snap.
 pub fn slider<S>(value: f32, on_change: impl Fn(&mut S, f32) + 'static) -> View<S> {
-    View::new(Kind::Slider(value.clamp(0.0, 1.0), 0, Box::new(on_change))).fill_width()
+    View::new(Kind::Slider(value.clamp(0.0, 1.0), 0, Box::new(on_change), None)).fill_width()
 }
 /// A menu panel: rows with icons, shortcuts, hints, separators, section titles and submenus,
 /// highlighted under the mouse and driven by ↑↓ ←→ Enter Esc. Open it with

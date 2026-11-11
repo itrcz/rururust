@@ -249,10 +249,24 @@ fn fs(in: VOut) -> @location(0) vec4f {
     if kind == 1.0 {
         // Soft shadow: gaussian falloff of the shape's distance field.
         let sigma = max(in.p0.z, 0.5);
+        // c1.w: the spread (px at scale 1); the caster is this shape less the spread.
+        let spread = in.c1.w * g.scale;
+        let off = in.c1.xy * g.scale;
+        if in.border.x > 0.5 {
+            // Inset: inside the caster, outside its copy moved by the offset and shrunk by
+            // the spread. Without blur the edge is a crisp line (a rim), not a half-pixel smear.
+            let hole = sd_shape(p - off, half - spread, max(radius - spread, 0.0), cont);
+            var lit = clamp(0.5 + hole, 0.0, 1.0);
+            if in.p0.z > 0.0 {
+                lit = 0.5 + 0.5 * erf(hole / (sigma * 1.41421));
+            }
+            let a = clamp(0.5 - d, 0.0, 1.0) * lit;
+            return premul(vec4f(in.c0.rgb, in.c0.a * a)) * alpha;
+        }
         var a = 0.5 - 0.5 * erf(d / (sigma * 1.41421));
         if in.c1.z > 0.5 {
             // Don't darken underneath a translucent caster.
-            a *= clamp(0.5 + sd_shape(p + in.c1.xy * g.scale, half, radius, cont), 0.0, 1.0);
+            a *= clamp(0.5 + sd_shape(p + off, half - spread, max(radius - spread, 0.0), cont), 0.0, 1.0);
         }
         return premul(vec4f(in.c0.rgb, in.c0.a * a)) * alpha;
     }

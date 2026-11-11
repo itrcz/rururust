@@ -197,7 +197,7 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
             ((widest + 40.0) * labels.len() as f32 + 2.0 * TABS_PAD, 56.0)
         }
         Kind::Toggle(..) => TOGGLE,
-        Kind::Slider(..) => (inner.0.unwrap_or(200.0), SLIDER_H),
+        Kind::Slider(.., st) => (inner.0.unwrap_or(200.0), st.as_ref().map_or(SLIDER_H, |s| s.knob_size.max(s.track_height))),
         Kind::Menu { items, style } => crate::ui::popup::layout_menu(items, style, lx, id, &mut node),
         Kind::List { count, row_h, row } => {
             // Rows are built during paint (only the visible ones); here we just need the

@@ -9,7 +9,7 @@ use super::{Action, Hit, Painter, Spring, Ui, Xf, Zone, NO_ROUND};
 use crate::layout::{child_id, LNode, Lx};
 use crate::text::TextSpec;
 use crate::types::{Color, Rect};
-use crate::view::{Align, Fill, Glass, Image, Kind, Mods, Shadow, View};
+use crate::view::{Align, Fill, Glass, Image, Kind, Mods, Shadow, View, Weight};
 use crate::KeyInput;
 use std::rc::Rc;
 
@@ -19,8 +19,6 @@ pub(crate) const SLOT_FADE: u8 = 7;
 pub(crate) const TIP_DELAY: f32 = 0.5;
 /// Quick and without overshoot: a layer is fully in after ~120 ms.
 const FADE: (f32, f32) = (1600.0, 80.0);
-/// Distance kept from the window edges.
-const MARGIN: f32 = 8.0;
 
 /// Id of the popover attached to the view `id`, and of its tooltip.
 pub(crate) fn pop_id(id: u64) -> u64 {
@@ -59,22 +57,28 @@ pub enum Side {
 
 /// Where a popover sits relative to its anchor: a side, the alignment along that side
 /// (`Start` = left / top edges line up) and the gap. It flips to the opposite side when it
-/// does not fit and slides along the side to stay inside the window.
+/// does not fit and slides along the side to stay `margin` points inside the window.
 ///
 /// ```ignore
-/// Placement::top().start()      // above, left edges aligned
-/// Placement::right().gap(4.0)   // to the right, centered vertically
+/// Placement::top().start()                      // above, left edges aligned
+/// Placement::right().gap(4.0)                   // to the right, centered vertically
+/// Placement::bottom().end().margin(6.5)         // may come within 6.5 pt of the window edge
+/// Placement::right().end().offset(0.0, 1.5)     // then nudged 1.5 pt down
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Placement {
     pub side: Side,
     pub align: Align,
     pub gap: f32,
+    /// Distance kept from the window edges (default 8).
+    pub margin: f32,
+    /// Shift (x, y) after placing, before keeping inside the window.
+    pub offset: (f32, f32),
 }
 
 impl Placement {
     fn on(side: Side) -> Self {
-        Placement { side, align: Align::Center, gap: 6.0 }
+        Placement { side, align: Align::Center, gap: 6.0, margin: 8.0, offset: (0.0, 0.0) }
     }
     pub fn top() -> Self {
         Self::on(Side::Top)
@@ -104,6 +108,14 @@ impl Placement {
         self.gap = g;
         self
     }
+    pub fn margin(mut self, m: f32) -> Self {
+        self.margin = m;
+        self
+    }
+    pub fn offset(mut self, dx: f32, dy: f32) -> Self {
+        self.offset = (dx, dy);
+        self
+    }
 }
 
 /// Top-left corner of a `size` box placed at `a` inside `screen`, and the point on the anchor
@@ -111,11 +123,13 @@ impl Placement {
 pub(crate) fn place(a: Rect, size: (f32, f32), p: Placement, screen: Rect) -> ((f32, f32), (f32, f32)) {
     let (w, h) = size;
     let vertical = matches!(p.side, Side::Top | Side::Bottom);
+    let m = p.margin;
+    let (dmain, dcross) = if vertical { (p.offset.1, p.offset.0) } else { p.offset };
     // Main axis: the preferred side, or the other one if only that one has room.
     let (lo, hi, len, a0, a1) = if vertical {
-        (screen.y + MARGIN, screen.y + screen.h - MARGIN, h, a.y, a.y + a.h)
+        (screen.y + m, screen.y + screen.h - m, h, a.y, a.y + a.h)
     } else {
-        (screen.x + MARGIN, screen.x + screen.w - MARGIN, w, a.x, a.x + a.w)
+        (screen.x + m, screen.x + screen.w - m, w, a.x, a.x + a.w)
     };
     let before = a0 - p.gap - len; // above / to the left
     let after = a1 + p.gap; // below / to the right
@@ -123,19 +137,20 @@ pub(crate) fn place(a: Rect, size: (f32, f32), p: Placement, screen: Rect) -> ((
     let fits_after = after + len <= hi;
     let want_before = matches!(p.side, Side::Top | Side::Left);
     let use_before = if want_before { fits_before || (!fits_after && a0 - lo > hi - a1) } else { !fits_after && (fits_before || a0 - lo > hi - a1) };
-    let main = if use_before { before } else { after };
+    let main = (if use_before { before } else { after }) + dmain;
     let main = main.min(hi - len).max(lo);
     // Cross axis: aligned with the anchor, then slid back inside the window.
     let (clo, chi, clen, c0, c1) = if vertical {
-        (screen.x + MARGIN, screen.x + screen.w - MARGIN, w, a.x, a.x + a.w)
+        (screen.x + m, screen.x + screen.w - m, w, a.x, a.x + a.w)
     } else {
-        (screen.y + MARGIN, screen.y + screen.h - MARGIN, h, a.y, a.y + a.h)
+        (screen.y + m, screen.y + screen.h - m, h, a.y, a.y + a.h)
     };
-    let cross = match p.align {
-        Align::Start => c0,
-        Align::Center => (c0 + c1 - clen) * 0.5,
-        Align::End => c1 - clen,
-    };
+    let cross = dcross
+        + match p.align {
+            Align::Start => c0,
+            Align::Center => (c0 + c1 - clen) * 0.5,
+            Align::End => c1 - clen,
+        };
     let cross = cross.min(chi - clen).max(clo);
     let edge = if use_before { a0 } else { a1 };
     let mid = ((c0 + c1) * 0.5).clamp(cross, cross + clen);
@@ -314,16 +329,26 @@ pub struct MenuStyle {
     pub glass: Option<Glass>,
     pub radius: f32,
     pub border: Option<(f32, Color)>,
+    /// Key shadow: close and fairly sharp.
     pub shadow: Option<Shadow>,
+    /// A second, wide and soft shadow under the first, as macOS menus have.
+    pub ambient: Option<Shadow>,
+    /// Inner light rim along the edge: `Shadow::new(Color::WHITE.alpha(0.1), 0.0, 0.0).spread(0.5).inset()`.
+    pub rim: Option<Shadow>,
     /// Space between the panel edge and the rows.
     pub padding: f32,
     pub font_size: f32,
     pub row_height: f32,
     /// Corner radius of the highlight.
     pub row_radius: f32,
+    /// The highlight is this much shorter than the row at the top and at the bottom: a 24 pt
+    /// capsule on a 28 pt row step is `row_height: 28.0, highlight_inset: 2.0, row_radius: 12.0`.
+    pub highlight_inset: f32,
     /// Left and right padding inside a row.
     pub row_padding: f32,
     pub icon_size: f32,
+    /// Between the icon (or check mark) column and the label.
+    pub icon_gap: f32,
     pub text: Color,
     /// Shortcuts, hints, section titles, chevrons.
     pub dim: Color,
@@ -333,6 +358,19 @@ pub struct MenuStyle {
     /// Text on the highlighted row (default: unchanged).
     pub highlight_text: Option<Color>,
     pub separator: Color,
+    /// Height of a separator row; the line is centered in it.
+    pub separator_height: f32,
+    /// Size of the shortcut text (default: `font_size`).
+    pub shortcut_size: Option<f32>,
+    /// Color of the shortcut text (default: `dim`).
+    pub shortcut_color: Option<Color>,
+    /// Section titles: size (default `font_size - 1.5`), weight, color (default `dim`),
+    /// row height (default `row_height - 2`) and extra space above every section but the first row.
+    pub section_size: Option<f32>,
+    pub section_weight: Weight,
+    pub section_color: Option<Color>,
+    pub section_height: Option<f32>,
+    pub section_gap: f32,
     pub min_width: f32,
     pub max_width: f32,
 }
@@ -344,32 +382,49 @@ impl Default for MenuStyle {
             glass: None,
             radius: 12.0,
             border: Some((0.5, Color::WHITE.alpha(0.12))),
-            shadow: Some(Shadow { color: Color::BLACK.alpha(0.4), blur: 28.0, y: 8.0 }),
+            shadow: Some(Shadow::new(Color::BLACK.alpha(0.4), 28.0, 8.0)),
+            ambient: None,
+            rim: None,
             padding: 5.0,
             font_size: 13.0,
             row_height: 28.0,
             row_radius: 7.0,
+            highlight_inset: 0.0,
             row_padding: 10.0,
             icon_size: 16.0,
+            icon_gap: 8.0,
             text: Color::WHITE.alpha(0.92),
             dim: Color::WHITE.alpha(0.42),
             disabled: Color::WHITE.alpha(0.28),
             highlight: Color::WHITE.alpha(0.09),
             highlight_text: None,
             separator: Color::WHITE.alpha(0.09),
+            separator_height: 11.0,
+            shortcut_size: None,
+            shortcut_color: None,
+            section_size: None,
+            section_weight: Weight::Semibold,
+            section_color: None,
+            section_height: None,
+            section_gap: 0.0,
             min_width: 180.0,
             max_width: 420.0,
         }
     }
 }
 
-const SEPARATOR_H: f32 = 11.0;
-
-fn row_h<S>(it: &MenuItem<S>, st: &MenuStyle) -> f32 {
+/// Height of row `i`; a section's includes the gap above it.
+fn row_h<S>(it: &MenuItem<S>, i: usize, st: &MenuStyle) -> f32 {
     match it.kind {
-        ItemKind::Separator => SEPARATOR_H,
-        ItemKind::Section => st.row_height - 2.0,
+        ItemKind::Separator => st.separator_height,
+        ItemKind::Section => st.section_height.unwrap_or(st.row_height - 2.0) + if i > 0 { st.section_gap } else { 0.0 },
         _ => st.row_height,
+    }
+}
+
+impl MenuStyle {
+    fn section_size(&self) -> f32 {
+        self.section_size.unwrap_or(self.font_size - 1.5)
     }
 }
 
@@ -380,7 +435,7 @@ fn spec(text: &str, size: f32, weight: u16) -> TextSpec<'_> {
 /// Width of the icon column (0 when no row has an icon or check).
 fn icon_col<S>(items: &[MenuItem<S>], st: &MenuStyle) -> f32 {
     if items.iter().any(|i| i.icon.is_some() || i.checked) {
-        st.icon_size + 8.0
+        st.icon_size + st.icon_gap
     } else {
         0.0
     }
@@ -394,16 +449,16 @@ pub(crate) fn layout_menu<S>(items: &[MenuItem<S>], st: &MenuStyle, lx: &mut Lx,
     let mut h = 2.0 * st.padding;
     let none = (0u64, (0.0f32, 0.0f32));
     for (i, it) in items.iter().enumerate() {
-        h += row_h(it, st);
+        h += row_h(it, i, st);
         let (label, hint, right) = match &it.kind {
             ItemKind::Separator => (none, none, none),
-            ItemKind::Section => (lx.text.measure(&spec(&it.label, st.font_size - 1.5, 600), None), none, none),
+            ItemKind::Section => (lx.text.measure(&spec(&it.label, st.section_size(), st.section_weight as u16), None), none, none),
             kind => {
                 let label = lx.text.measure(&spec(&it.label, st.font_size, 400), None);
                 let hint = it.hint.as_deref().map_or(none, |t| lx.text.measure(&spec(t, st.font_size, 400), None));
                 let right = match (kind, &it.shortcut) {
                     (ItemKind::Submenu(_), _) => lx.text.measure(&spec("›", st.font_size + 4.0, 400), None),
-                    (_, Some(k)) => lx.text.measure(&spec(k, st.font_size, 400), None),
+                    (_, Some(k)) => lx.text.measure(&spec(k, st.shortcut_size.unwrap_or(st.font_size), 400), None),
                     _ => none,
                 };
                 (label, hint, right)
@@ -614,6 +669,7 @@ impl<S> Painter<'_, S> {
             }
         }
         if let Some(tip) = x.tip {
+            let placement = x.tip_at.unwrap_or(Placement::bottom().gap(6.0));
             self.zones.push(Zone { id, rect: sr.intersect(&xf.clip), round: (xf.clip, xf.clip_r), cursor: None, blocks: false, tip: true });
             if let Some(node) = &ln.tip {
                 self.layers.push(Layer {
@@ -621,7 +677,7 @@ impl<S> Painter<'_, S> {
                     view: *tip,
                     node: (**node).clone(),
                     anchor: sr,
-                    placement: Placement::bottom().gap(6.0),
+                    placement,
                     open: self.tip == Some(id),
                     kind: LayerKind::Tooltip,
                     fg: xf.fg,
@@ -633,7 +689,7 @@ impl<S> Painter<'_, S> {
     pub(super) fn paint_menu(&mut self, items: Vec<MenuItem<S>>, style: Rc<MenuStyle>, ln: &LNode, r: Rect, xf: Xf, id: u64) {
         let st = &*style;
         let sr = xf.rect(r);
-        if let Some(sh) = st.shadow {
+        for sh in [st.shadow, st.ambient].into_iter().flatten() {
             self.shadow(&xf, r, st.radius, sh, true);
         }
         match st.glass {
@@ -660,7 +716,7 @@ impl<S> Painter<'_, S> {
         let mut y = r.y + st.padding;
         let mut subk = 0;
         for (i, it) in items.into_iter().enumerate() {
-            let h = row_h(&it, st);
+            let h = row_h(&it, i, st);
             let row = Rect::new(r.x + st.padding, y, r.w - 2.0 * st.padding, h);
             let rid = row_id(id, i);
             let (label, hint, right) = (ln.texts[3 * i], ln.texts[3 * i + 1], ln.texts[3 * i + 2]);
@@ -674,14 +730,18 @@ impl<S> Painter<'_, S> {
                     nav.push((rid, Nav::Skip));
                 }
                 ItemKind::Section => {
-                    self.label(&cxf, label.0, (lx, mid(label.1) + 1.0), label.1, st.dim);
+                    // Centered in the part under the gap.
+                    let top = h - st.section_height.unwrap_or(st.row_height - 2.0);
+                    let y = row.y + top + (h - top - label.1 .1) * 0.5 + 1.0;
+                    self.label(&cxf, label.0, (lx, y), label.1, st.section_color.unwrap_or(st.dim));
                     nav.push((rid, Nav::Skip));
                 }
                 kind => {
                     let enabled = !it.disabled;
                     let lit = enabled && hl == Some(i);
                     if lit {
-                        self.fill(&cxf, row, st.row_radius, Fill::Solid(st.highlight), None);
+                        let band = Rect::new(row.x, row.y + st.highlight_inset, row.w, h - 2.0 * st.highlight_inset);
+                        self.fill(&cxf, band, st.row_radius, Fill::Solid(st.highlight), None);
                     }
                     let color = match (enabled, lit) {
                         (false, _) => st.disabled,
@@ -703,8 +763,13 @@ impl<S> Painter<'_, S> {
                     }
                     if right.0 != 0 {
                         let rx = row.x + row.w - st.row_padding - right.1 .0;
-                        let ry = mid(right.1) - if matches!(kind, ItemKind::Submenu(_)) { 1.0 } else { 0.0 };
-                        self.label(&cxf, right.0, (rx, ry), right.1, dim);
+                        let sub = matches!(kind, ItemKind::Submenu(_));
+                        let ry = mid(right.1) - if sub { 1.0 } else { 0.0 };
+                        let c = match st.shortcut_color {
+                            Some(c) if enabled && !sub => c,
+                            _ => dim,
+                        };
+                        self.label(&cxf, right.0, (rx, ry), right.1, c);
                     }
                     let srow = xf.rect(row);
                     self.zones.push(Zone { id: rid, rect: srow, round: NO_ROUND, cursor: None, blocks: false, tip: false });
@@ -745,6 +810,9 @@ impl<S> Painter<'_, S> {
                     }
                 }
             }
+        }
+        if let Some(rim) = st.rim {
+            self.shadow(&xf, r, st.radius, rim, false);
         }
         self.menu_nav.push(MenuNav { id, parent: self.layer.parent_menu, rows: nav, keys: self.layer.inside });
     }
