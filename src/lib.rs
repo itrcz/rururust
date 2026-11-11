@@ -25,6 +25,8 @@
 
 #[cfg(feature = "app")]
 mod app;
+#[cfg(all(feature = "app", target_os = "macos"))]
+mod macos;
 #[cfg(all(feature = "headless", not(target_arch = "wasm32")))]
 pub mod headless;
 mod layout;
@@ -38,7 +40,7 @@ mod ui;
 mod view;
 
 #[cfg(feature = "app")]
-pub use app::{App, Titlebar};
+pub use app::{App, Backdrop, Titlebar};
 #[cfg(feature = "renderer")]
 pub use render::{RenderStats, Renderer};
 pub use task::{link, set_spawner, set_waker, spawn, Link, Task};
@@ -62,7 +64,7 @@ pub use markdown::{markdown, markdown_styled, markdown_styled_with, markdown_wit
 
 pub mod prelude {
     #[cfg(feature = "app")]
-    pub use crate::{App, Titlebar};
+    pub use crate::{App, Backdrop, Titlebar};
     pub use crate::{
         after, button, copy_text, hstack, icon, image, list, modal, picker, rect, scroll, sheet, slider, snackbar, spacer,
         split, tab_bar, text, text_field, toggle, vstack, zstack, Align, Color, Cursor, Fill, Glass, Image, Indicator, Shadow,

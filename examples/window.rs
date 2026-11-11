@@ -1,7 +1,8 @@
-//! A desktop window like native macOS apps have: translucent, the desktop blurred behind the
-//! sidebar, content under the title bar, the traffic lights where they always are.
+//! A desktop window like native macOS apps have: the desktop blurred behind the sidebar through a
+//! system material, content under a tall title bar with the traffic lights centred in it, an
+//! opaque panel on the right.
 //!
-//! cargo run --release --example window
+//! cargo run --release --example window [-- --backdrop sidebar|under|window|content|titlebar|header|menu|popover|sheet|hud|fullscreen|blur]
 
 use ruru::prelude::*;
 
@@ -11,6 +12,7 @@ struct S {
 }
 
 const ITEMS: [&str; 5] = ["Inbox", "Today", "Projects", "Archive", "Settings"];
+const TITLEBAR: f32 = 44.0;
 
 fn sidebar(s: &S, env: &Env) -> View<S> {
     let rows = ITEMS.iter().enumerate().map(|(i, name)| {
@@ -52,13 +54,32 @@ fn content(s: &S, env: &Env) -> View<S> {
     vstack((title, panel)).padding_ltrb(0.0, 0.0, 8.0, 8.0).fill()
 }
 
+fn backdrop() -> Backdrop {
+    let args: Vec<String> = std::env::args().collect();
+    let name = args.iter().position(|a| a == "--backdrop").and_then(|i| args.get(i + 1));
+    match name.map(String::as_str) {
+        Some("under") => Backdrop::UnderWindow,
+        Some("window") => Backdrop::Window,
+        Some("content") => Backdrop::Content,
+        Some("titlebar") => Backdrop::Titlebar,
+        Some("header") => Backdrop::HeaderView,
+        Some("menu") => Backdrop::Menu,
+        Some("popover") => Backdrop::Popover,
+        Some("sheet") => Backdrop::Sheet,
+        Some("hud") => Backdrop::Hud,
+        Some("fullscreen") => Backdrop::FullScreenUi,
+        Some("blur") => Backdrop::Blur(20.0),
+        _ => Backdrop::default(),
+    }
+}
+
 fn main() {
     App::new(S { selected: 0, count: 0 }, |s: &S, env: &Env| hstack((sidebar(s, env), content(s, env))).fill())
         .title("ruru window")
         .size(900.0, 560.0)
         // Dark tint over the blurred desktop; the panel on the right is opaque.
         .background(Color::hex(0x1E1E20).alpha(0.55))
-        .blur(true)
-        .titlebar(Titlebar::Overlay)
+        .backdrop(backdrop())
+        .titlebar_height(TITLEBAR)
         .run();
 }
