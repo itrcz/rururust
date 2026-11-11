@@ -352,7 +352,7 @@ fn main() {
         if let Some(i) = args.iter().position(|a| a == "--screenshot") {
             let scene = args.get(i + 2).cloned().unwrap_or_else(|| "menu".into());
             let mut ui = ruru::Ui::new(state, view);
-            ui.background = BG;
+            ui.background = Some(BG);
             // Input sent before frame `n`, as a user would: the scene's anchors are at fixed places
             // in the 900×600 window.
             let input = move |ui: &mut ruru::Ui<Demo>, n: u32| {

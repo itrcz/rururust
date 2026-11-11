@@ -32,6 +32,7 @@ mod layout;
 mod render;
 mod task;
 mod text;
+mod theme;
 mod types;
 mod ui;
 mod view;
@@ -44,6 +45,7 @@ pub use task::{link, set_spawner, set_waker, spawn, Link, Task};
 #[cfg(any(not(target_arch = "wasm32"), feature = "app"))]
 pub use task::sleep;
 pub use text::TextSystem;
+pub use theme::{Controls, Motion, Palette, Radii, Shadows, TextStyle, Theme, TypeScale};
 pub use types::{Color, Rect};
 pub use ui::{after, copy_text, Cmd, DrawList, KeyInput, Quad, TextCmd, Ui, WheelPhase, WindowRequest};
 pub use view::{
@@ -68,7 +70,7 @@ pub mod prelude {
     };
     #[cfg(feature = "markdown")]
     pub use crate::{markdown, markdown_styled, markdown_with, MarkdownStyle};
-    pub use crate::{drawer, rich_text, Env, SizeClass, Span};
+    pub use crate::{drawer, rich_text, Env, SizeClass, Span, TextStyle, Theme};
     pub use crate::{menu, MenuItem, MenuStyle, Placement, Shortcut};
     pub use crate::{link, spawn, Link, Task};
     #[cfg(any(not(target_arch = "wasm32"), feature = "app"))]

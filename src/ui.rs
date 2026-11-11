@@ -1,10 +1,11 @@
 //! Platform-independent core: owns the app state, rebuilds the view tree,
 //! lays it out, paints it into a `DrawList`, and routes pointer input.
 
-use crate::layout::{child_id, layout, LNode, Lx, FIELD_FONT, TABS_PAD};
+use crate::layout::{child_id, layout, spec_in, LNode, Lx};
+use crate::theme::{Look, Theme};
 use crate::text::{TextSpec, TextSystem};
 use crate::types::{Color, Rect};
-use crate::view::{Axis, Cursor, Env, Fill, Glass, Image, Indicator, Kind, OverlayMode, Shadow, SliderStyle, Truncate, View, ViewFn};
+use crate::view::{Axis, Cursor, Env, Fill, Glass, Image, Indicator, Kind, OverlayMode, Shadow, Truncate, View, ViewFn};
 use std::any::Any;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -19,7 +20,7 @@ pub(crate) mod select;
 #[path = "popup.rs"]
 pub(crate) mod popup;
 
-use popup::{Dismiss, Layer, LayerCtx, MenuNav, MenuState, Shortcut, TIP_DELAY};
+use popup::{Dismiss, Layer, LayerCtx, MenuNav, MenuState, Shortcut};
 
 // ---------------------------------------------------------------- draw list
 
@@ -89,11 +90,7 @@ pub(crate) struct Spring {
 }
 
 impl Spring {
-    /// Default: lively, with a hint of bounce (toggles, the tab drop, menus).
-    const BOUNCY: (f32, f32) = (380.0, 28.0);
-    /// Quick and critically damped, no overshoot (press feedback, fades).
-    const CRISP: (f32, f32) = (900.0, 60.0);
-    /// Critically damped and unhurried (~0.35 s): panels and sizes that change.
+    /// Parameters of a spring that only keeps a value (the theme's `motion` drives the rest).
     pub(crate) const SMOOTH: (f32, f32) = (260.0, 32.25);
 
     pub(crate) fn new(x: f32, target: f32, (k, c): (f32, f32)) -> Self {
@@ -285,10 +282,8 @@ enum Action<S> {
     ScrollBar { scroll: u64, y0: f32, track: f32, len: f32, lo: f32, hi: f32, page: f32 },
 }
 
-/// Scroll bar: hover strip along the right edge, thumb width thin / hovered, its inset.
+/// Scroll bar: hover strip along the right edge (thumb widths are in the theme).
 const BAR_STRIP: f32 = 14.0;
-const BAR_THIN: f32 = 5.0;
-const BAR_WIDE: f32 = 9.0;
 const BAR_SALT: u64 = 0x5C_B0A2;
 
 /// Something the UI asks of the window it lives in. The core knows nothing about windows:
@@ -536,6 +531,7 @@ impl Xf {
 
 struct Painter<'a, S> {
     list: &'a mut DrawList,
+    look: &'a Look,
     hits: &'a mut Vec<Hit<S>>,
     zones: &'a mut Vec<Zone>,
     /// Views under the pointer (from the last frame's zones).
@@ -665,7 +661,7 @@ impl<S> Painter<'_, S> {
 
     /// Spring that starts from `initial` the first time it is seen (appear animations).
     fn spring_from(&mut self, id: u64, slot: u8, initial: f32, target: f32) -> f32 {
-        let s = self.springs.entry((id, slot)).or_insert(Spring::new(initial, target, Spring::BOUNCY));
+        let s = self.springs.entry((id, slot)).or_insert(Spring::new(initial, target, self.look.theme.motion.bouncy));
         s.target = target;
         s.used = self.frame;
         s.x
@@ -691,24 +687,25 @@ impl<S> Painter<'_, S> {
     }
 
     fn paint_picker_menu(&mut self, m: Menu<S>, size: (f32, f32)) {
-        const ROW: f32 = 44.0;
+        let theme = self.look.theme.clone();
+        let row_h = theme.control.picker_row;
         let screen = Rect::new(0.0, 0.0, size.0, size.1);
         // Anything outside the menu closes it.
         self.hits.push(Hit { id: m.id ^ 0xD15, rect: screen, round: NO_ROUND, action: Action::Dismiss });
         self.zones.push(Zone { id: m.id ^ 0xD15, rect: screen, round: NO_ROUND, cursor: None, blocks: true, tip: false });
-        let spec = |text| TextSpec { spans: &[], text, size: FIELD_FONT, weight: 400, center: false, ..Default::default() };
+        let spec = |text| spec_in(&theme.text.body, text);
         let rows: Vec<(u64, (f32, f32))> = m.options.iter().map(|o| self.text.measure(&spec(o), None)).collect();
         let (check, check_size) = self.text.measure(&TextSpec { weight: 600, ..spec("✓") }, None);
         let widest = rows.iter().map(|r| r.1 .0).fold(0.0, f32::max);
         let w = (widest + 46.0 + check_size.0).max(m.anchor.w).min(size.0 - 16.0);
-        let h = ROW * rows.len() as f32 + 12.0;
+        let h = row_h * rows.len() as f32 + 12.0;
         let x = m.anchor.x.min(size.0 - w - 8.0).max(8.0);
         let below = m.anchor.y + m.anchor.h + 6.0;
         let (y, down) = if below + h <= size.1 - 8.0 { (below, true) } else { ((m.anchor.y - h - 6.0).max(8.0), false) };
 
         // The menu grows out of the control it belongs to.
         let frame = self.frame;
-        let s = self.springs.entry((m.id, 4)).or_insert(Spring::new(0.0, 1.0, Spring::BOUNCY));
+        let s = self.springs.entry((m.id, 4)).or_insert(Spring::new(0.0, 1.0, theme.motion.bouncy));
         s.used = frame;
         let t = s.x;
         let k = 0.8 + 0.2 * t;
@@ -725,18 +722,19 @@ impl<S> Painter<'_, S> {
             px: self.px,
         };
         let r = Rect::new(x, y, w, h);
-        self.shadow(&xf, r, 18.0, Shadow::new(Color::BLACK.alpha(0.35), 40.0, 12.0), true);
-        self.glass(&xf, r, 18.0, Glass::frosted(), None);
+        let radius = theme.control.picker_radius;
+        self.shadow(&xf, r, radius, theme.shadow.bar, true);
+        self.glass(&xf, r, radius, theme.glass_menu, None);
         for (i, (key, ts)) in rows.into_iter().enumerate() {
-            let row = Rect::new(x + 6.0, y + 6.0 + ROW * i as f32, w - 12.0, ROW);
+            let row = Rect::new(x + 6.0, y + 6.0 + row_h * i as f32, w - 12.0, row_h);
             let rid = child_id(m.id, i, Some(0xA000 + i as u64));
             if self.pressed == Some(rid) {
-                self.fill(&xf, row, 12.0, Fill::Solid(Color::WHITE.alpha(0.16)), None);
+                self.fill(&xf, row, 12.0, Fill::Solid(theme.color.pressed), None);
             }
-            self.label(&xf, key, (row.x + 10.0, row.y + (ROW - ts.1) * 0.5), ts, m.fg);
+            self.label(&xf, key, (row.x + 10.0, row.y + (row_h - ts.1) * 0.5), ts, m.fg);
             if i == m.selected {
                 let cx = row.x + row.w - 10.0 - check_size.0;
-                self.label(&xf, check, (cx, row.y + (ROW - check_size.1) * 0.5), check_size, m.fg);
+                self.label(&xf, check, (cx, row.y + (row_h - check_size.1) * 0.5), check_size, m.fg);
             }
             self.hits.push(Hit { id: rid, rect: xf.rect(row), round: NO_ROUND, action: Action::Pick(i, m.on_select.clone()) });
             self.zones.push(Zone { id: rid, rect: xf.rect(row), round: NO_ROUND, cursor: Some(Cursor::Pointer), blocks: false, tip: false });
@@ -744,7 +742,7 @@ impl<S> Painter<'_, S> {
     }
 
     fn spring(&mut self, id: u64, slot: u8, target: f32) -> f32 {
-        let s = self.springs.entry((id, slot)).or_insert(Spring::new(target, target, Spring::BOUNCY));
+        let s = self.springs.entry((id, slot)).or_insert(Spring::new(target, target, self.look.theme.motion.bouncy));
         s.target = target;
         s.used = self.frame;
         s.x
@@ -752,7 +750,7 @@ impl<S> Painter<'_, S> {
 
     /// A spring without overshoot, for press feedback.
     fn crisp(&mut self, id: u64, slot: u8, target: f32) -> f32 {
-        let s = self.springs.entry((id, slot)).or_insert(Spring::new(target, target, Spring::CRISP));
+        let s = self.springs.entry((id, slot)).or_insert(Spring::new(target, target, self.look.theme.motion.crisp));
         s.target = target;
         s.used = self.frame;
         s.x
@@ -971,9 +969,10 @@ impl<S> Painter<'_, S> {
                     None => (first, r.y + (0..first).map(|i| est(known(self.text, i))).sum::<f32>()),
                 };
                 let measure = |p: &mut Self, i: usize| {
-                    let rv = row(i);
+                    let mut rv = row(i);
+                    crate::theme::apply(&mut rv, p.look);
                     let cid = child_id(id, i, rv.key);
-                    let mut lx = Lx { text: p.text, springs: p.springs, frame: p.frame, along: None, menu: p.open_menu, tip: p.tip, shift: 0.0 };
+                    let mut lx = Lx { text: p.text, look: p.look, springs: p.springs, frame: p.frame, along: None, menu: p.open_menu, tip: p.tip, shift: 0.0 };
                     let n = layout(&rv, (Some(r.w), None), &mut lx, cid);
                     (i, rv, n, cid)
                 };
@@ -1057,7 +1056,8 @@ impl<S> Painter<'_, S> {
                 // Slides as one piece in whole pixels: its parts keep their sizes on the way.
                 let pos = cxf.at_px(pos);
                 if mode != OverlayMode::Toast {
-                    self.fill(&xf, r, 0.0, Fill::Solid(Color::BLACK.alpha(0.45 * tc)), None);
+                    let scrim = self.look.theme.color.scrim;
+                    self.fill(&xf, r, 0.0, Fill::Solid(scrim.alpha(scrim.a * tc)), None);
                     self.hit(&xf, id, sr, Action::Block(on_dismiss));
                 }
                 let body = cxf.rect(Rect::new(pos.0, pos.1, w, h));
@@ -1071,9 +1071,10 @@ impl<S> Painter<'_, S> {
             }
             Kind::TextField(f) => self.paint_field(f, &st, r, sr, xf, id),
             Kind::Tabs { labels, selected, on_select } => {
+                let (tabs_pad, drop_tint, lift) = (self.look.theme.control.tab_padding, self.look.theme.control.tab_drop, self.look.theme.shadow.lift);
                 let n = labels.len().max(1);
-                let tab_w = (r.w - 2.0 * TABS_PAD) / n as f32;
-                let center = |i: usize| r.x + TABS_PAD + tab_w * (i as f32 + 0.5);
+                let tab_w = (r.w - 2.0 * tabs_pad) / n as f32;
+                let center = |i: usize| r.x + tabs_pad + tab_w * (i as f32 + 0.5);
                 let held = self.pressed == Some(id);
                 // The drop rests on the selected tab; while held it follows the pointer.
                 let target = if held {
@@ -1091,14 +1092,14 @@ impl<S> Painter<'_, S> {
                 // Liquid: it swells when grabbed and stretches along its motion.
                 let stretch = (vel.abs() * 0.035).min(tab_w * 0.6);
                 let lw = tab_w * (1.0 + 0.14 * p) + stretch;
-                let lh = (r.h - 2.0 * TABS_PAD) * (1.0 + 0.42 * p) * (1.0 - 0.18 * stretch / (tab_w * 0.6));
+                let lh = (r.h - 2.0 * tabs_pad) * (1.0 + 0.42 * p) * (1.0 - 0.18 * stretch / (tab_w * 0.6));
                 let lens = Rect::new(cx - lw * 0.5, r.y + (r.h - lh) * 0.5, lw, lh);
                 if p > 0.02 {
-                    let sh = Shadow::new(Color::BLACK.alpha(0.22 * p), 18.0, 5.0);
+                    let sh = Shadow { color: lift.color.alpha(lift.color.a * p), ..lift };
                     self.shadow(&Xf { px: 0.0, ..xf }, lens, lh * 0.5, sh, true);
                 }
                 let drop = Glass {
-                    tint: Color::WHITE.alpha(0.13 - 0.09 * p.clamp(0.0, 1.0)),
+                    tint: drop_tint.alpha(drop_tint.a * (1.0 - 0.7 * p.clamp(0.0, 1.0))),
                     saturation: 1.25,
                     frost: 1.5 * (1.0 - p.clamp(0.0, 1.0)),
                     refraction: 1.0,
@@ -1110,7 +1111,7 @@ impl<S> Painter<'_, S> {
                 let lxf = Xf { px: 0.0, ..xf };
                 self.glass(&lxf, lens, lh * 0.5, drop, None);
                 self.hit(&xf, id, sr.inflate(4.0), Action::Tabs {
-                        x0: (r.x + TABS_PAD) * xf.s + xf.tx,
+                        x0: (r.x + tabs_pad) * xf.s + xf.tx,
                         tab_w: tab_w * xf.s,
                         n,
                         on_select,
@@ -1258,9 +1259,10 @@ impl<S> Painter<'_, S> {
                     // against the end while the content is stretched.
                     let len = ((track * r.h / content.max(1.0)).max(34.0) - over).clamp(10.0, track.max(10.0));
                     let at = ((offset - lo) / (hi - lo).max(1.0)).clamp(0.0, 1.0);
-                    let w = BAR_THIN + (BAR_WIDE - BAR_THIN) * wide;
+                    let (thin, wide_w) = self.look.theme.control.scrollbar;
+                    let w = thin + (wide_w - thin) * wide;
                     if wide > 0.01 {
-                        let rail = Rect::new(r.x + r.w - BAR_WIDE - 4.0, r.y, BAR_WIDE + 4.0, r.h);
+                        let rail = Rect::new(r.x + r.w - wide_w - 4.0, r.y, wide_w + 4.0, r.h);
                         self.fill(&bxf, rail, 0.0, Fill::Solid(xf.fg.alpha(0.06 * wide * a)), None);
                     }
                     let bar = Rect::new(r.x + r.w - 2.0 - w, r.y + 4.0 + (track - len) * at, w, len);
@@ -1275,8 +1277,9 @@ impl<S> Painter<'_, S> {
             Kind::Toggle(on, f) => {
                 let t = self.spring(id, 1, if on { 1.0 } else { 0.0 });
                 let p = self.spring(id, 2, if self.pressed == Some(id) { 1.0 } else { 0.0 });
-                let off = Color::rgba(0.47, 0.47, 0.5, 0.36);
-                let track = off.lerp(Color::GREEN, t.clamp(0.0, 1.0));
+                let theme = &*self.look.theme;
+                let (knob_c, knob_sh) = (theme.control.knob, theme.shadow.control);
+                let track = theme.color.fill_strong.lerp(theme.toggle_on(), t.clamp(0.0, 1.0));
                 self.fill(&xf, r, r.h * 0.5, Fill::Solid(track), None);
                 // The knob stretches a little while pressed, like on iOS.
                 let kw = r.h - 4.0 + 6.0 * p;
@@ -1284,13 +1287,16 @@ impl<S> Painter<'_, S> {
                 let knob = Rect::new(kx, r.y + 2.0, kw, r.h - 4.0);
                 // It slides and stretches on springs: drawn as is, not in pixel steps.
                 let kxf = Xf { px: 0.0, ..xf };
-                self.shadow(&kxf, knob, knob.h * 0.5, Shadow::new(Color::BLACK.alpha(0.25), 8.0, 3.0), false);
-                self.fill(&kxf, knob, knob.h * 0.5, Fill::Solid(Color::WHITE), None);
+                self.shadow(&kxf, knob, knob.h * 0.5, knob_sh, false);
+                self.fill(&kxf, knob, knob.h * 0.5, Fill::Solid(knob_c), None);
                 self.hit(&xf, id, sr.inflate(6.0), Action::Toggle(on, f));
             }
-            Kind::Menu { items, style } => self.paint_menu(items, style, ln, r, xf, id),
+            Kind::Menu { items, style } => {
+                let style = style.unwrap_or_else(|| self.look.menu.clone());
+                self.paint_menu(items, style, ln, r, xf, id)
+            }
             Kind::Slider(value, steps, f, style) => {
-                let st = style.map_or_else(SliderStyle::default, |b| *b);
+                let st = style.map_or(self.look.slider, |b| *b);
                 let p = self.spring(id, 2, if self.pressed == Some(id) { 1.0 } else { 0.0 });
                 let knob_d = st.knob_size;
                 let range = (r.w - knob_d).max(1.0);
@@ -1338,7 +1344,10 @@ pub struct Ui<S> {
     view_fn: Box<dyn Fn(&S, &Env) -> View<S>>,
     pub text: TextSystem,
     pub list: DrawList,
-    pub background: Color,
+    /// Window background; `None` = the theme's `color.bg`. See [`Ui::clear_color`].
+    pub background: Option<Color>,
+    look: Rc<Look>,
+    theme_fn: Option<Box<dyn Fn(&S) -> Theme>>,
     /// True while springs or scroll inertia are still moving: keep drawing frames.
     pub animating: bool,
     hits: Vec<Hit<S>>,
@@ -1406,7 +1415,9 @@ impl<S: 'static> Ui<S> {
             view_fn: Box::new(move |s, env| view.build(s, env)),
             text: TextSystem::new(),
             list: DrawList::default(),
-            background: Color::BLACK,
+            background: None,
+            look: Rc::new(Look::new(Rc::new(Theme::default()))),
+            theme_fn: None,
             animating: false,
             hits: Vec::new(),
             zones: Vec::new(),
@@ -1444,8 +1455,34 @@ impl<S: 'static> Ui<S> {
         }
     }
 
+    /// Replaces the theme; the next frame repaints everything in it. Built-in widgets take
+    /// their colors and sizes from it; modifiers on a view still win.
+    pub fn set_theme(&mut self, theme: Theme) {
+        if *self.look.theme != theme {
+            self.look = Rc::new(Look::new(Rc::new(theme)));
+        }
+    }
+    /// The theme in use.
+    pub fn theme(&self) -> &Theme {
+        &self.look.theme
+    }
+    /// Derives the theme from the state before every frame, so a handler can switch it:
+    /// `ui.theme_with(|s: &State| if s.dark { Theme::dark() } else { Theme::light() })`.
+    /// Overrides [`set_theme`](Self::set_theme).
+    pub fn theme_with(&mut self, f: impl Fn(&S) -> Theme + 'static) {
+        self.theme_fn = Some(Box::new(f));
+    }
+    /// What to clear the window with: [`background`](Self::background), or the theme's.
+    pub fn clear_color(&self) -> Color {
+        self.background.unwrap_or(self.look.theme.color.bg)
+    }
+
     /// Builds, lays out and paints one frame for a window of `size` points.
     pub fn frame(&mut self, size: (f32, f32)) {
+        if let Some(f) = &self.theme_fn {
+            let t = f(&self.state);
+            self.set_theme(t);
+        }
         // Updates sent through `Link`s from background work.
         self.pump();
         self.text.set_scale(self.scale);
@@ -1550,7 +1587,9 @@ impl<S: 'static> Ui<S> {
         }
         self.size = size;
 
-        let view = (self.view_fn)(&self.state, &self.env());
+        let mut view = (self.view_fn)(&self.state, &self.env());
+        let look = self.look.clone();
+        crate::theme::apply(&mut view, &look);
         // A tooltip shows once the mouse has rested long enough; until then a timer, not frames.
         let tip_left = self.tip.as_ref().filter(|t| !t.hidden).map(|t| t.delay - (now - t.since).as_secs_f32());
         let tip_show = self.tip.as_ref().filter(|_| tip_left.is_some_and(|l| l <= 0.0)).map(|t| t.id);
@@ -1558,7 +1597,7 @@ impl<S: 'static> Ui<S> {
         if tip_show.is_some() {
             self.tip_seen = Some(now);
         }
-        let mut lx = Lx { text: &mut self.text, springs: &mut self.springs, frame: self.frame, along: None, menu: self.open_menu, tip: tip_show, shift: 0.0 };
+        let mut lx = Lx { text: &mut self.text, look: &look, springs: &mut self.springs, frame: self.frame, along: None, menu: self.open_menu, tip: tip_show, shift: 0.0 };
         let root = layout(&view, (Some(size.0), Some(size.1)), &mut lx, 1);
         self.list.cmds.clear();
         self.list.images.clear();
@@ -1570,7 +1609,7 @@ impl<S: 'static> Ui<S> {
         self.shortcuts.clear();
         let paint_sel = self.sel.for_paint();
         let blink = self.ed.blink_at.map_or(0.0, |t| (now - t).as_secs_f32());
-        let fg = if self.background.luminance() < 0.5 { Color::WHITE } else { Color::BLACK };
+        let fg = look.theme.color.text;
         let xf = Xf {
             s: 1.0,
             tx: 0.0,
@@ -1585,6 +1624,7 @@ impl<S: 'static> Ui<S> {
         let frame = self.frame;
         let mut p = Painter {
             list: &mut self.list,
+            look: &look,
             hits: &mut self.hits,
             zones: &mut self.zones,
             hovered: &self.hovered,
@@ -1610,7 +1650,7 @@ impl<S: 'static> Ui<S> {
             texts: &mut self.sel.texts,
             areas: &mut self.sel.areas,
             sel: paint_sel,
-            tctx: select::TextCtx::default(),
+            tctx: select::TextCtx::with_color(look.theme.color.selection),
             tbase: 0,
             path: Vec::new(),
             screen: Rect::new(0.0, 0.0, size.0, size.1),
@@ -1831,7 +1871,7 @@ impl<S: 'static> Ui<S> {
             (Some(id), Some(t)) if t.id == id => {}
             (Some(id), _) => {
                 let warm = self.tip_seen.is_some_and(|t| t.elapsed().as_secs_f32() < 0.4);
-                self.tip = Some(TipState { id, since: Instant::now(), delay: if warm { 0.0 } else { TIP_DELAY }, hidden: false });
+                self.tip = Some(TipState { id, since: Instant::now(), delay: if warm { 0.0 } else { self.look.theme.motion.tip_delay }, hidden: false });
             }
             (None, _) => self.tip = None,
         }

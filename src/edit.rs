@@ -6,7 +6,7 @@
 //! which work in byte offsets of the whole text.
 
 use super::{Action, Painter, Ui, WindowRequest, Xf, DOUBLE_CLICK};
-use crate::layout::{LNode, FIELD_FONT};
+use crate::layout::LNode;
 use crate::text::{TextSpec, TextSystem};
 use crate::types::{Color, Rect};
 use crate::view::{Fill, Kind, Mods, Style, View};
@@ -15,7 +15,6 @@ use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 use web_time::Instant;
 
-const ACCENT: Color = Color::BLUE;
 /// Typing within this many seconds of the previous keystroke joins its undo step.
 const UNDO_GROUP: f32 = 1.0;
 const UNDO_DEPTH: usize = 200;
@@ -27,6 +26,9 @@ pub(crate) struct Field<S> {
     pub on_change: Box<dyn Fn(&mut S, String)>,
     pub on_submit: Option<Box<dyn Fn(&mut S)>>,
     pub size: f32,
+    /// Set by `.font_size()`: the theme's body size does not replace it.
+    pub sized: bool,
+    pub line_height: f32,
     /// 1 = single-line; more = grows with its text up to this many rows, then scrolls.
     pub max_lines: usize,
     /// No ring of its own: the app draws the container.
@@ -37,7 +39,26 @@ pub(crate) struct Field<S> {
 
 impl<S> Field<S> {
     pub(crate) fn new(value: String, placeholder: String, on_change: Box<dyn Fn(&mut S, String)>) -> Self {
-        Field { value, placeholder, on_change, on_submit: None, size: FIELD_FONT, max_lines: 1, plain: false, placeholder_color: None }
+        let body = crate::theme::Theme::default().text.body;
+        Field {
+            value,
+            placeholder,
+            on_change,
+            on_submit: None,
+            size: body.size,
+            sized: false,
+            line_height: body.line_height,
+            max_lines: 1,
+            plain: false,
+            placeholder_color: None,
+        }
+    }
+
+    pub(crate) fn theme(&mut self, body: &crate::theme::TextStyle) {
+        if !self.sized {
+            self.size = body.size;
+        }
+        self.line_height = body.line_height;
     }
 }
 
@@ -93,6 +114,7 @@ impl<S> View<S> {
     pub fn plain(mut self) -> Self {
         if let Some(f) = self.field() {
             f.plain = true;
+            self.style.role = crate::view::Role::None;
             self.style.bg = None;
             self.style.border = None;
             self.style.radius = 0.0;
@@ -102,12 +124,12 @@ impl<S> View<S> {
     }
 }
 
-fn line_h(size: f32) -> f32 {
-    (size * crate::text::LINE_HEIGHT).round() // as text.rs lays out lines
+fn line_h(size: f32, k: f32) -> f32 {
+    (size * k).round() // as text.rs lays out lines
 }
 
-fn spec(text: &str, size: f32) -> TextSpec<'_> {
-    TextSpec { spans: &[], text, size, weight: 400, center: false, ..Default::default() }
+fn spec(text: &str, size: f32, line_height: f32) -> TextSpec<'_> {
+    TextSpec { spans: &[], text, size, weight: 400, center: false, line_height, ..Default::default() }
 }
 
 fn wrap_at(multi: bool, w: f32) -> Option<f32> {
@@ -118,8 +140,8 @@ fn wrap_at(multi: bool, w: f32) -> Option<f32> {
 /// needs, up to `max_lines`.
 pub(crate) fn layout_field<S>(f: &Field<S>, width: Option<f32>, ts: &mut TextSystem, node: &mut LNode) -> (f32, f32) {
     let w = width.unwrap_or(220.0);
-    let lh = line_h(f.size);
-    let (key, size) = ts.measure(&spec(&f.value, f.size), wrap_at(f.max_lines > 1, w));
+    let lh = line_h(f.size, f.line_height);
+    let (key, size) = ts.measure(&spec(&f.value, f.size, f.line_height), wrap_at(f.max_lines > 1, w));
     node.text = key;
     let rows = ((size.1 / lh).round() as usize).clamp(1, f.max_lines.max(1));
     (w, rows as f32 * lh)
@@ -132,6 +154,7 @@ pub(crate) struct FieldHit<S> {
     scale: f32,
     wrap: Option<f32>,
     size: f32,
+    line_height: f32,
     multi: bool,
     /// Visible text height and full text height (local points).
     view_h: f32,
@@ -297,7 +320,7 @@ impl<S: 'static> Ui<S> {
     /// the text key plus the press position in text coordinates.
     fn shaped(&mut self, i: usize, pos: (f32, f32)) -> (u64, (f32, f32)) {
         let Action::Field(h) = &self.hits[i].action else { return (0, (0.0, 0.0)) };
-        let key = self.text.measure(&spec(&h.value, h.size), h.wrap).0;
+        let key = self.text.measure(&spec(&h.value, h.size, h.line_height), h.wrap).0;
         (key, ((pos.0 - h.origin.0) / h.scale, (pos.1 - h.origin.1) / h.scale))
     }
 
@@ -460,7 +483,7 @@ impl<S: 'static> Ui<S> {
         let m = self.ed.mods;
         let word = m.alt || m.command;
         let (c, sel) = (self.ed.caret, self.ed.range());
-        let key_v = self.text.measure(&spec(&value, h.size), h.wrap).0;
+        let key_v = self.text.measure(&spec(&value, h.size, h.line_height), h.wrap).0;
         use KeyInput as K;
         if !matches!(key, K::Up | K::Down) {
             self.ed.goal_x = None;
@@ -562,16 +585,17 @@ impl<S> Painter<'_, S> {
         if !f.plain {
             // A thin ring that fades in without overshoot.
             let k = self.crisp(id, 3, if focused { 1.0 } else { 0.0 }).clamp(0.0, 1.0);
+            let focus = self.look.theme.color.focus;
             if k > 0.01 {
-                self.fill(&xf, r, st.radius, Fill::Solid(Color::CLEAR), Some((1.5, ACCENT.alpha(0.55 * k))));
+                self.fill(&xf, r, st.radius, Fill::Solid(Color::CLEAR), Some((self.look.theme.control.focus_ring, focus.alpha(focus.a * k))));
             }
         }
         let pad = st.padding;
         let inner = Rect::new(r.x + pad[0], r.y + pad[1], (r.w - pad[0] - pad[2]).max(0.0), (r.h - pad[1] - pad[3]).max(0.0));
         let multi = f.max_lines > 1;
         let wrap = wrap_at(multi, inner.w);
-        let (key_v, size_v) = self.text.measure(&spec(&f.value, f.size), wrap);
-        let lh = line_h(f.size);
+        let (key_v, size_v) = self.text.measure(&spec(&f.value, f.size, f.line_height), wrap);
+        let lh = line_h(f.size, f.line_height);
         let content_h = size_v.1.max(lh);
 
         let ed = &mut *self.ed;
@@ -596,7 +620,7 @@ impl<S> Painter<'_, S> {
             Some((p, cur)) => {
                 let c = ed.caret;
                 let shown = format!("{}{}{}", &f.value[..c], p, &f.value[c..]);
-                let (k, s) = self.text.measure(&spec(&shown, f.size), wrap);
+                let (k, s) = self.text.measure(&spec(&shown, f.size, f.line_height), wrap);
                 (k, s, c + cur.map_or(p.len(), |x| x.0.min(p.len())), Some(c..c + p.len()))
             }
             None => (key_v, size_v, ed.caret, None),
@@ -636,7 +660,7 @@ impl<S> Painter<'_, S> {
             }
         }
         if f.value.is_empty() && pre.is_none() {
-            let (key_p, size_p) = self.text.measure(&spec(&f.placeholder, f.size), wrap);
+            let (key_p, size_p) = self.text.measure(&spec(&f.placeholder, f.size, f.line_height), wrap);
             let color = f.placeholder_color.unwrap_or(xf.fg.alpha(xf.fg.a * 0.4));
             self.label(&cxf, key_p, origin, size_p, color);
         } else {
@@ -654,7 +678,7 @@ impl<S> Painter<'_, S> {
         if focused {
             self.ed.ime_area = Some(xf.rect(bar));
             if self.caret_on && (sel.is_empty() || pre.is_some()) {
-                self.fill(&cxf, bar, 1.0, Fill::Solid(ACCENT), None);
+                self.fill(&cxf, bar, 1.0, Fill::Solid(self.look.theme.color.accent), None);
             }
         }
         self.hit(
@@ -666,6 +690,7 @@ impl<S> Painter<'_, S> {
                 scale: xf.s,
                 wrap,
                 size: f.size,
+                line_height: f.line_height,
                 multi,
                 view_h: inner.h,
                 content_h,

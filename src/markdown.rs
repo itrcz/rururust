@@ -90,23 +90,39 @@ pub struct QuoteStyle {
 }
 
 impl Default for MarkdownStyle {
+    /// The default (dark) theme's look. In an app with a theme use
+    /// `MarkdownStyle::from(&*env.theme)`.
     fn default() -> Self {
+        MarkdownStyle::from(&crate::theme::Theme::default())
+    }
+}
+
+impl From<&crate::theme::Theme> for MarkdownStyle {
+    /// Body size and line height from `text.body`, links in `color.link`, code plates and
+    /// rules that read on the theme's background.
+    fn from(t: &crate::theme::Theme) -> Self {
+        let body = t.text.body;
         MarkdownStyle {
-            size: 17.0,
-            line_height: crate::text::LINE_HEIGHT,
-            letter_spacing: 0.0,
+            size: body.size,
+            line_height: body.line_height,
+            letter_spacing: body.tracking,
             color: None,
             gap: 10.0,
-            link: Color::hex(0x4DA3FF),
+            link: t.color.link,
             link_icons: Vec::new(),
             strong: Weight::Bold,
             headings: [26.0, 22.0, 19.0, 17.0],
             heading_weight: Weight::Bold,
             list_indent: 26.0,
             list_nest: 18.0,
-            code_color: Some(Color::hex(0xFFB86B)),
+            code_color: Some(if t.dark { Color::hex(0xFFB86B) } else { Color::hex(0xB4430B) }),
             code_background: None,
-            code_block: CodeBlockStyle::default(),
+            code_block: CodeBlockStyle {
+                line_height: body.line_height,
+                background: if t.dark { Color::BLACK.alpha(0.35) } else { Color::BLACK.alpha(0.04) },
+                border: Some((1.0, t.color.divider)),
+                ..CodeBlockStyle::default()
+            },
             table: TableStyle::default(),
             quote: QuoteStyle::default(),
         }

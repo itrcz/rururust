@@ -148,7 +148,7 @@ fn main() {
             let mouse = (num(4, -1.0), num(5, -1.0));
             let width = num(6, 1000.0) as u32;
             let mut ui = ruru::Ui::new(state, view);
-            ui.background = Color::hex(0x1C1C1E);
+            ui.background = Some(Color::hex(0x1C1C1E));
             let before = |ui: &mut ruru::Ui<S>, n: u32| {
                 if n > 0 {
                     std::thread::sleep(std::time::Duration::from_millis(16));

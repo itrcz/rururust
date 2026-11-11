@@ -16,8 +16,6 @@ use crate::KeyInput;
 use std::rc::Rc;
 use web_time::Instant;
 
-/// Default highlight under selected text (and in text fields).
-pub(crate) const SEL_COLOR: Color = Color::BLUE.alpha(0.3);
 /// Mixed into an area's id for its hit, so it never equals a tappable view's id.
 const SEL_SALT: u64 = 0x5E1E_C7AB_1E00_0001;
 /// A press on a link that moves further than this (points) becomes a selection.
@@ -96,9 +94,10 @@ impl<S> Clone for TextCtx<S> {
     }
 }
 
-impl<S> Default for TextCtx<S> {
-    fn default() -> Self {
-        TextCtx { area: None, row: 0, link: None, color: SEL_COLOR, scroll: None }
+impl<S> TextCtx<S> {
+    /// The painter starts from the theme's `color.selection`.
+    pub(crate) fn with_color(color: Color) -> Self {
+        TextCtx { area: None, row: 0, link: None, color, scroll: None }
     }
 }
 
@@ -433,8 +432,18 @@ impl<S: 'static> Ui<S> {
         find(view, 1, s.area, &s.path, &mut c).filter(|t| !t.is_empty())
     }
 
+    pub(super) fn theme_rc(&self) -> Rc<crate::theme::Theme> {
+        self.look.theme.clone()
+    }
+
     pub(super) fn env(&self) -> Env {
-        Env { width: self.size.0, height: self.size.1, titlebar: self.titlebar, window_buttons: self.window_buttons }
+        Env {
+            width: self.size.0,
+            height: self.size.1,
+            titlebar: self.titlebar,
+            window_buttons: self.window_buttons,
+            theme: self.theme_rc(),
+        }
     }
 }
 

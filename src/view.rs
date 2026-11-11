@@ -118,7 +118,8 @@ impl Shadow {
 
 /// Look of a [`slider`] (`.slider_style()`). The track and its filled part are capsules
 /// `track_height` high; the knob is a disc `knob_size` across, which is also the slider's
-/// height. Change the fields you need: `SliderStyle { fill: Color::GREEN, ..Default::default() }`.
+/// height. The theme gives the default; change the fields you need:
+/// `SliderStyle { fill: Color::GREEN, ..SliderStyle::from(&*env.theme) }`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SliderStyle {
     pub track_height: f32,
@@ -138,23 +139,6 @@ pub struct SliderStyle {
     pub tick_off: Option<Color>,
 }
 
-impl Default for SliderStyle {
-    fn default() -> Self {
-        SliderStyle {
-            track_height: 6.0,
-            track: Color::rgba(0.47, 0.47, 0.5, 0.36),
-            track_border: None,
-            fill: Color::BLUE,
-            knob: Color::WHITE,
-            knob_size: 28.0,
-            knob_shadow: Some(Shadow::new(Color::BLACK.alpha(0.28), 10.0, 3.0)),
-            tick_size: 4.0,
-            tick_on: Color::WHITE.alpha(0.6),
-            tick_off: None,
-        }
-    }
-}
-
 /// Glass material: the content behind it is lightly frosted and refracted through a
 /// bevelled rim. Defaults follow iOS "regular" glass.
 ///
@@ -165,7 +149,7 @@ impl Default for SliderStyle {
 /// let tinted = Glass::light().tint(Color::BLUE).opacity(0.2);
 /// ```
 /// The fields stay public for fine tuning.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Glass {
     /// Color mixed over the backdrop; alpha is the mix strength.
     pub tint: Color,
@@ -306,7 +290,28 @@ pub(crate) struct Style {
     pub copy_as: Option<String>,
     /// Put between the children's texts when copying (`.copy_sep()`).
     pub copy_sep: Option<&'static str>,
+    /// Which built-in widget this is: the theme fills in what its modifiers left unset.
+    pub role: Role,
+    /// Fields set by a modifier that have no `None` of their own (`PAD_*`, `SET_RADIUS`).
+    pub set: u8,
 }
+
+/// A built-in widget whose padding, fill and radius come from the theme (`theme::apply`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Role {
+    None,
+    Button,
+    Field,
+    Picker,
+    Tabs,
+}
+
+pub(crate) const PAD_L: u8 = 1;
+pub(crate) const PAD_T: u8 = 2;
+pub(crate) const PAD_R: u8 = 4;
+pub(crate) const PAD_B: u8 = 8;
+const PAD_ALL: u8 = PAD_L | PAD_T | PAD_R | PAD_B;
+pub(crate) const SET_RADIUS: u8 = 16;
 
 impl Default for Style {
     fn default() -> Self {
@@ -338,6 +343,8 @@ impl Default for Style {
             sel_color: None,
             copy_as: None,
             copy_sep: None,
+            role: Role::None,
+            set: 0,
         }
     }
 }
@@ -417,7 +424,7 @@ impl Span {
 
 /// What the screen looks like right now; lets one `view` function lay itself out
 /// differently on a phone, a tablet and a desktop window.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Env {
     /// Window size in points.
     pub width: f32,
@@ -428,6 +435,8 @@ pub struct Env {
     /// Width at the leading edge of that zone taken by the window buttons (the macOS traffic
     /// lights): start your own toolbar buttons after it.
     pub window_buttons: f32,
+    /// The theme in use (`App::theme`): `env.theme.color.accent`, `env.theme.text.body`.
+    pub theme: Rc<crate::theme::Theme>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -482,6 +491,38 @@ pub(crate) struct TextData {
     pub line_height: f32,
     /// Extra space between letters, in em.
     pub tracking: f32,
+    /// Theme text style for what no modifier set (`set`: `T_*` bits).
+    pub role: TextRole,
+    pub set: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TextRole {
+    Body,
+    Headline,
+}
+
+const T_SIZE: u8 = 1;
+const T_WEIGHT: u8 = 2;
+const T_LH: u8 = 4;
+const T_TRACK: u8 = 8;
+
+impl TextData {
+    /// Takes the theme's style for everything no modifier set.
+    pub(crate) fn theme(&mut self, ts: &crate::theme::TextStyle) {
+        if self.set & T_SIZE == 0 {
+            self.size = ts.size;
+        }
+        if self.set & T_WEIGHT == 0 {
+            self.weight = ts.weight;
+        }
+        if self.set & T_LH == 0 {
+            self.line_height = ts.line_height;
+        }
+        if self.set & T_TRACK == 0 {
+            self.tracking = ts.tracking;
+        }
+    }
 }
 
 /// How text that does not fit its lines ends (see [`View::lines`], [`View::truncate`]).
@@ -613,7 +654,8 @@ pub(crate) enum Kind<S> {
     Toggle(bool, Box<dyn Fn(&mut S, bool)>),
     /// Value, number of stops (0 = continuous), handler, look (default when `None`).
     Slider(f32, u32, Box<dyn Fn(&mut S, f32)>, Option<Box<SliderStyle>>),
-    Menu { items: Vec<MenuItem<S>>, style: Rc<MenuStyle> },
+    /// Look: the theme's unless `.menu_style()` set one.
+    Menu { items: Vec<MenuItem<S>>, style: Option<Rc<MenuStyle>> },
 }
 
 /// How an attached popover opens and closes.
@@ -636,6 +678,8 @@ pub(crate) struct Pop<S> {
 pub(crate) struct Extras<S> {
     pub pop: Option<Pop<S>>,
     pub tip: Option<Box<View<S>>>,
+    /// A default tooltip (label, key hint), built with the theme by `theme::apply`.
+    pub tip_text: Option<(String, Option<String>)>,
     pub tip_at: Option<Placement>,
     pub shortcuts: Vec<(Shortcut, Box<dyn Fn(&mut S)>)>,
     pub secondary: Option<Box<dyn Fn(&mut S)>>,
@@ -657,16 +701,18 @@ impl<S> View<S> {
     }
 
     fn extras(&mut self) -> &mut Extras<S> {
-        self.extra.get_or_insert_with(|| Box::new(Extras { pop: None, tip: None, tip_at: None, shortcuts: Vec::new(), secondary: None }))
+        self.extra.get_or_insert_with(|| Box::new(Extras { pop: None, tip: None, tip_text: None, tip_at: None, shortcuts: Vec::new(), secondary: None }))
     }
 
     // ---- layout ----
     pub fn padding(mut self, p: f32) -> Self {
         self.style.padding = [p; 4];
+        self.style.set |= PAD_ALL;
         self
     }
     pub fn padding_xy(mut self, x: f32, y: f32) -> Self {
         self.style.padding = [x, y, x, y];
+        self.style.set |= PAD_ALL;
         self
     }
     /// Left and right only; top and bottom keep what was set before, so
@@ -674,17 +720,20 @@ impl<S> View<S> {
     pub fn padding_h(mut self, x: f32) -> Self {
         self.style.padding[0] = x;
         self.style.padding[2] = x;
+        self.style.set |= PAD_L | PAD_R;
         self
     }
     /// Top and bottom only; left and right keep what was set before.
     pub fn padding_v(mut self, y: f32) -> Self {
         self.style.padding[1] = y;
         self.style.padding[3] = y;
+        self.style.set |= PAD_T | PAD_B;
         self
     }
     /// left, top, right, bottom
     pub fn padding_ltrb(mut self, l: f32, t: f32, r: f32, b: f32) -> Self {
         self.style.padding = [l, t, r, b];
+        self.style.set |= PAD_ALL;
         self
     }
     pub fn width(mut self, w: f32) -> Self {
@@ -784,6 +833,7 @@ impl<S> View<S> {
     /// Corner radius with iOS-style continuous (squircle) corners.
     pub fn radius(mut self, r: f32) -> Self {
         self.style.radius = r;
+        self.style.set |= SET_RADIUS;
         self
     }
     pub fn border(mut self, width: f32, color: Color) -> Self {
@@ -882,15 +932,31 @@ impl<S> View<S> {
     pub fn font_size(mut self, s: f32) -> Self {
         if let Kind::Text(t) = &mut self.kind {
             t.size = s;
+            t.set |= T_SIZE;
         }
         if let Kind::TextField(f) = &mut self.kind {
             f.size = s;
+            f.sized = true;
         }
         self
     }
     pub fn weight(mut self, w: Weight) -> Self {
         if let Kind::Text(t) = &mut self.kind {
             t.weight = w;
+            t.set |= T_WEIGHT;
+        }
+        self
+    }
+    /// Text only: size, line height, weight and letter spacing at once, usually from the
+    /// theme: `text("Settings").style(env.theme.text.title)`.
+    pub fn style(mut self, ts: crate::theme::TextStyle) -> Self {
+        if let Kind::Text(t) = &mut self.kind {
+            t.set = 0;
+            t.theme(&ts);
+            t.set = T_SIZE | T_WEIGHT | T_LH | T_TRACK;
+        }
+        if let Kind::TextField(f) = &mut self.kind {
+            (f.size, f.line_height, f.sized) = (ts.size, ts.line_height, true);
         }
         self
     }
@@ -899,6 +965,7 @@ impl<S> View<S> {
     pub fn line_height(mut self, k: f32) -> Self {
         if let Kind::Text(t) = &mut self.kind {
             t.line_height = k.max(0.5);
+            t.set |= T_LH;
         }
         self
     }
@@ -907,6 +974,7 @@ impl<S> View<S> {
     pub fn letter_spacing(mut self, em: f32) -> Self {
         if let Kind::Text(t) = &mut self.kind {
             t.tracking = em;
+            t.set |= T_TRACK;
         }
         self
     }
@@ -1044,7 +1112,7 @@ impl<S> View<S> {
     /// Menu only (see [`menu`]): its look, and that of its submenus.
     pub fn menu_style(mut self, style: MenuStyle) -> Self {
         if let Kind::Menu { style: s, .. } = &mut self.kind {
-            *s = Rc::new(style);
+            *s = Some(Rc::new(style));
         }
         self
     }
@@ -1098,17 +1166,20 @@ impl<S> View<S> {
     /// A small label shown under this view after the mouse rests on it for half a second;
     /// it never takes clicks. Moving on to a neighbour while one is visible shows the next
     /// one at once.
-    pub fn tooltip(self, label: impl Into<String>) -> Self {
-        let tip = tip_view(label.into(), None);
-        self.tooltip_with(tip)
+    pub fn tooltip(mut self, label: impl Into<String>) -> Self {
+        self.extras().tip = None;
+        self.extras().tip_text = Some((label.into(), None));
+        self
     }
     /// A tooltip with a key hint in a chip, like "Back ⌘[".
-    pub fn tooltip_shortcut(self, label: impl Into<String>, keys: impl Into<String>) -> Self {
-        let tip = tip_view(label.into(), Some(keys.into()));
-        self.tooltip_with(tip)
+    pub fn tooltip_shortcut(mut self, label: impl Into<String>, keys: impl Into<String>) -> Self {
+        self.extras().tip = None;
+        self.extras().tip_text = Some((label.into(), Some(keys.into())));
+        self
     }
     /// A tooltip made of any view (style it yourself: background, padding, radius).
     pub fn tooltip_with(mut self, content: View<S>) -> Self {
+        self.extras().tip_text = None;
         self.extras().tip = Some(Box::new(content));
         self
     }
@@ -1222,6 +1293,8 @@ pub fn text<S>(content: impl Into<String>) -> View<S> {
         truncate: Truncate::Ellipsis,
         line_height: crate::text::LINE_HEIGHT,
         tracking: 0.0,
+        role: TextRole::Body,
+        set: 0,
     }))
 }
 /// Text made of differently styled runs (bold, italic, code, colored) that wrap together.
@@ -1236,6 +1309,8 @@ pub fn rich_text<S>(spans: Vec<Span>) -> View<S> {
         truncate: Truncate::Ellipsis,
         line_height: crate::text::LINE_HEIGHT,
         tracking: 0.0,
+        role: TextRole::Body,
+        set: 0,
     }))
 }
 /// Flexible empty space inside a stack.
@@ -1251,13 +1326,13 @@ pub fn scroll<S>(child: View<S>) -> View<S> {
     View::new(Kind::Scroll { child: Box::new(child), refresh: None, indicator: Indicator::Auto, stick: false }).fill()
 }
 pub fn button<S>(label: impl Into<String>, on_tap: impl Fn(&mut S) + 'static) -> View<S> {
-    zstack(text(label).weight(Weight::Semibold))
-        .padding_xy(20.0, 13.0)
-        .background(Color::BLUE)
-        .color(Color::WHITE)
-        .radius(14.0)
-        .hover(Color::WHITE.alpha(0.14))
-        .on_tap(on_tap)
+    let mut label = text(label);
+    if let Kind::Text(t) = &mut label.kind {
+        t.role = TextRole::Headline;
+    }
+    let mut b = zstack(label).on_tap(on_tap);
+    b.style.role = Role::Button;
+    b
 }
 /// A picture. It keeps its aspect ratio; when both sides are set it fills the box and
 /// crops the overflow. Combine with `.radius()` for rounded corners.
@@ -1310,20 +1385,17 @@ pub fn text_field<S>(
     placeholder: impl Into<String>,
     on_change: impl Fn(&mut S, String) + 'static,
 ) -> View<S> {
-    View::new(Kind::TextField(crate::ui::edit::Field::new(value.into(), placeholder.into(), Box::new(on_change))))
-        .padding_xy(14.0, 12.0)
-        .background(Color::rgba(0.47, 0.47, 0.5, 0.24))
-        .radius(12.0)
-        .fill_width()
+    let mut v = View::new(Kind::TextField(crate::ui::edit::Field::new(value.into(), placeholder.into(), Box::new(on_change))));
+    v.style.role = Role::Field;
+    v.fill_width()
 }
 /// Drop-down choice: shows the selected option and opens a glass menu with all of them.
 pub fn picker<S, T: AsRef<str>>(options: &[T], selected: usize, on_select: impl Fn(&mut S, usize) + 'static) -> View<S> {
     let options: Vec<String> = options.iter().map(|o| o.as_ref().to_string()).collect();
     let selected = selected.min(options.len().saturating_sub(1));
-    View::new(Kind::Picker { options, selected, on_select: Rc::new(on_select) })
-        .padding_xy(14.0, 10.0)
-        .background(Color::rgba(0.47, 0.47, 0.5, 0.24))
-        .radius(12.0)
+    let mut v = View::new(Kind::Picker { options, selected, on_select: Rc::new(on_select) });
+    v.style.role = Role::Picker;
+    v
 }
 /// Floating glass tab bar. A glass "drop" marks the selected tab: it flows to a tab when
 /// you tap it, and while held it swells past the bar and can be dragged across the tabs,
@@ -1331,10 +1403,9 @@ pub fn picker<S, T: AsRef<str>>(options: &[T], selected: usize, on_select: impl 
 pub fn tab_bar<S, T: AsRef<str>>(labels: &[T], selected: usize, on_select: impl Fn(&mut S, usize) + 'static) -> View<S> {
     let labels: Vec<String> = labels.iter().map(|l| l.as_ref().to_string()).collect();
     let selected = selected.min(labels.len().saturating_sub(1));
-    View::new(Kind::Tabs { labels, selected, on_select: Box::new(on_select) })
-        .glass()
-        .radius(28.0)
-        .shadow(Color::BLACK.alpha(0.35), 30.0, 10.0)
+    let mut v = View::new(Kind::Tabs { labels, selected, on_select: Box::new(on_select) });
+    v.style.role = Role::Tabs;
+    v
 }
 /// iOS-style switch.
 pub fn toggle<S>(on: bool, on_change: impl Fn(&mut S, bool) + 'static) -> View<S> {
@@ -1357,24 +1428,5 @@ pub fn slider<S>(value: f32, on_change: impl Fn(&mut S, f32) + 'static) -> View<
 /// ])
 /// ```
 pub fn menu<S>(items: Vec<MenuItem<S>>) -> View<S> {
-    View::new(Kind::Menu { items, style: Rc::new(MenuStyle::default()) })
-}
-
-/// The default tooltip: a dark plate with the label and an optional key chip.
-fn tip_view<S>(label: String, keys: Option<String>) -> View<S> {
-    let label = text(label).font_size(12.0).weight(Weight::Medium);
-    let row = match keys {
-        Some(k) => hstack((
-            label,
-            text(k).font_size(11.0).weight(Weight::Medium).padding_xy(5.0, 1.5).background(Color::WHITE.alpha(0.14)).radius(5.0),
-        ))
-        .spacing(7.0),
-        None => hstack(label),
-    };
-    row.padding_xy(9.0, 5.0)
-        .background(Color::hex(0x2C2C2E))
-        .border(0.5, Color::WHITE.alpha(0.12))
-        .radius(9.0)
-        .shadow(Color::BLACK.alpha(0.3), 14.0, 4.0)
-        .color(Color::WHITE.alpha(0.92))
+    View::new(Kind::Menu { items, style: None })
 }

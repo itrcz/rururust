@@ -5,6 +5,7 @@
 //! (`LNode::pop`), so layout stays one pass; paint queues the popover as a [`Layer`] and paints
 //! all layers after the tree, so they are on top in both pixels and input order.
 
+use super::select::TextCtx;
 use super::{Action, Hit, Painter, Spring, Ui, Xf, Zone, NO_ROUND};
 use crate::layout::{child_id, LNode, Lx};
 use crate::text::TextSpec;
@@ -15,8 +16,6 @@ use std::rc::Rc;
 
 /// Spring slot of a layer's fade (on the layer's own id).
 pub(crate) const SLOT_FADE: u8 = 7;
-/// Seconds the mouse rests on a view before its tooltip shows.
-pub(crate) const TIP_DELAY: f32 = 0.5;
 /// Quick and without overshoot: a layer is fully in after ~120 ms.
 const FADE: (f32, f32) = (1600.0, 80.0);
 
@@ -320,9 +319,10 @@ impl<S> MenuItem<S> {
     }
 }
 
-/// Look of a [`menu`](crate::menu) and its submenus. The default is a dark macOS-style menu;
-/// change the fields you need: `MenuStyle { highlight: Color::BLUE, ..Default::default() }`.
-#[derive(Clone, Debug)]
+/// Look of a [`menu`](crate::menu) and its submenus. The theme gives the default
+/// ([`Theme::menu`](crate::Theme::menu)); change the fields you need:
+/// `MenuStyle { highlight: Color::BLUE, ..MenuStyle::from(&*env.theme) }`.
+#[derive(Clone, Debug, PartialEq)]
 pub struct MenuStyle {
     pub background: Color,
     /// Glass behind the background (then make the background translucent).
@@ -373,44 +373,6 @@ pub struct MenuStyle {
     pub section_gap: f32,
     pub min_width: f32,
     pub max_width: f32,
-}
-
-impl Default for MenuStyle {
-    fn default() -> Self {
-        MenuStyle {
-            background: Color::hex(0x2A2A2C),
-            glass: None,
-            radius: 12.0,
-            border: Some((0.5, Color::WHITE.alpha(0.12))),
-            shadow: Some(Shadow::new(Color::BLACK.alpha(0.4), 28.0, 8.0)),
-            ambient: None,
-            rim: None,
-            padding: 5.0,
-            font_size: 13.0,
-            row_height: 28.0,
-            row_radius: 7.0,
-            highlight_inset: 0.0,
-            row_padding: 10.0,
-            icon_size: 16.0,
-            icon_gap: 8.0,
-            text: Color::WHITE.alpha(0.92),
-            dim: Color::WHITE.alpha(0.42),
-            disabled: Color::WHITE.alpha(0.28),
-            highlight: Color::WHITE.alpha(0.09),
-            highlight_text: None,
-            separator: Color::WHITE.alpha(0.09),
-            separator_height: 11.0,
-            shortcut_size: None,
-            shortcut_color: None,
-            section_size: None,
-            section_weight: Weight::Semibold,
-            section_color: None,
-            section_height: None,
-            section_gap: 0.0,
-            min_width: 180.0,
-            max_width: 420.0,
-        }
-    }
 }
 
 /// Height of row `i`; a section's includes the gap above it.
@@ -621,7 +583,7 @@ impl<S> Painter<'_, S> {
             open: l.open,
         };
         let saved = std::mem::replace(&mut self.layer, ctx);
-        let tctx = std::mem::take(&mut self.tctx);
+        let tctx = std::mem::replace(&mut self.tctx, TextCtx::with_color(self.look.theme.color.selection));
         let (nh, nz) = (self.hits.len(), self.zones.len());
         self.tbase = 0;
         self.paint(l.view, &l.node, (x - l.node.pos.0, y - l.node.pos.1), xf, l.id);
@@ -793,7 +755,7 @@ impl<S> Painter<'_, S> {
                                 let anchor = Rect::new(srow.x - pad, srow.y - pad, srow.w + 2.0 * pad, srow.h + 2.0 * pad);
                                 self.layers.push(Layer {
                                     id: sub_id(id, i),
-                                    view: View::new(Kind::Menu { items: sub_items, style: style.clone() }),
+                                    view: View::new(Kind::Menu { items: sub_items, style: Some(style.clone()) }),
                                     node: ln.children[k].clone(),
                                     anchor,
                                     placement: Placement::right().start().gap(-2.0),

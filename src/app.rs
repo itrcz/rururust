@@ -1,6 +1,7 @@
 //! The window/event-loop runner. Same code path on desktop, mobile and web.
 
 use crate::render::Renderer;
+use crate::theme::Theme;
 use crate::types::Color;
 use crate::ui::{KeyInput, Ui, WheelPhase, WindowRequest};
 use crate::view::{Cursor, Mods, ViewFn};
@@ -43,6 +44,8 @@ pub struct App<S> {
     transparent: bool,
     blur: bool,
     titlebar: Titlebar,
+    /// Light and dark theme to follow the system appearance with (`theme_auto`).
+    auto: Option<(Theme, Theme)>,
 }
 
 impl<S: 'static> App<S> {
@@ -55,6 +58,7 @@ impl<S: 'static> App<S> {
             transparent: false,
             blur: false,
             titlebar: Titlebar::Standard,
+            auto: None,
         }
     }
     pub fn title(mut self, t: impl Into<String>) -> Self {
@@ -66,11 +70,31 @@ impl<S: 'static> App<S> {
         self.size = (w, h);
         self
     }
-    /// Window clear color; also picks the default text color (light on dark, dark on light).
-    /// With [`transparent`](Self::transparent) its alpha tints what is behind the window;
+    /// Window clear color instead of the theme's `color.bg`. With
+    /// [`transparent`](Self::transparent) its alpha tints what is behind the window;
     /// otherwise alpha is ignored.
     pub fn background(mut self, c: Color) -> Self {
-        self.ui.background = c;
+        self.ui.background = Some(c);
+        self
+    }
+
+    /// Colors and metrics of the built-in widgets (default: [`Theme::dark`]).
+    /// `App::new(s, view).theme(Theme::light().accent(Color::hex(0x4D81EF)))`
+    pub fn theme(mut self, theme: Theme) -> Self {
+        self.ui.set_theme(theme);
+        self
+    }
+
+    /// The theme derived from the state before every frame: a handler switches it by
+    /// changing the state. `.theme_with(|s: &State| if s.dark { Theme::dark() } else { Theme::light() })`
+    pub fn theme_with(mut self, f: impl Fn(&S) -> Theme + 'static) -> Self {
+        self.ui.theme_with(f);
+        self
+    }
+
+    /// Follows the system appearance: `light` or `dark`, switched when the user changes it.
+    pub fn theme_auto(mut self, light: Theme, dark: Theme) -> Self {
+        self.auto = Some((light, dark));
         self
     }
 
@@ -582,7 +606,8 @@ impl<S: 'static> Runner<S> {
             }
         };
         let view = frame.texture.create_view(&Default::default());
-        let clear = if self.transparent { ui.background } else { Color { a: 1.0, ..ui.background } };
+        let bg = ui.clear_color();
+        let clear = if self.transparent { bg } else { Color { a: 1.0, ..bg } };
         gfx.renderer.render(&view, (size.width, size.height), scale, &ui.list, &mut ui.text, clear);
         let ms = started.elapsed().as_secs_f32() * 1000.0;
         ui.frame_ms += (ms - ui.frame_ms) * if ui.frame_ms == 0.0 { 1.0 } else { 0.1 };
@@ -594,6 +619,14 @@ impl<S: 'static> Runner<S> {
         }
         drop(slot);
         self.sync(); // the caret may have moved for the IME
+    }
+
+    /// With `theme_auto`, takes the theme that matches the system appearance.
+    fn follow_system(&mut self, system: Option<winit::window::Theme>) {
+        if let Some((light, dark)) = &self.app.auto {
+            let t = if system == Some(winit::window::Theme::Light) { light } else { dark };
+            self.app.ui.set_theme(t.clone());
+        }
     }
 
     fn scale(&self) -> f32 {
@@ -686,6 +719,8 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
         {
             *self.gfx.borrow_mut() = Some(pollster::block_on(init_gfx(window.clone(), self.transparent)));
         }
+        let system = window.theme();
+        self.follow_system(system);
         window.request_redraw();
         self.window = Some(window);
     }
@@ -694,6 +729,10 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
         let scale = self.scale();
         let ui = &mut self.app.ui;
         let dirty = match event {
+            WindowEvent::ThemeChanged(t) => {
+                self.follow_system(Some(t));
+                true
+            }
             WindowEvent::CloseRequested => {
                 event_loop.exit();
                 false

@@ -2,6 +2,7 @@
 //! their own, parents place them. Every node is laid out exactly once.
 
 use crate::text::{TextSpec, TextSystem};
+use crate::theme::Look;
 use crate::ui::Spring;
 use crate::view::{Align, Axis, Dim, Kind, OverlayMode, Truncate, View};
 use std::collections::HashMap;
@@ -10,6 +11,8 @@ use std::collections::HashMap;
 /// that carry animated sizes from frame to frame.
 pub(crate) struct Lx<'a> {
     pub text: &'a mut TextSystem,
+    /// The theme: sizes of the built-in controls, the `.animate()` spring.
+    pub look: &'a Look,
     pub springs: &'a mut HashMap<(u64, u8), Spring>,
     pub frame: u64,
     /// Set by a stack for a `.flex()` child just before laying it out: the axis along which
@@ -26,7 +29,7 @@ pub(crate) struct Lx<'a> {
 
 impl Lx<'_> {
     fn spring(&mut self, id: u64, slot: u8, target: f32) -> f32 {
-        let s = self.springs.entry((id, slot)).or_insert(Spring::new(target, target, Spring::SMOOTH));
+        let s = self.springs.entry((id, slot)).or_insert(Spring::new(target, target, self.look.theme.motion.smooth));
         s.target = target;
         s.used = self.frame;
         s.x
@@ -40,6 +43,15 @@ impl Lx<'_> {
         s.used = self.frame;
         s.x
     }
+}
+
+/// A one-line label in the theme's body style (picker, its drop-down).
+pub(crate) fn body_spec<'a>(lx: &Lx, text: &'a str) -> TextSpec<'a> {
+    spec_in(&lx.look.theme.text.body, text)
+}
+
+pub(crate) fn spec_in<'a>(ts: &crate::theme::TextStyle, text: &'a str) -> TextSpec<'a> {
+    TextSpec { spans: &[], text, size: ts.size, weight: ts.weight as u16, line_height: ts.line_height, tracking: ts.tracking, ..Default::default() }
 }
 
 /// Spring slots used by layout (paint uses 0..=9).
@@ -75,10 +87,6 @@ pub(crate) struct LNode {
     pub tip: Option<Box<LNode>>,
 }
 
-pub(crate) const TOGGLE: (f32, f32) = (51.0, 31.0);
-pub(crate) const SLIDER_H: f32 = 28.0;
-pub(crate) const FIELD_FONT: f32 = 17.0;
-pub(crate) const TABS_PAD: f32 = 6.0;
 
 fn fills_main<S>(v: &View<S>, axis: Axis) -> bool {
     if matches!(v.kind, Kind::Spacer) || v.style.flex > 0.0 {
@@ -183,22 +191,31 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
         Kind::TextField(f) => crate::ui::edit::layout_field(f, inner.0, lx.text, &mut node),
         Kind::Picker { options, selected, .. } => {
             let label = options.get(*selected).map_or("", |s| s.as_str());
-            let (key, size) = lx.text.measure(&TextSpec { spans: &[], text: label, size: FIELD_FONT, weight: 400, center: false, ..Default::default() }, None);
+            let (key, size) = lx.text.measure(&body_spec(lx, label), None);
             node.text = key;
             (size.0 + 26.0, size.1)
         }
         Kind::Tabs { labels, .. } => {
             let mut widest = 0.0f32;
+            let t = &lx.look.theme;
+            let (font, k) = (t.text.subhead, t.control);
             for l in labels {
-                let m = lx.text.measure(&TextSpec { spans: &[], text: l, size: 15.0, weight: 600, center: false, ..Default::default() }, None);
+                let spec = TextSpec { spans: &[], text: l, size: font.size, weight: 600, line_height: font.line_height, ..Default::default() };
+                let m = lx.text.measure(&spec, None);
                 widest = widest.max(m.1 .0);
                 node.texts.push(m);
             }
-            ((widest + 40.0) * labels.len() as f32 + 2.0 * TABS_PAD, 56.0)
+            ((widest + k.tab_extra) * labels.len() as f32 + 2.0 * k.tab_padding, k.tab_height)
         }
-        Kind::Toggle(..) => TOGGLE,
-        Kind::Slider(.., st) => (inner.0.unwrap_or(200.0), st.as_ref().map_or(SLIDER_H, |s| s.knob_size.max(s.track_height))),
-        Kind::Menu { items, style } => crate::ui::popup::layout_menu(items, style, lx, id, &mut node),
+        Kind::Toggle(..) => lx.look.theme.control.toggle,
+        Kind::Slider(.., st) => {
+            let s = st.as_deref().unwrap_or(&lx.look.slider);
+            (inner.0.unwrap_or(200.0), s.knob_size.max(s.track_height))
+        }
+        Kind::Menu { items, style } => {
+            let st = style.clone().unwrap_or_else(|| lx.look.menu.clone());
+            crate::ui::popup::layout_menu(items, &st, lx, id, &mut node)
+        }
         Kind::List { count, row_h, row } => {
             // Rows are built during paint (only the visible ones); here we just need the
             // total height: measured rows as measured, the rest at the estimate.
@@ -219,7 +236,8 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
                     let (a, b) = (seen.0.min(*count), (seen.1 + 2).min(*count));
                     let on_screen: f32 = old[a..seen.1.min(*count)].iter().sum();
                     let mut measure = |i: usize| {
-                        let rv = row(i);
+                        let mut rv = row(i);
+                        crate::theme::apply(&mut rv, lx.look);
                         layout(&rv, (Some(w + pad_w), None), lx, child_id(id, i, rv.key)).size.1
                     };
                     let mut fresh: Vec<(usize, f32)> = (a..b).map(|i| (i, measure(i))).collect();
