@@ -1012,11 +1012,12 @@ impl Renderer {
                         // The painter put snapped text on whole pixels; float noise (20.999998)
                         // must not fall a pixel short where glyph rows are truncated.
                         left: on_pixel(t.pos.0 * scale),
-                        top: on_pixel(t.pos.1 * scale),
-                        // Animated scale is snapped to 1/16 steps: otherwise every frame of a
-                        // press or menu animation rasterizes each glyph at a brand-new size and
-                        // floods the glyph atlas.
-                        scale: (t.scale * 16.0).round() / 16.0 * scale,
+                        // Glyphon truncates the row; the painter already put it on a whole
+                        // pixel, this only keeps an unsnapped one from falling short.
+                        top: (t.pos.1 * scale).round(),
+                        // Already quantized by the painter (`text_scale`), which places the
+                        // text for exactly this scale.
+                        scale: t.scale * scale,
                         bounds,
                         default_color: glyphon::Color::rgba(to8(c.r), to8(c.g), to8(c.b), to8(c.a * a)),
                         custom_glyphs: &[],
