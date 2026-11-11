@@ -40,7 +40,7 @@ mod view;
 #[cfg(feature = "app")]
 pub use app::{App, Titlebar};
 #[cfg(feature = "renderer")]
-pub use render::Renderer;
+pub use render::{RenderStats, Renderer};
 pub use task::{link, set_spawner, set_waker, spawn, Link, Task};
 #[cfg(any(not(target_arch = "wasm32"), feature = "app"))]
 pub use task::sleep;

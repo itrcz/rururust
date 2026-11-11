@@ -245,6 +245,8 @@ struct Gfx {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     renderer: Renderer,
+    /// The surface could also be a copy source (see `Renderer::wants_copy_src`).
+    can_copy: bool,
 }
 
 async fn init_gfx(window: Arc<Window>, transparent: bool) -> Gfx {
@@ -290,7 +292,9 @@ async fn init_gfx(window: Arc<Window>, transparent: bool) -> Gfx {
         }
     }
     surface.configure(&device, &config);
-    Gfx { surface, config, renderer: Renderer::new(device, queue, format) }
+    // Native only: in the browser the canvas stays a plain render target.
+    let can_copy = !cfg!(target_arch = "wasm32") && caps.usages.contains(wgpu::TextureUsages::COPY_SRC);
+    Gfx { surface, config, renderer: Renderer::new(device, queue, format), can_copy }
 }
 
 struct Runner<S> {
@@ -582,6 +586,7 @@ impl<S: 'static> Runner<S> {
             gfx.config.width = size.width;
             gfx.config.height = size.height;
             gfx.surface.configure(&gfx.renderer.device, &gfx.config);
+            gfx.renderer.invalidate();
         }
         let scale = window.scale_factor() as f32;
         let ui = &mut self.app.ui;
@@ -595,24 +600,51 @@ impl<S: 'static> Runner<S> {
         let started = web_time::Instant::now();
         ui.scale = scale;
         ui.frame((size.width as f32 / scale, size.height as f32 / scale));
+        let bg = ui.clear_color();
+        let clear = if self.transparent { bg } else { Color { a: 1.0, ..bg } };
+
+        // Nothing visible changed (hover over plain content, a wake-up for nothing): the
+        // window already shows this frame, so the GPU is left alone.
+        if gfx.renderer.unchanged((size.width, size.height), scale, &ui.list, clear) {
+            self.wake_at = ui.wake_in.map(|s| web_time::Instant::now() + std::time::Duration::from_secs_f32(s));
+            if ui.animating {
+                // Without a present nothing paces the loop to the display: come back in a
+                // frame's time instead of spinning.
+                let next = web_time::Instant::now() + std::time::Duration::from_millis(8);
+                self.wake_at = Some(self.wake_at.map_or(next, |w| w.min(next)));
+            }
+            drop(slot);
+            self.sync();
+            return;
+        }
 
         let frame = match gfx.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return,
             _ => {
                 gfx.surface.configure(&gfx.renderer.device, &gfx.config);
+                gfx.renderer.invalidate();
                 window.request_redraw();
                 return;
             }
         };
         let view = frame.texture.create_view(&Default::default());
-        let bg = ui.clear_color();
-        let clear = if self.transparent { bg } else { Color { a: 1.0, ..bg } };
         gfx.renderer.render(&view, (size.width, size.height), scale, &ui.list, &mut ui.text, clear);
+        // Glass draws through an off-screen copy of the window until the window itself can
+        // be copied from. Only apps that show glass ask for that (it may cost the compositor
+        // a little), once.
+        let readable = gfx.can_copy
+            && gfx.renderer.wants_copy_src()
+            && !gfx.config.usage.contains(wgpu::TextureUsages::COPY_SRC);
         let ms = started.elapsed().as_secs_f32() * 1000.0;
         ui.frame_ms += (ms - ui.frame_ms) * if ui.frame_ms == 0.0 { 1.0 } else { 0.1 };
         window.pre_present_notify();
         gfx.renderer.queue.present(frame);
+        if readable {
+            gfx.config.usage |= wgpu::TextureUsages::COPY_SRC;
+            gfx.surface.configure(&gfx.renderer.device, &gfx.config);
+            gfx.renderer.invalidate();
+        }
         self.wake_at = ui.wake_in.map(|s| web_time::Instant::now() + std::time::Duration::from_secs_f32(s));
         if ui.animating {
             window.request_redraw();
