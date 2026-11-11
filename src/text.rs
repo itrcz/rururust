@@ -111,6 +111,8 @@ pub struct TextSystem {
     frame: u64,
     /// Bytes of shaped text kept between frames, [`CACHE_BUDGET`] unless a test lowers it.
     budget: usize,
+    /// Glyph outlines are hinted (only at scale < 2; see `set_scale`).
+    hint: bool,
 }
 
 /// Default line height, as a multiple of the font size.
@@ -208,6 +210,20 @@ impl Layout {
 }
 
 impl TextSystem {
+    /// Hinting snaps outlines to the pixel grid: crisper stems on a 1x screen, but on 2x and
+    /// up it only bends the shapes (most visibly JetBrains Mono, which carries hints; Inter
+    /// has next to none) and macOS never hints anyway. The choice lives in the shaped glyphs'
+    /// cache keys, so a change (window moved to another screen) reshapes everything once.
+    /// Glyph positions do not depend on it, so the layout stays the same.
+    pub(crate) fn set_scale(&mut self, scale: f32) {
+        let hint = scale < 2.0;
+        if hint != self.hint {
+            self.hint = hint;
+            self.entries.clear();
+            self.owners.clear();
+        }
+    }
+
     pub fn new() -> Self {
         // Inter is embedded so text looks identical on every platform (and works
         // in the browser, where there are no system fonts). On native the system
@@ -238,6 +254,7 @@ impl TextSystem {
             // Starts at 1: a layout with `used == 0` was never handed out.
             frame: 1,
             budget: CACHE_BUDGET,
+            hint: true,
         }
     }
 
@@ -287,7 +304,8 @@ impl TextSystem {
             buffer.set_metrics(metrics);
         }
 
-        let mut attrs = Attrs::new().family(Family::SansSerif).weight(Weight(spec.weight));
+        let flags = if self.hint { CacheKeyFlags::empty() } else { CacheKeyFlags::DISABLE_HINTING };
+        let mut attrs = Attrs::new().family(Family::SansSerif).weight(Weight(spec.weight)).cache_key_flags(flags);
         if spec.tracking != 0.0 {
             attrs = attrs.letter_spacing(spec.tracking);
         }
@@ -305,7 +323,7 @@ impl TextSystem {
                     a = a.weight(Weight(w as u16));
                 }
                 if s.italic {
-                    a = a.cache_key_flags(CacheKeyFlags::FAKE_ITALIC); // slanted, no extra font file
+                    a = a.cache_key_flags(flags | CacheKeyFlags::FAKE_ITALIC); // slanted, no extra font file
                 }
                 if s.mono {
                     a = a.family(Family::Monospace);
@@ -760,6 +778,25 @@ mod tests {
 
     fn shaped(ts: &mut TextSystem, text: &str, w: Option<f32>) -> u64 {
         ts.measure(&TextSpec { text, ..Default::default() }, w).0
+    }
+
+    #[test]
+    fn hinting_is_off_from_scale_two_and_layout_does_not_move() {
+        let mut ts = TextSystem::new();
+        let flags = |ts: &TextSystem, key: u64| {
+            let (k, slot) = split_key(key);
+            let b = &ts.entries[&k].layouts[slot].buffer;
+            b.layout_runs().flat_map(|r| r.glyphs.iter().map(|g| g.cache_key_flags)).collect::<Vec<_>>()
+        };
+        let text = "Hinted at 1x, wgpu";
+        ts.set_scale(1.0);
+        let (k1, size1) = ts.measure(&TextSpec { text, ..Default::default() }, None);
+        assert!(flags(&ts, k1).iter().all(|f| !f.contains(CacheKeyFlags::DISABLE_HINTING)));
+        ts.set_scale(2.0);
+        let (k2, size2) = ts.measure(&TextSpec { text, ..Default::default() }, None);
+        let f2 = flags(&ts, k2);
+        assert!(!f2.is_empty() && f2.iter().all(|f| f.contains(CacheKeyFlags::DISABLE_HINTING)));
+        assert_eq!(size1, size2);
     }
 
     #[test]
