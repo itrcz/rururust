@@ -661,7 +661,7 @@ pub(crate) enum Kind<S> {
     Spacer,
     Stack { axis: Axis, spacing: f32, align: Align, children: Vec<View<S>> },
     Text(TextData),
-    Scroll { child: Box<View<S>>, refresh: Option<(bool, Box<dyn Fn(&mut S)>)>, indicator: Indicator, stick: bool },
+    Scroll { child: Box<View<S>>, refresh: Option<(bool, Box<dyn Fn(&mut S)>)>, indicator: Indicator, stick: bool, bar_insets: (f32, f32) },
     List { count: usize, row_h: f32, row: Box<dyn Fn(usize) -> View<S>> },
     Overlay { open: bool, mode: OverlayMode, child: Box<View<S>>, on_dismiss: Option<Box<dyn Fn(&mut S)>> },
     Toggle(bool, Box<dyn Fn(&mut S, bool)>),
@@ -937,6 +937,15 @@ impl<S> View<S> {
     pub fn indicator(mut self, mode: Indicator) -> Self {
         if let Kind::Scroll { indicator, .. } = &mut self.kind {
             *indicator = mode;
+        }
+        self
+    }
+    /// Scroll only: keeps the scroll bar (and the strip that grabs it) `top` and `bottom`
+    /// points away from the ends of the viewport, e.g. clear of a composer floating over the
+    /// end of a chat: `scroll(feed).indicator_insets(0.0, composer_h)`.
+    pub fn indicator_insets(mut self, top: f32, bottom: f32) -> Self {
+        if let Kind::Scroll { bar_insets, .. } = &mut self.kind {
+            *bar_insets = (top.max(0.0), bottom.max(0.0));
         }
         self
     }
@@ -1360,7 +1369,7 @@ pub fn rect<S>() -> View<S> {
 }
 /// Vertically scrolling container.
 pub fn scroll<S>(child: View<S>) -> View<S> {
-    View::new(Kind::Scroll { child: Box::new(child), refresh: None, indicator: Indicator::Auto, stick: false }).fill()
+    View::new(Kind::Scroll { child: Box::new(child), refresh: None, indicator: Indicator::Auto, stick: false, bar_insets: (0.0, 0.0) }).fill()
 }
 pub fn button<S>(label: impl Into<String>, on_tap: impl Fn(&mut S) + 'static) -> View<S> {
     let mut label = text(label);

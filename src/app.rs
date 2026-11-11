@@ -41,6 +41,8 @@ pub struct App<S> {
     ui: Ui<S>,
     title: String,
     size: (f32, f32),
+    min_size: Option<(f32, f32)>,
+    max_size: Option<(f32, f32)>,
     transparent: bool,
     blur: bool,
     titlebar: Titlebar,
@@ -55,6 +57,8 @@ impl<S: 'static> App<S> {
             ui: Ui::new(state, view),
             title: "ruru".into(),
             size: (420.0, 760.0),
+            min_size: None,
+            max_size: None,
             transparent: false,
             blur: false,
             titlebar: Titlebar::Standard,
@@ -68,6 +72,18 @@ impl<S: 'static> App<S> {
     /// Initial window size in points (desktop only).
     pub fn size(mut self, w: f32, h: f32) -> Self {
         self.size = (w, h);
+        self
+    }
+    /// The smallest the user can make the window, in points (desktop only): below the size the
+    /// layout was made for it would only squeeze. The view can still adapt above it, e.g.
+    /// collapse a side panel when [`Env::width`](crate::Env::width) gets narrow.
+    pub fn min_size(mut self, w: f32, h: f32) -> Self {
+        self.min_size = Some((w, h));
+        self
+    }
+    /// The largest the user can make the window, in points (desktop only).
+    pub fn max_size(mut self, w: f32, h: f32) -> Self {
+        self.max_size = Some((w, h));
         self
     }
     /// Window clear color instead of the theme's `color.bg`. With
@@ -719,6 +735,12 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
             .with_inner_size(LogicalSize::new(self.app.size.0 as f64, self.app.size.1 as f64))
             .with_transparent(self.transparent)
             .with_blur(self.app.blur && self.transparent);
+        if let Some((w, h)) = self.app.min_size {
+            attrs = attrs.with_min_inner_size(LogicalSize::new(w as f64, h as f64));
+        }
+        if let Some((w, h)) = self.app.max_size {
+            attrs = attrs.with_max_inner_size(LogicalSize::new(w as f64, h as f64));
+        }
         #[cfg(target_os = "macos")]
         if self.app.titlebar == Titlebar::Overlay {
             use winit::platform::macos::WindowAttributesExtMacOS;

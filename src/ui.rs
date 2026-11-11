@@ -524,6 +524,21 @@ impl Xf {
     }
 }
 
+/// A scroll bar waiting to be painted over everything else in its layer.
+struct Bar<S> {
+    /// The scroll view's transform and clip.
+    xf: Xf,
+    id: u64,
+    /// The edge strip (screen) that reveals the bar on hover and takes presses on it.
+    strip: Rect,
+    /// Hover zone over the strip, with its pointer shape.
+    zone: Option<Option<Cursor>>,
+    /// Track under the pointer, and the thumb with its radius.
+    rail: Option<(Rect, Color)>,
+    thumb: Option<(Rect, f32, Color)>,
+    hit: Option<Action<S>>,
+}
+
 struct Painter<'a, S> {
     list: &'a mut DrawList,
     look: &'a Look,
@@ -571,6 +586,8 @@ struct Painter<'a, S> {
     screen: Rect,
     /// Popovers, submenus and tooltips to paint after the tree.
     layers: Vec<Layer<S>>,
+    /// Scroll bars of the layer being painted, to go over the rest of it (`flush_bars`).
+    bars: Vec<Bar<S>>,
     /// The layer being painted (default: the tree).
     layer: LayerCtx<S>,
     menu_state: &'a mut HashMap<u64, MenuState>,
@@ -587,6 +604,28 @@ struct Painter<'a, S> {
 }
 
 impl<S> Painter<'_, S> {
+    /// Paints the scroll bars collected so far, over everything painted before them: content
+    /// laid over a scroll view (a fade, a floating composer) never covers its bar or takes its
+    /// presses. Called at the end of the tree and of each layer, and before a modal's scrim,
+    /// so popovers, menus and modals still cover bars beneath them.
+    fn flush_bars(&mut self) {
+        self.smooth = false;
+        for b in std::mem::take(&mut self.bars) {
+            if let Some(cursor) = b.zone {
+                self.zone(&b.xf, b.id, b.strip, cursor);
+            }
+            if let Some((r, c)) = b.rail {
+                self.fill(&b.xf, r, 0.0, Fill::Solid(c), None);
+            }
+            if let Some((r, radius, c)) = b.thumb {
+                self.fill(&b.xf, r, radius, Fill::Solid(c), None);
+            }
+            if let Some(a) = b.hit {
+                self.hit(&b.xf, b.id, b.strip, a);
+            }
+        }
+    }
+
     fn hit(&mut self, xf: &Xf, id: u64, rect: Rect, action: Action<S>) {
         self.hits.push(Hit { id, rect: rect.intersect(&xf.clip), round: (xf.clip, xf.clip_r), action });
     }
@@ -1054,6 +1093,8 @@ impl<S> Painter<'_, S> {
                 };
                 // Slides as one piece in whole pixels: its parts keep their sizes on the way.
                 let pos = cxf.at_px(pos);
+                // Bars of what lies underneath go under the scrim with it.
+                self.flush_bars();
                 if mode != OverlayMode::Toast {
                     let scrim = self.look.theme.color.scrim;
                     self.fill(&xf, r, 0.0, Fill::Solid(scrim.alpha(scrim.a * tc)), None);
@@ -1187,7 +1228,7 @@ impl<S> Painter<'_, S> {
                     self.paint(c, n, (r.x, r.y + y - tops[k]), xf, cid);
                 }
             }
-            Kind::Scroll { child, refresh, indicator, stick } => {
+            Kind::Scroll { child, refresh, indicator, stick, bar_insets } => {
                 let content = ln.content_h + pad[1] + pad[3];
                 let (frame, now) = (self.frame, self.now);
                 let s = self.scrolls.entry(id).or_default();
@@ -1238,7 +1279,8 @@ impl<S> Painter<'_, S> {
 
                 // Overlay scroll bar, as on macOS: shows while scrolling or when the pointer
                 // comes to the edge, widens with a track under the pointer, and its thumb can
-                // be dragged; fades out when idle.
+                // be dragged; fades out when idle. Painted after the rest of its layer (see
+                // `flush_bars`), so nothing laid over the scroll view hides it.
                 let bar_id = id ^ BAR_SALT;
                 let grabbed = self.bar_drag == Some(id);
                 let near = self.hovered.contains(&bar_id);
@@ -1250,17 +1292,18 @@ impl<S> Painter<'_, S> {
                 }
                 let a = self.spring(id, 8, if show { 1.0 } else { 0.0 }).clamp(0.0, 1.0);
                 let wide = self.crisp(id, 9, if show && (near || grabbed) { 1.0 } else { 0.0 }).clamp(0.0, 1.0);
-                let strip = Rect::new(r.x + r.w - BAR_STRIP, r.y, BAR_STRIP, r.h);
-                let mut bxf = cxf;
-                bxf.clip_r = 0.0;
+                let (it, ib) = bar_insets;
+                let (by, bh) = (r.y + it, (r.h - it - ib).max(0.0));
+                let strip = Rect::new(r.x + r.w - BAR_STRIP, by, BAR_STRIP, bh);
+                let mut bar = Bar { xf: cxf, id: bar_id, strip: xf.rect(strip), zone: None, rail: None, thumb: None, hit: None };
+                bar.xf.clip_r = 0.0;
                 if scrolls {
                     // Always there, so hovering the edge reveals the bar; once shown it keeps
                     // the arrow pointer over text that runs under it.
-                    let cursor = (a > 0.5).then_some(Cursor::Default);
-                    self.zone(&bxf, bar_id, xf.rect(strip), cursor);
+                    bar.zone = Some((a > 0.5).then_some(Cursor::Default));
                 }
-                if a > 0.01 {
-                    let track = r.h - 8.0;
+                if a > 0.01 && bh > 8.0 {
+                    let track = bh - 8.0;
                     // Its length mirrors how much of the content is visible; it squashes
                     // against the end while the content is stretched.
                     let len = ((track * r.h / content.max(1.0)).max(34.0) - over).clamp(10.0, track.max(10.0));
@@ -1268,17 +1311,17 @@ impl<S> Painter<'_, S> {
                     let (thin, wide_w) = self.look.theme.control.scrollbar;
                     let w = thin + (wide_w - thin) * wide;
                     if wide > 0.01 {
-                        let rail = Rect::new(r.x + r.w - wide_w - 4.0, r.y, wide_w + 4.0, r.h);
-                        self.fill(&bxf, rail, 0.0, Fill::Solid(xf.fg.alpha(0.06 * wide * a)), None);
+                        let rail = Rect::new(r.x + r.w - wide_w - 4.0, by, wide_w + 4.0, bh);
+                        bar.rail = Some((rail, xf.fg.alpha(0.06 * wide * a)));
                     }
-                    let bar = Rect::new(r.x + r.w - 2.0 - w, r.y + 4.0 + (track - len) * at, w, len);
-                    self.fill(&bxf, bar, w * 0.5, Fill::Solid(xf.fg.alpha((0.45 + 0.1 * wide) * a)), None);
+                    let thumb = Rect::new(r.x + r.w - 2.0 - w, by + 4.0 + (track - len) * at, w, len);
+                    bar.thumb = Some((thumb, w * 0.5, xf.fg.alpha((0.45 + 0.1 * wide) * a)));
                     if a > 0.5 {
-                        let y0 = (r.y + 4.0) * xf.s + xf.ty;
-                        let action = Action::ScrollBar { scroll: id, y0, track: track * xf.s, len: len * xf.s, lo, hi, page: (r.h * 0.9).max(1.0) };
-                        self.hit(&bxf, bar_id, xf.rect(strip), action);
+                        let y0 = (by + 4.0) * xf.s + xf.ty;
+                        bar.hit = Some(Action::ScrollBar { scroll: id, y0, track: track * xf.s, len: len * xf.s, lo, hi, page: (r.h * 0.9).max(1.0) });
                     }
                 }
+                self.bars.push(bar);
             }
             Kind::Toggle(on, f) => {
                 let r = cr;
@@ -1664,6 +1707,7 @@ impl<S: 'static> Ui<S> {
             path: Vec::new(),
             screen: Rect::new(0.0, 0.0, size.0, size.1),
             layers: Vec::new(),
+            bars: Vec::new(),
             layer: LayerCtx::default(),
             menu_state: &mut self.menu_state,
             menu_nav: &mut self.menu_nav,
@@ -1674,9 +1718,13 @@ impl<S: 'static> Ui<S> {
             px: self.scale,
         };
         p.paint(view, &root, (0.0, 0.0), xf, 1);
+        p.flush_bars();
         p.paint_layers();
         match p.menu.take() {
-            Some(menu) => p.paint_picker_menu(menu, size),
+            Some(menu) => {
+                p.paint_picker_menu(menu, size);
+                p.flush_bars();
+            }
             None if !p.managed_seen => self.open_menu = None, // its picker or anchor is gone
             None => {}
         }

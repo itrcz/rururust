@@ -608,6 +608,7 @@ impl<S> Painter<'_, S> {
         let (nh, nz) = (self.hits.len(), self.zones.len());
         self.tbase = 0;
         self.paint(l.view, &l.node, (x - l.node.pos.0, y - l.node.pos.1), xf, l.id);
+        self.flush_bars();
         if tip || !l.open {
             // Tooltips and closing layers never take input.
             self.hits.truncate(nh);

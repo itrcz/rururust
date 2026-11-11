@@ -2132,6 +2132,95 @@ fn scroll_bar_thumb_drags_proportionally_and_the_track_pages() {
     assert_eq!(-top_y(&ui), 2001.0 - 360.0);
 }
 
+#[derive(Default)]
+struct Over {
+    pop: bool,
+    modal: bool,
+    taps: u32,
+}
+
+const FADE: Color = Color::hex(0x202020);
+const BOX: Color = Color::hex(0x404040);
+const POP: Color = Color::hex(0x606060);
+
+/// A chat-like column: a feed, a fade laid over its lower part and a tappable "composer"
+/// floating over its end; the bar stops above the composer.
+fn over_ui() -> Ui<Over> {
+    let mut ui = Ui::new(Over::default(), |s: &Over| {
+        let rows = list(60, 40.0, |i| text(format!("row {i}")).fill_width().height(40.0));
+        zstack((
+            scroll(rows).indicator_insets(0.0, 80.0),
+            rect().fill_width().height(150.0).background(FADE).place(Align::Center, Align::End),
+            rect()
+                .fill_width()
+                .height(70.0)
+                .background(BOX)
+                .on_tap(|s: &mut Over| s.taps += 1)
+                .popover(s.pop, Placement::top(), |s: &mut Over| s.pop = false, rect().size(280.0, 300.0).background(POP))
+                .place(Align::Center, Align::End),
+            modal(s.modal, |s: &mut Over| s.modal = false, rect().size(100.0, 100.0)),
+        ))
+        .fill()
+    });
+    ui.frame((300.0, 400.0));
+    ui
+}
+
+fn settle_over(ui: &mut Ui<Over>) {
+    for _ in 0..80 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        ui.frame((300.0, 400.0));
+    }
+}
+
+/// Paint order of the first quad matching `f`.
+fn order(ui: &Ui<impl Sized>, f: impl Fn(&[f32; 4], &[f32; 4]) -> bool) -> Option<usize> {
+    ui.list.cmds.iter().position(|c| matches!(c, ruru::Cmd::Quad(q) if f(&q.rect, &q.c0)))
+}
+
+#[test]
+fn scroll_bar_lies_over_content_above_the_scroll_but_under_popovers_and_modals() {
+    let mut ui = over_ui();
+    let is = |c: Color| move |_: &[f32; 4], q: &[f32; 4]| *q == [c.r, c.g, c.b, c.a];
+    let thumb_at = |r: &[f32; 4], _: &[f32; 4]| r[0] > 280.0 && r[2] <= 10.0 && r[3] > 20.0;
+    // Hovering the edge where the fade lies over the feed still reveals the bar.
+    ui.pointer_move((294.0, 280.0));
+    settle_over(&mut ui);
+    let t = ui
+        .list
+        .cmds
+        .iter()
+        .find_map(|c| match c {
+            ruru::Cmd::Quad(q) if thumb_at(&q.rect, &q.c0) => Some(q.rect),
+            _ => None,
+        })
+        .expect("the bar shows under the pointer");
+    assert!(order(&ui, thumb_at).unwrap() > order(&ui, is(FADE)).unwrap(), "the bar is painted over the fade");
+    assert!(order(&ui, thumb_at).unwrap() > order(&ui, is(BOX)).unwrap(), "and over the composer");
+    // It stops above the composer: track 400 - 80, from 4 to 316.
+    assert!(t[1] + t[3] <= 316.0 + 0.01, "the bar ends above the composer: {t:?}");
+    // A press on the strip over the fade grabs the bar; one on the composer at the same
+    // x still taps the composer.
+    ui.pointer_down((294.0, 300.0), false);
+    ui.pointer_up((294.0, 300.0));
+    ui.frame((300.0, 400.0));
+    assert_eq!(ui.state.taps, 0, "the bar took the press, not what lies under it");
+    ui.pointer_move((294.0, 370.0));
+    ui.frame((300.0, 400.0));
+    click(&mut ui, (294.0, 370.0));
+    assert_eq!(ui.state.taps, 1, "below the inset the composer gets the press");
+    // A popover and a modal cover the bar.
+    ui.pointer_move((294.0, 200.0));
+    ui.state.pop = true;
+    settle_over(&mut ui);
+    assert!(order(&ui, is(POP)).unwrap() > order(&ui, thumb_at).unwrap(), "the popover is over the bar");
+    ui.state.pop = false;
+    ui.state.modal = true;
+    settle_over(&mut ui);
+    let scrim = ui.list.cmds.iter().position(|c| matches!(c, ruru::Cmd::Quad(q) if q.rect == [0.0, 0.0, 300.0, 400.0] && q.c0[3] > 0.0 && q.c0[3] < 1.0));
+    assert!(scrim.unwrap() > order(&ui, thumb_at).unwrap(), "the modal's scrim is over the bar");
+}
+
 #[test]
 fn scroll_bar_press_keeps_the_text_selection() {
     let mut ui = bar_ui();
