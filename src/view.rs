@@ -1367,7 +1367,7 @@ pub fn hstack<S>(children: impl Children<S>) -> View<S> {
 /// the pointer; any other change of `width` (a button, a reset) glides on a spring. The
 /// panel's `.min_width()` / `.max_width()` bound the drag, and its content is laid out at
 /// least that wide, cut rather than squeezed while the panel closes. Over the divider (a
-/// one-point line in the theme's `divider` color, 8 points to grab) the pointer turns into
+/// hairline of the theme's `control.border` width in `divider` color, 8 points to grab) the pointer turns into
 /// a resize arrow and the line lights up in `accent`.
 ///
 /// ```

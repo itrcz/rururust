@@ -61,8 +61,6 @@ const SLOT_LAST_W: u8 = 12;
 const SLOT_LAST_H: u8 = 13;
 /// A split's side region (panel + divider) on screen; input sets it directly while dragging.
 pub(crate) const SLOT_SPLIT: u8 = 14;
-/// Thickness of a split's divider line, in points.
-pub(crate) const SPLIT_LINE: f32 = 1.0;
 
 #[derive(Default, Clone)]
 pub(crate) struct LNode {
@@ -312,18 +310,19 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
         }
         Kind::Stack { children, .. } if split.is_some() && children.len() == 2 => {
             let sp = split.expect("guarded");
+            let line = lx.look.theme.control.border;
             let w = inner.0.unwrap_or(0.0);
             let (panel, main) = (&children[0], &children[1]);
             let (min, max) = (panel.style.min.0, panel.style.max.0.max(panel.style.min.0));
             let open = sp.width.clamp(min, max);
             let collapsed = sp.collapse.as_ref().is_some_and(|c| c.0);
-            let region = lx.spring(id, SLOT_SPLIT, if collapsed { 0.0 } else { open + SPLIT_LINE }).clamp(0.0, w);
+            let region = lx.spring(id, SLOT_SPLIT, if collapsed { 0.0 } else { open + line }).clamp(0.0, w);
             // The panel fills its region, but never narrower than its open width: closing,
             // it slides out whole instead of being squeezed.
-            let pw = open.max(region - SPLIT_LINE);
+            let pw = open.max(region - line);
             let pn = layout(panel, (Some(pw), inner.1), lx, child_id(id, 0, panel.key));
             let mn = layout(main, (Some((w - region).max(0.0)), inner.1), lx, child_id(id, 1, main.key));
-            let (px, mx) = if sp.trailing { (w - region + SPLIT_LINE, 0.0) } else { ((region - SPLIT_LINE - pn.size.0).min(0.0), region) };
+            let (px, mx) = if sp.trailing { (w - region + line, 0.0) } else { ((region - line - pn.size.0).min(0.0), region) };
             let h = inner.1.unwrap_or(pn.size.1.max(mn.size.1));
             node.split = region;
             node.children = vec![pn, mn];

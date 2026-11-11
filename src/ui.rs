@@ -1,7 +1,7 @@
 //! Platform-independent core: owns the app state, rebuilds the view tree,
 //! lays it out, paints it into a `DrawList`, and routes pointer input.
 
-use crate::layout::{child_id, layout, spec_in, LNode, Lx, SLOT_SPLIT, SPLIT_LINE};
+use crate::layout::{child_id, layout, spec_in, LNode, Lx, SLOT_SPLIT};
 use crate::theme::{Look, Theme};
 use crate::text::{TextSpec, TextSystem};
 use crate::types::{Color, Rect};
@@ -647,12 +647,13 @@ impl<S> Painter<'_, S> {
         let (Some(panel), Some(main)) = (it.next(), it.next()) else { return };
         let (pn, mn) = (&ln.children[0], &ln.children[1]);
         let region = ln.split;
+        let line = self.look.theme.control.border;
         let (min, max) = (panel.style.min.0, panel.style.max.0.max(panel.style.min.0));
         let (pid, mid) = (child_id(id, 0, panel.key), child_id(id, 1, main.key));
         // The line is the panel region's inner edge.
-        let line_x = if sp.trailing { cr.x + cr.w - region } else { cr.x + region - SPLIT_LINE };
-        let inner = (region - SPLIT_LINE).max(0.0);
-        let area = Rect::new(if sp.trailing { line_x + SPLIT_LINE } else { cr.x }, cr.y, inner, cr.h);
+        let line_x = if sp.trailing { cr.x + cr.w - region } else { cr.x + region - line };
+        let inner = (region - line).max(0.0);
+        let area = Rect::new(if sp.trailing { line_x + line } else { cr.x }, cr.y, inner, cr.h);
         let mut pxf = xf;
         pxf.clip_to(xf.rect_px(area), 0.0, false);
         self.tbase = tbase;
@@ -665,9 +666,9 @@ impl<S> Painter<'_, S> {
         let t = self.crisp(div, 9, if on { 1.0 } else { 0.0 }).clamp(0.0, 1.0);
         if region > 0.0 {
             let c = self.look.theme.color.divider.lerp(self.look.theme.color.accent, t);
-            self.fill(&xf, Rect::new(line_x, cr.y, SPLIT_LINE.min(region), cr.h), 0.0, Fill::Solid(c), None);
+            self.fill(&xf, Rect::new(line_x, cr.y, line.min(region), cr.h), 0.0, Fill::Solid(c), None);
         }
-        let center = line_x + SPLIT_LINE * 0.5;
+        let center = line_x + line * 0.5;
         let grab = Rect::new(center - SPLIT_GRAB * 0.5, cr.y, SPLIT_GRAB, cr.h).intersect(&cr);
         let scr = xf.rect(cr);
         let hit = SplitHit {
@@ -1985,11 +1986,12 @@ impl<S: 'static> Ui<S> {
             }
         }
         let w = want.clamp(h.min, h.max);
+        let line = self.look.theme.control.border;
         (h.on_resize)(&mut self.state, w);
         // Resting (not still gliding open): the region jumps straight to the new width.
         if let Some(s) = self.springs.get_mut(&(h.id, SLOT_SPLIT)) {
             if (s.x - s.target).abs() < 0.5 {
-                (s.x, s.target, s.v) = (w + SPLIT_LINE, w + SPLIT_LINE, 0.0);
+                (s.x, s.target, s.v) = (w + line, w + line, 0.0);
             }
         }
         true

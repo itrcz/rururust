@@ -174,7 +174,7 @@ pub struct Controls {
     pub tab_radius: f32,
     /// Tint of the glass drop on the selected tab.
     pub tab_drop: Color,
-    /// Hairline around popovers and tooltips.
+    /// Hairline around popovers and tooltips; also the thickness of a `split`'s divider.
     pub border: f32,
     /// Width of the text field focus ring.
     pub focus_ring: f32,

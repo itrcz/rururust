@@ -3036,7 +3036,7 @@ fn settle_split(ui: &mut Ui<Sp>) {
 fn split_drag_resizes_one_to_one_within_min_and_max() {
     let mut ui = split_ui(false);
     assert_eq!(quads(&ui, SIDE)[0], [0.0, 0.0, 300.0, 400.0]);
-    assert_eq!(quads(&ui, MAIN)[0], [301.0, 0.0, 499.0, 400.0], "the main area starts after the 1 pt line");
+    assert_eq!(quads(&ui, MAIN)[0], [301.0, 0.0, 499.0, 400.0], "the main area starts after the hairline (0.5 pt, on the grid)");
     // Grabbed 0.5 pt right of the line's left edge: the line keeps that offset to the pointer.
     ui.pointer_move((300.5, 200.0));
     ui.frame((800.0, 400.0));
@@ -3135,7 +3135,7 @@ fn split_divider_lights_up_on_hover_and_double_click_resets() {
 fn split_toggled_by_state_glides_and_trailing_panel_sits_right() {
     let mut ui = split_ui(true);
     assert_eq!(quads(&ui, SIDE)[0], [500.0, 0.0, 300.0, 400.0]);
-    assert_eq!(quads(&ui, MAIN)[0], [0.0, 0.0, 499.0, 400.0]);
+    assert_eq!(quads(&ui, MAIN)[0], [0.0, 0.0, 500.0, 400.0], "499.5 wide, on the pixel grid");
     // Dragging the line left widens a panel on the right.
     ui.pointer_down((499.5, 200.0), false);
     ui.pointer_move((449.5, 200.0));
