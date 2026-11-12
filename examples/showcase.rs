@@ -25,6 +25,7 @@ struct Icons {
     plus: Image,
     send: Image,
     menu: Image,
+    chevron: Image,
 }
 
 struct Demo {
@@ -95,6 +96,7 @@ fn icons() -> Icons {
         plus: svg("M11 5h2v6h6v2h-6v6h-2v-6H5v-2h6z"),
         send: svg("M12 4l7 7-1.4 1.4L13 7.8V20h-2V7.8l-4.6 4.6L5 11z"),
         menu: svg("M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"),
+        chevron: svg("M9.4 5 8 6.4l5.6 5.6L8 17.6 9.4 19l7-7z"),
     }
 }
 
@@ -445,6 +447,35 @@ fn forms(s: &Demo, t: &Theme) -> View<Demo> {
             field(t, "NOTES", text_field(s.notes.as_str(), "Notes (Enter starts a new line)", |s: &mut Demo, v| s.notes = v).max_lines(4)),
             field(t, "CITY", picker(&CITIES, s.city, |s: &mut Demo, i| s.city = i).fill_width()),
             button("Clear", |s: &mut Demo| s.name.clear()).fill_width(),
+        ))
+        .spacing(16.0)
+        .padding(20.0),
+        // Button looks, icon buttons (a tooltip, a round one, a turning chevron) and progress.
+        card(s, (
+            hstack((
+                button("Save", |s: &mut Demo| toast(s, "Saved")).flex(1.0),
+                button("Cancel", |s: &mut Demo| s.name.clear()).secondary().flex(1.0),
+                button("Skip", |_: &mut Demo| {}).plain().flex(1.0),
+            ))
+            .spacing(10.0)
+            .fill_width(),
+            hstack((
+                icon_button(&s.icons.heart, |s: &mut Demo| toast(s, "Liked")).tooltip("Like"),
+                icon_button(&s.icons.plus, |s: &mut Demo| s.drift = if s.drift >= 1.0 { 0.0 } else { (s.drift + 0.25).min(1.0) })
+                    .tooltip_shortcut("Progress", "⌘+"),
+                icon_button(&s.icons.send, |s: &mut Demo| toast(s, "Sent"))
+                    .size(34.0, 34.0)
+                    .radius(17.0)
+                    .background(t.color.accent)
+                    .color(t.color.on_accent)
+                    .hover_color(t.color.on_accent),
+                icon_button(&s.icons.chevron, |s: &mut Demo| s.focus = !s.focus).rotation(if s.focus { 90.0 } else { 0.0 }).tooltip("Expand"),
+                spacer(),
+                progress_ring(s.drift),
+            ))
+            .spacing(8.0)
+            .fill_width(),
+            progress_bar(s.drift),
         ))
         .spacing(16.0)
         .padding(20.0),
