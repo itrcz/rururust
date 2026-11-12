@@ -1,7 +1,7 @@
 //! Platform-independent core: owns the app state, rebuilds the view tree,
 //! lays it out, paints it into a `DrawList`, and routes pointer input.
 
-use crate::layout::{child_id, layout, spec_in, LNode, Lx, SLOT_SPLIT};
+use crate::layout::{child_id, layout, spec_in, LNode, Lx};
 use crate::theme::{Look, Theme};
 use crate::text::{TextSpec, TextSystem};
 use crate::types::{Color, Rect};
@@ -132,6 +132,67 @@ impl Spring {
     fn moving(&self) -> bool {
         self.x != self.target || self.v != 0.0
     }
+}
+
+/// Spring slots: a node keeps its springs under `(id, slot)`. Every animated value of a
+/// node has its own slot here, so two effects on one view never drive the same spring.
+pub(crate) mod slot {
+    /// Press feedback of a tappable view.
+    pub const PRESS: u8 = 0;
+    /// Toggle knob position.
+    pub const TOGGLE: u8 = 1;
+    /// Toggle and slider knob swelling while held.
+    pub const CONTROL_PRESS: u8 = 2;
+    /// Focus ring of a text field.
+    pub const FOCUS: u8 = 3;
+    /// Opening of the picker drop-down (on the picker's id).
+    pub const PICKER_MENU: u8 = 4;
+    /// Tab bar drop: position and swelling while held.
+    pub const TAB_DROP: u8 = 5;
+    pub const TAB_HELD: u8 = 6;
+    /// Fade of a layer (popover, menu, tooltip) or a modal.
+    pub const FADE: u8 = 7;
+    /// Scroll bar visibility.
+    pub const BAR_SHOW: u8 = 8;
+    /// `.hover()` / `.hover_color()` highlight (also a split divider's, on its own id).
+    pub const HOVER: u8 = 9;
+    /// `.animate()` size, and the last target it was laid out at (layout).
+    pub const W: u8 = 10;
+    pub const H: u8 = 11;
+    pub const LAST_W: u8 = 12;
+    pub const LAST_H: u8 = 13;
+    /// Width of a split's panel region (layout and paint).
+    pub const SPLIT: u8 = 14;
+    /// `.reveal()` progress.
+    pub const REVEAL: u8 = 15;
+    /// `.animate_radius()`.
+    pub const RADIUS: u8 = 16;
+    /// `.text_cursor()` size.
+    pub const CURSOR: u8 = 17;
+    /// `.hover_offset()` amount.
+    pub const HOVER_OFFSET: u8 = 18;
+    /// Sheet, drawer and snackbar entrance.
+    pub const OVERLAY: u8 = 19;
+    /// Scroll bar widening under the pointer.
+    pub const BAR_WIDE: u8 = 20;
+    /// A split's resize grip while dragged (on the divider's id).
+    pub const DIVIDER_HELD: u8 = 21;
+}
+
+/// The spring of `(id, slot)`: made at `initial` with `params` the first time it is seen,
+/// then aimed at `target` (or snapped there while the window resizes) and kept this frame.
+pub(crate) fn spring_with<'a>(
+    springs: &'a mut HashMap<(u64, u8), Spring>,
+    (frame, resizing): (u64, bool),
+    (id, slot): (u64, u8),
+    initial: f32,
+    target: f32,
+    params: (f32, f32),
+) -> &'a mut Spring {
+    let s = springs.entry((id, slot)).or_insert(Spring::new(initial, target, params));
+    if resizing { s.snap_to(target); } else { s.target = target; }
+    s.used = frame;
+    s
 }
 
 #[derive(Clone, Copy, Default)]
@@ -737,7 +798,7 @@ impl<S> Painter<'_, S> {
         let div = id ^ SPLIT_SALT;
         let hidden = sp.hide_collapsed_divider && sp.collapse.as_ref().is_some_and(|c| c.0);
         let on = self.split_drag == Some(id) || self.hovered.contains(&div);
-        let t = if hidden { 0.0 } else { self.crisp(div, 9, if on { 1.0 } else { 0.0 }).clamp(0.0, 1.0) };
+        let t = if hidden { 0.0 } else { self.crisp(div, slot::HOVER, if on { 1.0 } else { 0.0 }).clamp(0.0, 1.0) };
         if hidden { main.style.border_hidden |= if sp.trailing { 2 } else { 8 }; }
         if sp.highlight_main_border && !hidden {
             let (width, color) = main.style.border.unwrap_or((line, self.look.theme.color.divider));
@@ -756,7 +817,7 @@ impl<S> Painter<'_, S> {
         let center = line_x + line * 0.5;
         if sp.resize_grip && region > 0.0 {
             let (width, resting, hovered) = self.look.theme.control.split_grip;
-            let held = self.crisp(div, 10, if self.split_drag == Some(id) { 1.0 } else { 0.0 }).clamp(0.0, 1.0);
+            let held = self.crisp(div, slot::DIVIDER_HELD, if self.split_drag == Some(id) { 1.0 } else { 0.0 }).clamp(0.0, 1.0);
             let w = width * (1.0 + 0.15 * t);
             let h = (resting + (hovered-resting)*t + hovered*0.15*held).min(cr.h);
             let grip_y = sp.grip_bottom.map_or((cr.h-h)*0.5, |inset| (cr.h-inset-h*0.5).clamp(0.0,(cr.h-h).max(0.0)));
@@ -876,10 +937,13 @@ impl<S> Painter<'_, S> {
 
     /// Spring that starts from `initial` the first time it is seen (appear animations).
     fn spring_from(&mut self, id: u64, slot: u8, initial: f32, target: f32) -> f32 {
-        let s = self.springs.entry((id, slot)).or_insert(Spring::new(initial, target, self.look.theme.motion.bouncy));
-        if self.resizing { s.snap_to(target); } else { s.target = target; }
-        s.used = self.frame;
-        s.x
+        let bouncy = self.look.theme.motion.bouncy;
+        self.spring_with(id, slot, initial, target, bouncy).x
+    }
+
+    /// [`spring_with`] on this frame's springs.
+    pub(super) fn spring_with(&mut self, id: u64, slot: u8, initial: f32, target: f32, params: (f32, f32)) -> &mut Spring {
+        spring_with(self.springs, (self.frame, self.resizing), (id, slot), initial, target, params)
     }
 
     /// iOS-style activity indicator; `progress` < 1 shows it filling up while pulling.
@@ -919,11 +983,7 @@ impl<S> Painter<'_, S> {
         let (y, down) = if below + h <= size.1 - 8.0 { (below, true) } else { ((m.anchor.y - h - 6.0).max(8.0), false) };
 
         // The menu grows out of the control it belongs to.
-        let frame = self.frame;
-        let s = self.springs.entry((m.id, 4)).or_insert(Spring::new(0.0, 1.0, theme.motion.bouncy));
-        if self.resizing { s.snap_to(1.0); }
-        s.used = frame;
-        let t = s.x;
+        let t = self.spring_with(m.id, slot::PICKER_MENU, 0.0, 1.0, theme.motion.bouncy).x;
         let k = 0.8 + 0.2 * t;
         let (ax, ay) = (m.anchor.x + m.anchor.w * 0.5, if down { y } else { y + h });
         let xf = Xf {
@@ -963,24 +1023,21 @@ impl<S> Painter<'_, S> {
     }
 
     fn spring(&mut self, id: u64, slot: u8, target: f32) -> f32 {
-        let s = self.springs.entry((id, slot)).or_insert(Spring::new(target, target, self.look.theme.motion.bouncy));
-        if self.resizing { s.snap_to(target); } else { s.target = target; }
-        s.used = self.frame;
-        s.x
+        let bouncy = self.look.theme.motion.bouncy;
+        self.spring_with(id, slot, target, target, bouncy).x
     }
 
     /// A spring without overshoot, for press feedback.
     fn crisp(&mut self, id: u64, slot: u8, target: f32) -> f32 {
-        let s = self.springs.entry((id, slot)).or_insert(Spring::new(target, target, self.look.theme.motion.crisp));
-        if self.resizing { s.snap_to(target); } else { s.target = target; }
-        s.used = self.frame;
-        s.x
+        let crisp = self.look.theme.motion.crisp;
+        self.spring_with(id, slot, target, target, crisp).x
     }
 
     /// Like `spring`, but also returns the current velocity.
     fn spring_v(&mut self, id: u64, slot: u8, target: f32) -> (f32, f32) {
-        let x = self.spring(id, slot, target);
-        (x, self.springs[&(id, slot)].v)
+        let bouncy = self.look.theme.motion.bouncy;
+        let s = self.spring_with(id, slot, target, target, bouncy);
+        (s.x, s.v)
     }
 
     fn quad(&mut self, xf: &Xf, r: Rect, radius: f32, kind: f32) -> Quad {
@@ -1083,7 +1140,7 @@ impl<S> Painter<'_, S> {
         let pin = self.sticky;
         let tbase = std::mem::take(&mut self.tbase);
         let mut st = v.style;
-        if st.animate_radius { st.radius = self.crisp(id, 16, st.radius.max(0.0)).max(0.0); }
+        if st.animate_radius { st.radius = self.crisp(id, slot::RADIUS, st.radius.max(0.0)).max(0.0); }
         xf.shape_sq = st.square_corners;
         xf.border_hidden = st.border_hidden;
         let r = Rect::new(origin.0 + ln.pos.0, origin.1 + ln.pos.1, ln.size.0, ln.size.1);
@@ -1091,7 +1148,7 @@ impl<S> Painter<'_, S> {
         xf.text_reveal = st.text_reveal.or(xf.text_reveal);
         if st.hover_scope { xf.hover_scope=Some(self.hovered.contains(&id)); }
         if let Some((x,y))=st.hover_offset {
-            let amount=self.crisp(id,18,if xf.hover_scope.unwrap_or(false) {1.0}else{0.0});
+            let amount=self.crisp(id,slot::HOVER_OFFSET,if xf.hover_scope.unwrap_or(false) {1.0}else{0.0});
             xf.tx+=x*amount*xf.s;xf.ty+=y*amount*xf.s;
         }
         if let Some(fg) = st.fg {
@@ -1099,8 +1156,7 @@ impl<S> Painter<'_, S> {
         }
 
         if let Some(shown) = st.reveal {
-            // Slot 15 is reserved for visibility, independently of control and layout springs.
-            let progress = self.spring(id, 15, if shown { 1.0 } else { 0.0 });
+            let progress = self.spring(id, slot::REVEAL, if shown { 1.0 } else { 0.0 });
             let scale = 0.5 + 0.5 * progress.max(0.0);
             let (cx, cy) = (r.x + r.w * 0.5, r.y + r.h * 0.5);
             xf.tx += cx * (1.0 - scale) * xf.s;
@@ -1115,7 +1171,7 @@ impl<S> Painter<'_, S> {
         let anchor = xf.rect_px(r);
         // Press feedback: a quick, quiet dim with a barely-there squeeze. No bounce.
         if v.on_tap.is_some() || v.on_double_tap.is_some() || tap_menu {
-            let p = self.crisp(id, 0, if self.pressed == Some(id) { 1.0 } else { 0.0 });
+            let p = self.crisp(id, slot::PRESS, if self.pressed == Some(id) { 1.0 } else { 0.0 });
             let k = 1.0 - (1.0 - st.press_scale) * p;
             let (cx, cy) = (r.x + r.w * 0.5, r.y + r.h * 0.5);
             xf.tx += cx * (1.0 - k) * xf.s;
@@ -1181,7 +1237,7 @@ impl<S> Painter<'_, S> {
             self.zone(&xf, id, sr, cursor);
         }
         if st.hover.is_some() || st.hover_fg.is_some() {
-            let t = self.crisp(id, 9, if self.hovered.contains(&id) { 1.0 } else { 0.0 }).clamp(0.0, 1.0);
+            let t = self.crisp(id, slot::HOVER, if self.hovered.contains(&id) { 1.0 } else { 0.0 }).clamp(0.0, 1.0);
             if let Some(c) = st.hover.filter(|_| t > 0.004) {
                 self.fill(&xf, r, st.radius, Fill::Solid(c.alpha(c.a * t)), None);
             }
@@ -1331,7 +1387,7 @@ impl<S> Painter<'_, S> {
             Kind::Overlay { open, mode, child, on_dismiss, style } => {
                 let target = if open { 1.0 } else { 0.0 };
                 let t = if mode == OverlayMode::Modal { self.fade(id, target) }
-                    else { self.spring_from(id, 7, 0.0, target) };
+                    else { self.spring_from(id, slot::OVERLAY, 0.0, target) };
                 if t <= 0.004 && !open {
                     return;
                 }
@@ -1404,8 +1460,8 @@ impl<S> Painter<'_, S> {
                 } else {
                     center(selected)
                 };
-                let (cx, vel) = self.spring_v(id, 5, target);
-                let p = self.spring(id, 6, if held { 1.0 } else { 0.0 });
+                let (cx, vel) = self.spring_v(id, slot::TAB_DROP, target);
+                let p = self.spring(id, slot::TAB_HELD, if held { 1.0 } else { 0.0 });
                 // Liquid: it swells when grabbed and stretches along its motion.
                 let stretch = (vel.abs() * 0.035).min(tab_w * 0.6);
                 let lw = tab_w * (1.0 + 0.14 * p) + stretch;
@@ -1517,7 +1573,7 @@ impl<S> Painter<'_, S> {
                     let at=(pos.0+(x+cursor.gap)*scale,pos.1+y*scale);
                     let area=Rect::new(at.0,at.1,cursor.reserve*scale,height*scale);
                     if area.intersects(&clip) && xf.opacity>0.0 {
-                        let size=self.crisp(id,17,target).max(0.0);
+                        let size=self.crisp(id,slot::CURSOR,target).max(0.0);
                         let pose=cursor::pose(self.time,cursor.cycle_period,cursor.transition_duration);
                         self.spin|=pose.animate;
                         if let Some(delay)=pose.wake {self.wake=Some(self.wake.map_or(delay,|wake|wake.min(delay)));}
@@ -1650,8 +1706,8 @@ impl<S> Painter<'_, S> {
                 if show && indicator == Indicator::Auto && !near && !grabbed {
                     self.wake = Some(self.wake.map_or(1.22 - idle, |w| w.min(1.22 - idle)));
                 }
-                let a = self.spring(id, 8, if show { 1.0 } else { 0.0 }).clamp(0.0, 1.0);
-                let wide = self.crisp(id, 9, if show && (near || grabbed) { 1.0 } else { 0.0 }).clamp(0.0, 1.0);
+                let a = self.spring(id, slot::BAR_SHOW, if show { 1.0 } else { 0.0 }).clamp(0.0, 1.0);
+                let wide = self.crisp(id, slot::BAR_WIDE, if show && (near || grabbed) { 1.0 } else { 0.0 }).clamp(0.0, 1.0);
                 let (it, ib) = bar_insets;
                 let ib=ib+ln.children.get(1).map_or(0.0,|overlay|overlay.size.1);
                 let (by, bh) = (r.y + it, (r.h - it - ib).max(0.0));
@@ -1692,8 +1748,8 @@ impl<S> Painter<'_, S> {
             }
             Kind::Toggle(on, f) => {
                 let r = cr;
-                let t = self.spring(id, 1, if on { 1.0 } else { 0.0 });
-                let p = self.spring(id, 2, if self.pressed == Some(id) { 1.0 } else { 0.0 });
+                let t = self.spring(id, slot::TOGGLE, if on { 1.0 } else { 0.0 });
+                let p = self.spring(id, slot::CONTROL_PRESS, if self.pressed == Some(id) { 1.0 } else { 0.0 });
                 let theme = &*self.look.theme;
                 let (knob_c, knob_sh) = (theme.control.knob, theme.shadow.control);
                 let track = theme.color.fill_strong.lerp(theme.toggle_on(), t.clamp(0.0, 1.0));
@@ -1715,7 +1771,7 @@ impl<S> Painter<'_, S> {
             Kind::Slider(value, steps, f, style) => {
                 let st = style.map_or(self.look.slider, |b| *b);
                 let r = cr;
-                let p = self.spring(id, 2, if self.pressed == Some(id) { 1.0 } else { 0.0 });
+                let p = self.spring(id, slot::CONTROL_PRESS, if self.pressed == Some(id) { 1.0 } else { 0.0 });
                 let knob_d = st.knob_size;
                 let range = (r.w - knob_d).max(1.0);
                 let cy = r.y + r.h * 0.5;
@@ -1943,7 +1999,7 @@ impl<S: 'static> Ui<S> {
     pub fn frame(&mut self, size: (f32, f32)) {
         // Dependent animated layout follows direct split drags just like window resizing.
         let dragging_split = self.split_drag.as_ref().is_some_and(|d| !d.collapsed
-            && self.springs.get(&(d.hit.id, SLOT_SPLIT)).is_some_and(|s| s.target > 0.0 && (s.x - s.target).abs() < 0.5));
+            && self.springs.get(&(d.hit.id, slot::SPLIT)).is_some_and(|s| s.target > 0.0 && (s.x - s.target).abs() < 0.5));
         let resizing = self.resizing || dragging_split || (self.frame > 0 && self.size != size);
         // Updates sent through `Link`s from background work.
         self.pump();
@@ -2338,7 +2394,7 @@ impl<S: 'static> Ui<S> {
         let line = self.look.theme.control.border;
         (h.on_resize)(&mut self.state, w);
         // Resting (not still gliding open): the region jumps straight to the new width.
-        if let Some(s) = self.springs.get_mut(&(h.id, SLOT_SPLIT)) {
+        if let Some(s) = self.springs.get_mut(&(h.id, slot::SPLIT)) {
             if (s.x - s.target).abs() < 0.5 {
                 (s.x, s.target, s.v) = (w + line, w + line, 0.0);
             }
@@ -2601,8 +2657,8 @@ impl<S: 'static> Ui<S> {
             },
             Action::Toggle(on, f) => f(&mut self.state, !on),
             Action::OpenMenu => {
-                self.springs.remove(&(id, 4)); // replay the opening animation
-                self.springs.remove(&(popup::pop_id(id), popup::SLOT_FADE));
+                self.springs.remove(&(id, slot::PICKER_MENU)); // replay the opening animation
+                self.springs.remove(&(popup::pop_id(id), slot::FADE));
                 self.open_menu = Some(id);
             }
             Action::Dismiss => self.open_menu = None,

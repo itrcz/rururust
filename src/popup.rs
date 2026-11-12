@@ -6,18 +6,13 @@
 //! all layers after the tree, so they are on top in both pixels and input order.
 
 use super::select::TextCtx;
-use super::{Action, Hit, Painter, Spring, Ui, Xf, Zone, NO_ROUND};
+use super::{slot, Action, Hit, Painter, Ui, Xf, Zone, NO_ROUND};
 use crate::layout::{child_id, LNode, Lx};
 use crate::text::TextSpec;
 use crate::types::{Color, Rect};
 use crate::view::{Align, Fill, Glass, Image, Kind, Mods, Shadow, View, Weight};
 use crate::KeyInput;
 use std::rc::Rc;
-
-/// Spring slot of a layer's fade (on the layer's own id).
-pub(crate) const SLOT_FADE: u8 = 7;
-/// Quick and without overshoot: a layer is fully in after ~120 ms.
-const FADE: (f32, f32) = (1600.0, 80.0);
 
 /// Id of the popover attached to the view `id`, and of its tooltip.
 pub(crate) fn pop_id(id: u64) -> u64 {
@@ -543,10 +538,8 @@ pub(crate) struct LayerCtx<S> {
 
 impl<S> Painter<'_, S> {
     pub(super) fn fade(&mut self, id: u64, target: f32) -> f32 {
-        let s = self.springs.entry((id, SLOT_FADE)).or_insert(Spring::new(0.0, target, FADE));
-        if self.resizing { s.snap_to(target); } else { s.target = target; }
-        s.used = self.frame;
-        s.x
+        let fade = self.look.theme.motion.fade;
+        self.spring_with(id, slot::FADE, 0.0, target, fade).x
     }
 
     /// Paints queued layers, then the layers they open (submenus, popovers inside popovers),
@@ -865,7 +858,7 @@ impl<S: 'static> Ui<S> {
                     return true;
                 }
                 &Action::Secondary(None, id) => {
-                    self.springs.remove(&(pop_id(id), SLOT_FADE)); // replay the fade
+                    self.springs.remove(&(pop_id(id), slot::FADE)); // replay the fade
                     self.open_menu = Some(id);
                     self.ctx_at = pos;
                     return true;

@@ -212,7 +212,19 @@ pub struct Motion {
     pub crisp: (f32, f32),
     /// Unhurried, no overshoot: `.animate()` sizes.
     pub smooth: (f32, f32),
+    /// Very quick, no overshoot: popovers, menus, tooltips and modals fade in (~120 ms).
+    pub fade: (f32, f32),
     pub tip_delay: f32,
+    /// Scale a tappable view shrinks to while pressed (`.press_scale()` overrides it).
+    pub press_scale: f32,
+    /// Opacity of a tappable view while pressed (`.press_opacity()` overrides it).
+    pub press_opacity: f32,
+    /// Scale a `.reveal()`ed view grows from (and shrinks to when hidden).
+    pub reveal_scale: f32,
+    /// Scale a popover, menu or tooltip grows from while it fades in.
+    pub popup_scale: f32,
+    /// Seconds a `.hover_marquee()` label takes to glide back when the pointer leaves.
+    pub marquee_return: f32,
 }
 
 const fn ts(size: f32, weight: Weight) -> TextStyle {
@@ -309,7 +321,18 @@ impl Theme {
                 tip: Shadow::new(Color::BLACK.alpha(0.3), 14.0, 4.0),
                 bar: Shadow::new(Color::BLACK.alpha(0.35), 30.0, 10.0),
             },
-            motion: Motion { bouncy: (380.0, 28.0), crisp: (900.0, 60.0), smooth: (260.0, 32.25), tip_delay: 0.5 },
+            motion: Motion {
+                bouncy: (380.0, 28.0),
+                crisp: (900.0, 60.0),
+                smooth: (260.0, 32.25),
+                fade: (1600.0, 80.0),
+                tip_delay: 0.5,
+                press_scale: 0.98,
+                press_opacity: 0.7,
+                reveal_scale: 0.5,
+                popup_scale: 0.94,
+                marquee_return: 0.18,
+            },
             glass: Glass::regular(),
             glass_menu: Glass::frosted(),
             menu: None,

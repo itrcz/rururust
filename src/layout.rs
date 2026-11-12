@@ -3,7 +3,7 @@
 
 use crate::text::{TextSpec, TextSystem};
 use crate::theme::Look;
-use crate::ui::Spring;
+use crate::ui::{slot, Spring};
 use crate::view::{Align, Axis, Dim, Kind, OverlayMode, Truncate, View};
 use std::collections::HashMap;
 
@@ -33,10 +33,7 @@ pub(crate) struct Lx<'a> {
 
 impl Lx<'_> {
     fn spring(&mut self, id: u64, slot: u8, target: f32) -> f32 {
-        let s = self.springs.entry((id, slot)).or_insert(Spring::new(target, target, self.look.theme.motion.smooth));
-        if self.resizing { s.snap_to(target); } else { s.target = target; }
-        s.used = self.frame;
-        s.x
+        crate::ui::spring_with(self.springs, (self.frame, self.resizing), (id, slot), target, target, self.look.theme.motion.smooth).x
     }
     /// A value kept between frames (a spring that never moves).
     fn keep(&mut self, id: u64, slot: u8, value: Option<f32>) -> f32 {
@@ -52,14 +49,6 @@ impl Lx<'_> {
 pub(crate) fn spec_in<'a>(ts: &crate::theme::TextStyle, text: &'a str) -> TextSpec<'a> {
     TextSpec { spans: &[], text, size: ts.size, weight: ts.weight as u16, line_height: ts.line_height, tracking: ts.tracking, ..Default::default() }
 }
-
-/// Spring slots used by layout (paint uses 0..=9).
-const SLOT_W: u8 = 10;
-const SLOT_H: u8 = 11;
-const SLOT_LAST_W: u8 = 12;
-const SLOT_LAST_H: u8 = 13;
-/// A split's side region (panel + divider) on screen; input sets it directly while dragging.
-pub(crate) const SLOT_SPLIT: u8 = 14;
 
 #[derive(Default, Clone)]
 pub(crate) struct LNode {
@@ -144,7 +133,7 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
     // so the content slides out of view instead of being squeezed.
     let mut last = (0.0f32, 0.0f32);
     if st.animate {
-        last = (lx.keep(id, SLOT_LAST_W, None), lx.keep(id, SLOT_LAST_H, None));
+        last = (lx.keep(id, slot::LAST_W, None), lx.keep(id, slot::LAST_H, None));
         if ow == Some(0.0) && last.0 > 0.0 {
             ow = Some(last.0);
         }
@@ -346,7 +335,7 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
             let (min, max) = (panel.style.min.0, panel.style.max.0.max(panel.style.min.0));
             let open = sp.width.clamp(min, max);
             let collapsed = sp.collapse.as_ref().is_some_and(|c| c.0);
-            let region = lx.spring(id, SLOT_SPLIT, if collapsed { 0.0 } else { open + line }).clamp(0.0, w);
+            let region = lx.spring(id, slot::SPLIT, if collapsed { 0.0 } else { open + line }).clamp(0.0, w);
             // The panel fills its region, but never narrower than its open width: closing,
             // it slides out whole instead of being squeezed.
             let pw = open.max(region - line);
@@ -438,21 +427,21 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
     if st.animate {
         let target = node.size;
         if target.0 > 0.0 {
-            lx.keep(id, SLOT_LAST_W, Some(target.0));
+            lx.keep(id, slot::LAST_W, Some(target.0));
         } else if last.0 > 0.0 {
             laid.0 = last.0;
         }
         if target.1 > 0.0 {
-            lx.keep(id, SLOT_LAST_H, Some(target.1));
+            lx.keep(id, slot::LAST_H, Some(target.1));
         } else if last.1 > 0.0 {
             laid.1 = last.1;
         }
         // A size that follows the parent (fill) tracks window resizes directly.
         if dim_w != Dim::Fill {
-            node.size.0 = lx.spring(id, SLOT_W, target.0).max(0.0);
+            node.size.0 = lx.spring(id, slot::W, target.0).max(0.0);
         }
         if dim_h != Dim::Fill {
-            node.size.1 = lx.spring(id, SLOT_H, target.1).max(0.0);
+            node.size.1 = lx.spring(id, slot::H, target.1).max(0.0);
         }
         node.clip = (node.size.0 - laid.0).abs() > 0.25 || (node.size.1 - laid.1).abs() > 0.25;
     }
@@ -502,9 +491,9 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
 /// A popover or tooltip is laid out right after its anchor, at its natural size, but only
 /// while it is open or still fading out.
 fn layout_attached<S>(x: &crate::view::Extras<S>, lx: &mut Lx, id: u64, node: &mut LNode) {
-    use crate::ui::popup::{pop_id, tip_id, SLOT_FADE};
+    use crate::ui::popup::{pop_id, tip_id};
     use crate::view::Opens;
-    let fading = |lx: &Lx, lid: u64| lx.springs.get(&(lid, SLOT_FADE)).is_some_and(|s| s.x > 0.004);
+    let fading = |lx: &Lx, lid: u64| lx.springs.get(&(lid, slot::FADE)).is_some_and(|s| s.x > 0.004);
     if let Some(p) = &x.pop {
         let open = match &p.opens {
             Opens::State(open, _) => *open,

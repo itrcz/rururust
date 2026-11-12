@@ -676,7 +676,7 @@ impl<S> Painter<'_, S> {
         let focused = self.focus == Some(id);
         if !f.plain {
             // A thin ring that fades in without overshoot.
-            let k = self.crisp(id, 3, if focused { 1.0 } else { 0.0 }).clamp(0.0, 1.0);
+            let k = self.crisp(id, super::slot::FOCUS, if focused { 1.0 } else { 0.0 }).clamp(0.0, 1.0);
             let focus = self.look.theme.color.focus;
             if k > 0.01 {
                 self.fill(&xf, r, st.radius, Fill::Solid(Color::CLEAR), Some((self.look.theme.control.focus_ring, focus.alpha(focus.a * k))));

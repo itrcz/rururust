@@ -2169,6 +2169,25 @@ fn settle_bar(ui: &mut Ui<()>) {
 }
 
 #[test]
+fn scroll_hover_and_its_bar_widening_are_separate_springs() {
+    let tint = Color::RED.alpha(0.5);
+    let mut ui = Ui::new((), move |_: &()| {
+        let rows = list(60, 40.0, |i| text(format!("row {i}")).fill_width().height(40.0));
+        scroll(rows).indicator(Indicator::Always).hover(tint)
+    });
+    ui.frame((300.0, 400.0));
+    ui.pointer_move((150.0, 200.0));
+    settle_bar(&mut ui);
+    assert_eq!(quads(&ui, tint).len(), 1, "hovering the content tints the scroll view");
+    let t = thumb(&ui).expect("always shown");
+    assert!(t[2] < 8.0, "the hover does not widen the bar: {t:?}");
+    ui.pointer_move((294.0, 200.0));
+    settle_bar(&mut ui);
+    assert!(thumb(&ui).expect("shown")[2] > 8.0, "the bar widens under the pointer");
+    assert_eq!(quads(&ui, tint).len(), 1, "and the view stays tinted, not flickering with the bar");
+}
+
+#[test]
 fn scroll_bar_shows_on_hover_at_the_edge_and_widens() {
     let mut ui = bar_ui();
     settle_bar(&mut ui);
