@@ -45,6 +45,7 @@ struct Demo {
     tab: usize,
     name: String,
     notes: String,
+    password: String,
     city: usize,
     photos: Vec<Image>,
     icons: Rc<Icons>,
@@ -445,6 +446,7 @@ fn forms(s: &Demo, t: &Theme) -> View<Demo> {
             text(hello).font_size(20.0).weight(Weight::Semibold).centered(),
             field(t, "NAME", text_field(s.name.as_str(), "Your name", |s: &mut Demo, v| s.name = v)),
             field(t, "NOTES", text_field(s.notes.as_str(), "Notes (Enter starts a new line)", |s: &mut Demo, v| s.notes = v).max_lines(4)),
+            field(t, "PASSWORD", text_field(s.password.as_str(), "Tab moves between fields", |s: &mut Demo, v| s.password = v).secure()),
             field(t, "CITY", picker(&CITIES, s.city, |s: &mut Demo, i| s.city = i).fill_width()),
             button("Clear", |s: &mut Demo| s.name.clear()).fill_width(),
         ))
@@ -453,7 +455,10 @@ fn forms(s: &Demo, t: &Theme) -> View<Demo> {
         // Button looks, icon buttons (a tooltip, a round one, a turning chevron) and progress.
         card(s, (
             hstack((
-                button("Save", |s: &mut Demo| toast(s, "Saved")).flex(1.0),
+                button("Save", |s: &mut Demo| toast(s, "Saved"))
+                    .disabled(s.password.is_empty())
+                    .tooltip("Needs a password")
+                    .flex(1.0),
                 button("Cancel", |s: &mut Demo| s.name.clear()).secondary().flex(1.0),
                 button("Skip", |_: &mut Demo| {}).plain().flex(1.0),
             ))
@@ -635,6 +640,7 @@ impl Demo {
             tab: 0,
             name: String::new(),
             notes: String::new(),
+            password: String::new(),
             city: 0,
             photos: (0..7).map(|i| plasma(i as f32 * 1.3 + 0.4)).collect(),
             icons: Rc::new(icons()),

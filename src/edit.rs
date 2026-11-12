@@ -11,6 +11,7 @@ use crate::text::{TextSpec, TextSystem};
 use crate::types::{Color, Rect};
 use crate::view::{Fill, Kind, Mods, Style, View};
 use crate::KeyInput;
+use std::borrow::Cow;
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 use web_time::Instant;
@@ -47,6 +48,8 @@ pub(crate) struct Field<S> {
     pub plain: bool,
     /// Placeholder color; the text color at 40 % when unset.
     pub placeholder_color: Option<Color>,
+    /// `.secure()`: shown and shaped as bullets, never copied.
+    pub secure: bool,
 }
 
 impl<S> Field<S> {
@@ -68,6 +71,7 @@ impl<S> Field<S> {
             max_lines: 1,
             plain: false,
             placeholder_color: None,
+            secure: false,
         }
     }
 
@@ -159,6 +163,17 @@ impl<S> View<S> {
         if let Some(field) = self.field() { field.on_cancel = Some(Box::new(f)); }
         self
     }
+    /// Text field for a password or token: every character is shown as `•`, Copy and Cut
+    /// do nothing, word moves jump to the ends and a double click selects everything. Typing,
+    /// paste, undo and IME edit the real value. The real text is never shaped or measured.
+    ///
+    /// ```ignore
+    /// text_field(&s.token, "Token", |s, v| s.token = v).secure()
+    /// ```
+    pub fn secure(mut self) -> Self {
+        if let Some(f) = self.field() { f.secure = true; }
+        self
+    }
     /// Text field without its own look: no background, padding, corners or focus ring.
     /// Put it in a container styled the way the app needs (e.g. a chat composer).
     ///
@@ -188,6 +203,21 @@ fn spec(text: &str, size: f32, line_height: f32, tracking: f32, weight: u16) -> 
     TextSpec { spans: &[], text, size, weight, center: false, line_height, tracking, ..Default::default() }
 }
 
+const BULLET: char = '•';
+
+/// What the field shapes: its value, or one bullet per char of it when secure.
+fn shown(v: &str, secure: bool) -> Cow<'_, str> {
+    if secure { Cow::Owned(std::iter::repeat_n(BULLET, v.chars().count()).collect()) } else { Cow::Borrowed(v) }
+}
+/// Byte offset `i` of the value → byte offset in the shown text.
+fn to_shown(v: &str, secure: bool, i: usize) -> usize {
+    if secure { v[..floor_char(v, i)].chars().count() * BULLET.len_utf8() } else { i }
+}
+/// Byte offset in the shown text → byte offset of the value.
+fn from_shown(v: &str, secure: bool, m: usize) -> usize {
+    if secure { v.char_indices().nth(m / BULLET.len_utf8()).map_or(v.len(), |(k, _)| k) } else { floor_char(v, m) }
+}
+
 fn wrap_at(multi: bool, w: f32) -> Option<f32> {
     multi.then_some(w.max(1.0))
 }
@@ -196,12 +226,13 @@ fn wrap_at(multi: bool, w: f32) -> Option<f32> {
 /// needs, up to `max_lines`.
 pub(crate) fn layout_field<S>(f: &Field<S>, width: Option<f32>, ts: &mut TextSystem, node: &mut LNode) -> (f32, f32) {
     let w = if f.intrinsic && f.max_lines == 1 {
-        let label = if f.value.is_empty() { &f.placeholder } else { &f.value };
+        let value = shown(&f.value, f.secure);
+        let label = if f.value.is_empty() { &f.placeholder } else { value.as_ref() };
         let natural = ts.measure(&spec(label, f.size, f.line_height, f.tracking, f.weight), None).1.0 + 2.0;
         width.map_or(natural, |offered| natural.min(offered))
     } else { width.unwrap_or(220.0) };
     let lh = line_h(f.size, f.line_height);
-    let (key, size) = ts.measure(&spec(&f.value, f.size, f.line_height, f.tracking, f.weight), wrap_at(f.max_lines > 1, w));
+    let (key, size) = ts.measure(&spec(&shown(&f.value, f.secure), f.size, f.line_height, f.tracking, f.weight), wrap_at(f.max_lines > 1, w));
     node.text = key;
     let rows = ((size.1 / lh).round() as usize).clamp(1, f.max_lines.max(1));
     (w, rows as f32 * lh)
@@ -228,6 +259,7 @@ pub(crate) struct FieldHit<S> {
     on_cancel: Option<Box<dyn Fn(&mut S)>>,
     autofocus: bool,
     select_on_focus: bool,
+    secure: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -341,7 +373,7 @@ impl<S: 'static> Ui<S> {
         if self.focus.is_none() {
             return self.feed_text();
         }
-        let h = self.field_hit()?;
+        let h = self.field_hit().filter(|h| !h.secure)?;
         let r = self.ed.range();
         h.value.get(r).filter(|t| !t.is_empty()).map(str::to_string)
     }
@@ -386,7 +418,7 @@ impl<S: 'static> Ui<S> {
     /// the text key plus the press position in text coordinates.
     fn shaped(&mut self, i: usize, pos: (f32, f32)) -> (u64, (f32, f32)) {
         let Action::Field(h) = &self.hits[i].action else { return (0, (0.0, 0.0)) };
-        let key = self.text.measure(&spec(&h.value, h.size, h.line_height, h.tracking, h.weight), h.wrap).0;
+        let key = self.text.measure(&spec(&shown(&h.value, h.secure), h.size, h.line_height, h.tracking, h.weight), h.wrap).0;
         (key, ((pos.0 - h.origin.0) / h.scale, (pos.1 - h.origin.1) / h.scale))
     }
 
@@ -406,16 +438,44 @@ impl<S: 'static> Ui<S> {
     pub(super) fn focus_new_field(&mut self, previous: &[u64]) -> bool {
         let target = self.hits.iter().position(|h| !previous.contains(&h.id)
             && matches!(&h.action, Action::Field(f) if f.autofocus));
-        if let Some(i) = target {
+        let Some(i) = target else { return false };
+        let Action::Field(h) = &self.hits[i].action else { return false };
+        self.focus_at(i, h.select_on_focus);
+        true
+    }
+
+    /// Gives hit `i` (a field) keyboard focus with the caret at the end, or everything selected.
+    fn focus_at(&mut self, i: usize, select_all: bool) {
+        let id = self.hits[i].id;
+        if self.focus != Some(id) {
             self.blur();
-            let Action::Field(h) = &self.hits[i].action else { return false };
-            self.focus = Some(self.hits[i].id);
-            self.ed = Editor { field: self.focus, mods: self.ed.mods, caret: h.value.len(),
-                anchor: if h.select_on_focus { 0 } else { h.value.len() }, ..Editor::default() };
-            self.ed.touched();
-            return true;
         }
-        false
+        let Action::Field(h) = &self.hits[i].action else { return };
+        let len = h.value.len();
+        self.focus = Some(id);
+        self.ed = Editor { field: Some(id), mods: self.ed.mods, caret: len, anchor: if select_all { 0 } else { len }, ..Editor::default() };
+        self.ed.touched();
+    }
+
+    /// Tab / Shift+Tab: the next / previous field in paint order, wrapping around. Only the
+    /// fields above the topmost modal scrim or popover take part, so focus never lands behind
+    /// a dialog. As in AppKit, the field it lands in has its whole text selected.
+    pub(super) fn focus_step(&mut self, forward: bool) -> bool {
+        let start = self.hits.iter().rposition(|h| matches!(h.action, Action::Outside(_) | Action::Block(_))).map_or(0, |i| i + 1);
+        let fields: Vec<usize> = (start..self.hits.len()).filter(|&i| matches!(self.hits[i].action, Action::Field(_))).collect();
+        let n = fields.len();
+        if n == 0 {
+            return false;
+        }
+        let at = self.focus.and_then(|id| fields.iter().position(|&i| self.hits[i].id == id));
+        let next = match (at, forward) {
+            (Some(k), true) => (k + 1) % n,
+            (Some(k), false) => (k + n - 1) % n,
+            (None, true) => 0,
+            (None, false) => n - 1,
+        };
+        self.focus_at(fields[next], true);
+        true
     }
 
     pub(super) fn field_press(&mut self, i: usize, pos: (f32, f32)) {
@@ -435,13 +495,15 @@ impl<S: 'static> Ui<S> {
         self.ed.click = Some((now, pos, n));
         let (key, at) = self.shaped(i, pos);
         let Action::Field(h) = &self.hits[i].action else { return };
-        let len = h.value.len();
+        let (len, secure) = (h.value.len(), h.secure);
         if self.ed.known.as_deref() != Some(h.value.as_str()) {
             self.ed.known = Some(h.value.clone());
             (self.ed.undo.clear(), self.ed.redo.clear());
         }
-        let idx = floor_char(&h.value, self.text.hit(key, at.0, at.1)).min(len);
+        let idx = from_shown(&h.value, secure, self.text.hit(key, at.0, at.1)).min(len);
         let unit = match n {
+            // Bullets have no words to pick: a secure field selects everything.
+            2 | 3 if secure => Some(0..len),
             2 => Some(self.text.word_at(key, idx)),
             3 => Some(self.text.para_at(key, idx)),
             _ => None,
@@ -464,7 +526,11 @@ impl<S: 'static> Ui<S> {
             return false;
         }
         let (key, at) = self.shaped(i, pos);
-        let idx = self.text.hit(key, at.0, at.1);
+        let Action::Field(h) = &self.hits[i].action else { return false };
+        let idx = from_shown(&h.value, h.secure, self.text.hit(key, at.0, at.1));
+        if h.secure && self.ed.unit.is_some() {
+            return false; // the whole value is already selected
+        }
         let (caret, anchor) = (self.ed.caret, self.ed.anchor);
         match self.ed.unit.clone() {
             None => self.ed.caret = idx,
@@ -568,13 +634,17 @@ impl<S: 'static> Ui<S> {
     pub(super) fn field_key(&mut self, key: KeyInput) -> bool {
         let Some(i) = self.field_index() else { return false };
         let Action::Field(h) = &self.hits[i].action else { return false };
-        let (multi, submit) = (h.multi, h.on_submit.is_some());
+        let (multi, submit, secure) = (h.multi, h.on_submit.is_some(), h.secure);
         let value = h.value.clone();
         self.ed.clamp(&value);
         let m = self.ed.mods;
         let word = m.alt || m.command;
+        // A secure field hides where its words are: word moves go to the ends.
+        let prev_word = move |v: &str, c| if secure { 0 } else { prev_word(v, c) };
+        let next_word = move |v: &str, c| if secure { v.len() } else { next_word(v, c) };
+        let (to, from) = (|i| to_shown(&value, secure, i), |m| from_shown(&value, secure, m));
         let (c, sel) = (self.ed.caret, self.ed.range());
-        let key_v = self.text.measure(&spec(&value, h.size, h.line_height, h.tracking, h.weight), h.wrap).0;
+        let key_v = self.text.measure(&spec(&shown(&value, secure), h.size, h.line_height, h.tracking, h.weight), h.wrap).0;
         use KeyInput as K;
         if !matches!(key, K::Up | K::Down) {
             self.ed.goal_x = None;
@@ -600,15 +670,15 @@ impl<S: 'static> Ui<S> {
             K::Right => self.go(if word { next_word(&value, c) } else { next_grapheme(&value, c) }),
             K::Up | K::Down if !multi || m.command => self.go(if key == K::Up { 0 } else { value.len() }),
             K::Up | K::Down => {
-                let (x, top, h) = self.text.caret(key_v, c);
+                let (x, top, h) = self.text.caret(key_v, to(c));
                 let goal = *self.ed.goal_x.get_or_insert(x);
                 let y = if key == K::Up { top - h * 0.5 } else { top + h * 1.5 };
                 let to = if y < 0.0 {
                     0
-                } else if y > self.text.caret(key_v, value.len()).1 + h {
+                } else if y > self.text.caret(key_v, to(value.len())).1 + h {
                     value.len()
                 } else {
-                    self.text.hit(key_v, goal, y)
+                    from(self.text.hit(key_v, goal, y))
                 };
                 let goal = self.ed.goal_x;
                 let r = self.go(to);
@@ -616,13 +686,14 @@ impl<S: 'static> Ui<S> {
                 r
             }
             K::Home | K::End if m.command || !multi => self.go(if key == K::Home { 0 } else { value.len() }),
-            K::Home => self.go(self.text.row_at(key_v, c).start),
-            K::End => self.go(self.text.row_at(key_v, c).end),
+            K::Home => self.go(from(self.text.row_at(key_v, to(c)).start)),
+            K::End => self.go(from(self.text.row_at(key_v, to(c)).end)),
             K::SelectAll => {
                 (self.ed.anchor, self.ed.caret) = (0, value.len());
                 self.ed.touched();
                 true
             }
+            K::Copy | K::Cut if secure => false,
             K::Copy | K::Cut => {
                 if let Some(t) = value.get(sel.clone()).filter(|t| !t.is_empty()) {
                     self.requests.push(WindowRequest::SetClipboard(t.to_string()));
@@ -633,6 +704,7 @@ impl<S: 'static> Ui<S> {
                 true
             }
             K::Undo | K::Redo => self.undo(key == K::Redo),
+            K::Tab | K::BackTab => self.focus_step(key == K::Tab),
             K::Enter if multi && (m.shift || m.alt || !submit) => self.insert("\n", Group::Single),
             K::Enter if submit => {
                 if self.ed.stale {
@@ -692,7 +764,8 @@ impl<S> Painter<'_, S> {
         let inner = Rect::new(r.x + pad[0], r.y + pad[1], (r.w - pad[0] - pad[2]).max(0.0), (r.h - pad[1] - pad[3]).max(0.0));
         let multi = f.max_lines > 1;
         let wrap = wrap_at(multi, inner.w);
-        let (key_v, size_v) = self.text.measure(&spec(&f.value, f.size, f.line_height, f.tracking, f.weight), wrap);
+        let secure = f.secure;
+        let (key_v, size_v) = self.text.measure(&spec(&shown(&f.value, secure), f.size, f.line_height, f.tracking, f.weight), wrap);
         let lh = line_h(f.size, f.line_height);
         let content_h = size_v.1.max(lh);
 
@@ -717,11 +790,13 @@ impl<S> Painter<'_, S> {
         let (key_d, size_d, caret_d, pre_range) = match &pre {
             Some((p, cur)) => {
                 let c = ed.caret;
-                let shown = format!("{}{}{}", &f.value[..c], p, &f.value[c..]);
-                let (k, s) = self.text.measure(&spec(&shown, f.size, f.line_height, f.tracking, f.weight), wrap);
-                (k, s, c + cur.map_or(p.len(), |x| x.0.min(p.len())), Some(c..c + p.len()))
+                let sc = to_shown(&f.value, secure, c);
+                let sp = shown(p, secure);
+                let text = format!("{}{}{}", shown(&f.value[..c], secure), sp, shown(&f.value[c..], secure));
+                let (k, s) = self.text.measure(&spec(&text, f.size, f.line_height, f.tracking, f.weight), wrap);
+                (k, s, sc + to_shown(p, secure, cur.map_or(p.len(), |x| x.0.min(p.len()))), Some(sc..sc + sp.len()))
             }
-            None => (key_v, size_v, ed.caret, None),
+            None => (key_v, size_v, to_shown(&f.value, secure, ed.caret), None),
         };
         let (cx, cy, ch) = if focused { self.text.caret(key_d, caret_d) } else { (0.0, 0.0, lh) };
         let ch = if ch <= 0.0 { lh } else { ch };
@@ -750,7 +825,8 @@ impl<S> Painter<'_, S> {
 
         let sel = ed.range();
         if focused && !sel.is_empty() && pre.is_none() {
-            self.paint_selection(&cxf, key_v, sel.clone(), origin);
+            let shown_sel = to_shown(&f.value, secure, sel.start)..to_shown(&f.value, secure, sel.end);
+            self.paint_selection(&cxf, key_v, shown_sel, origin);
         }
         if f.value.is_empty() && pre.is_none() {
             let (key_p, size_p) = self.text.measure(&spec(&f.placeholder, f.size, f.line_height, f.tracking, f.weight), wrap);
@@ -794,6 +870,7 @@ impl<S> Painter<'_, S> {
                 on_submit: f.on_submit,
                 on_blur: f.on_blur, on_cancel: f.on_cancel,
                 autofocus: f.autofocus, select_on_focus: f.select_on_focus,
+                secure,
             })),
         );
     }

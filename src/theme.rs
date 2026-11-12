@@ -151,6 +151,8 @@ pub struct Controls {
     pub button_radius: f32,
     /// Laid over a hovered button.
     pub button_hover: Color,
+    /// Opacity of a `.disabled(true)` button or other tappable view.
+    pub disabled_opacity: f32,
     pub field_padding: (f32, f32),
     /// Text fields and pickers.
     pub field_radius: f32,
@@ -315,6 +317,7 @@ impl Theme {
                 button_padding: (20.0, 13.0),
                 button_radius: 14.0,
                 button_hover: Color::WHITE.alpha(0.14),
+                disabled_opacity: 0.4,
                 field_padding: (14.0, 12.0),
                 field_radius: 12.0,
                 picker_padding: (14.0, 10.0),

@@ -411,6 +411,10 @@ pub enum KeyInput {
     Cut,
     Undo,
     Redo,
+    /// Tab and Shift+Tab: focus the next / previous `text_field` in paint order, wrapping;
+    /// inside an open modal or popover only its own fields take part.
+    Tab,
+    BackTab,
 }
 
 /// An open picker menu, painted above everything else.
@@ -1165,6 +1169,13 @@ impl<S> Painter<'_, S> {
         let pin = self.sticky;
         let tbase = std::mem::take(&mut self.tbase);
         let mut st = v.style;
+        // A disabled control keeps its place and tooltip but loses its tap, hover and press.
+        let disabled = st.disabled && (v.on_tap.is_some() || v.on_double_tap.is_some());
+        if disabled {
+            (v.on_tap, v.on_double_tap) = (None, None);
+            (st.hover, st.hover_fg) = (None, None);
+            xf.opacity *= self.look.theme.control.disabled_opacity;
+        }
         if st.animate_radius { st.radius = self.crisp(id, slot::RADIUS, st.radius.max(0.0)).max(0.0); }
         xf.shape_sq = st.square_corners;
         xf.border_hidden = st.border_hidden;
@@ -1246,6 +1257,8 @@ impl<S> Painter<'_, S> {
 
         // Pointer shape and hover: explicit, or what the kind of view suggests.
         let cursor = st.cursor.or(match &v.kind {
+            // Not the hand of a tappable view underneath.
+            _ if disabled => Some(Cursor::Default),
             Kind::TextField(_) => Some(Cursor::Text),
             Kind::Toggle(..) | Kind::Slider(..) | Kind::Tabs { .. } | Kind::Picker { .. } => Some(Cursor::Pointer),
             _ if v.on_tap.is_some() || v.on_double_tap.is_some() || tap_menu => Some(Cursor::Pointer),
@@ -1281,6 +1294,8 @@ impl<S> Painter<'_, S> {
         }
         if v.on_tap.is_some() || v.on_double_tap.is_some() {
             self.hit(&xf, id, sr, Action::Tap(v.on_tap, v.on_double_tap));
+        } else if disabled {
+            self.hit(&xf, id, sr, Action::Swallow);
         }
         if let Some(x) = extra {
             self.attach(x, ln, &xf, id, sr, anchor);
@@ -2754,6 +2769,7 @@ impl<S: 'static> Ui<S> {
             }
             KeyInput::Escape if self.field_key(key) => true,
             KeyInput::Escape => self.open_menu.take().is_some() | self.blur() | self.sel_key(key),
+            KeyInput::Tab | KeyInput::BackTab => self.focus_step(key == KeyInput::Tab),
             KeyInput::Enter if self.open_menu.is_some() => {
                 self.open_menu = None;
                 true

@@ -332,6 +332,8 @@ pub(crate) struct Style {
     pub copy_sep: Option<&'static str>,
     /// Which built-in widget this is: the theme fills in what its modifiers left unset.
     pub role: Role,
+    /// `.disabled(true)`: a tappable view ignores taps, hover and press, and is dimmed.
+    pub disabled: bool,
     /// Fields set by a modifier that have no `None` of their own (`PAD_*`, `SET_RADIUS`).
     pub set: u8,
 }
@@ -414,6 +416,7 @@ impl Default for Style {
             copy_as: None,
             copy_sep: None,
             role: Role::None,
+            disabled: false,
             set: 0,
         }
     }
@@ -1119,6 +1122,19 @@ impl<S> View<S> {
 
     pub fn opacity(mut self, o: f32) -> Self {
         self.style.opacity = o;
+        self
+    }
+    /// A `button`, `icon_button` or any view with `.on_tap()` that is unavailable: taps do
+    /// nothing (and do not reach the views under it), there is no hover tint, press feedback
+    /// or pointer cursor, and it is drawn at the theme's `control.disabled_opacity`. Its
+    /// `.tooltip()` still shows. Views without a tap handler (fields, toggles, sliders…)
+    /// ignore it. Same word as [`MenuItem::disabled`](crate::MenuItem::disabled).
+    ///
+    /// ```ignore
+    /// button("Connect", |s: &mut App| s.connect()).disabled(s.connecting)
+    /// ```
+    pub fn disabled(mut self, on: bool) -> Self {
+        self.style.disabled = on;
         self
     }
     /// Turns the pictures in this view (`image`, `icon`, the glyph of an `icon_button`) by

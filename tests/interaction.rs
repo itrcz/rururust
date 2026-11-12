@@ -4623,3 +4623,175 @@ fn settle_long(ui: &mut Ui<impl Sized + 'static>, size: (f32, f32)) {
         if !ui.animating || std::time::Instant::now() >= deadline { break; }
     }
 }
+
+#[derive(Default)]
+struct Tabbed {
+    a: String,
+    b: String,
+    c: String,
+    open: bool,
+    d: String,
+    e: String,
+}
+
+fn tabbed() -> Ui<Tabbed> {
+    let mut ui = Ui::new(Tabbed::default(), |s: &Tabbed| {
+        zstack((
+            vstack((
+                text_field(s.a.as_str(), "A", |s: &mut Tabbed, v| s.a = v).width(300.0),
+                text_field(s.b.as_str(), "B", |s: &mut Tabbed, v| s.b = v).width(300.0),
+                text_field(s.c.as_str(), "C", |s: &mut Tabbed, v| s.c = v).multiline().width(300.0),
+            ))
+            .place(Align::Start, Align::Start),
+            modal(s.open, |s: &mut Tabbed| s.open = false, vstack((
+                text_field(s.d.as_str(), "D", |s: &mut Tabbed, v| s.d = v).width(200.0),
+                text_field(s.e.as_str(), "E", |s: &mut Tabbed, v| s.e = v).width(200.0),
+            ))),
+        ))
+        .fill()
+    });
+    ui.frame((400.0, 600.0));
+    ui
+}
+
+#[test]
+fn tab_walks_the_fields_in_order_and_wraps() {
+    let mut ui = tabbed();
+    let size = (400.0, 600.0);
+    assert!(ui.key(KeyInput::Tab), "Tab with nothing focused takes the first field");
+    ui.text_input("1");
+    ui.frame(size);
+    ui.key(KeyInput::Tab);
+    ui.text_input("2");
+    ui.frame(size);
+    ui.key(KeyInput::Tab); // into the multi-line field
+    ui.text_input("3");
+    ui.frame(size);
+    ui.key(KeyInput::Tab); // a multi-line field does not take the Tab: back to the first
+    ui.text_input("x"); // the whole text was selected on the way in
+    assert_eq!((ui.state.a.as_str(), ui.state.b.as_str(), ui.state.c.as_str()), ("x", "2", "3"));
+    ui.frame(size);
+    ui.key(KeyInput::BackTab); // wraps backwards to the last
+    ui.text_input("y");
+    assert_eq!(ui.state.c, "y");
+    ui.frame(size);
+    ui.key(KeyInput::BackTab);
+    ui.text_input("z");
+    assert_eq!(ui.state.b, "z");
+}
+
+#[test]
+fn tab_stays_inside_an_open_modal() {
+    let mut ui = tabbed();
+    let size = (400.0, 600.0);
+    ui.key(KeyInput::Tab);
+    ui.state.open = true;
+    settle_long(&mut ui, size); // fields of a dialog still fading in are not hit yet
+    ui.key(KeyInput::Tab);
+    ui.text_input("d");
+    ui.frame(size);
+    ui.key(KeyInput::Tab);
+    ui.text_input("e");
+    ui.frame(size);
+    ui.key(KeyInput::Tab); // wraps to the modal's first field, never behind the scrim
+    ui.text_input("D");
+    ui.frame(size);
+    ui.key(KeyInput::BackTab);
+    ui.text_input("E");
+    assert_eq!((ui.state.d.as_str(), ui.state.e.as_str()), ("D", "E"));
+    assert_eq!((ui.state.a.as_str(), ui.state.b.as_str(), ui.state.c.as_str()), ("", "", ""));
+}
+
+#[test]
+fn tab_without_fields_is_not_used() {
+    let mut ui = ui();
+    assert!(!ui.key(KeyInput::Tab));
+    assert!(!ui.key(KeyInput::BackTab));
+}
+
+fn secure_ui(value: &str, secure: bool) -> Ui<String> {
+    let mut ui = Ui::new(value.to_string(), move |s: &String| {
+        let f = text_field(s.as_str(), "Password", |s: &mut String, v| *s = v).width(300.0);
+        zstack(if secure { f.secure() } else { f }).place(Align::Start, Align::Start)
+    });
+    ui.frame((400.0, 600.0));
+    ui
+}
+
+#[test]
+fn secure_field_shows_bullets_and_edits_the_real_value() {
+    use ruru::KeyInput::*;
+    let size = (400.0, 600.0);
+    let mut ui = secure_ui("", true);
+    ui.pointer_down((150.0, 20.0), false);
+    ui.pointer_up((150.0, 20.0));
+    ui.text_input("aй");
+    ui.text_input("c");
+    assert_eq!(ui.state, "aйc");
+    ui.frame(size);
+    // What is shaped and drawn is the bullets, never the value itself.
+    let key = |ui: &Ui<String>| texts(ui).iter().map(|t| t.key).collect::<Vec<_>>();
+    assert_eq!(key(&ui), key(&secure_ui("•••", false)));
+    assert_ne!(key(&ui), key(&secure_ui("aйc", false)));
+
+    ui.key(Backspace);
+    assert_eq!(ui.state, "aй");
+    ui.key(Undo);
+    assert_eq!(ui.state, "aйc");
+    ui.frame(size);
+    // The caret moves a bullet (a char) at a time over the real text.
+    ui.key(Left);
+    ui.key(Left);
+    ui.text_input("-");
+    assert_eq!(ui.state, "a-йc");
+    ui.frame(size);
+
+    ui.key(SelectAll);
+    assert_eq!(ui.selection_text(), None);
+    assert!(!ui.key(Copy));
+    assert!(!ui.key(Cut));
+    assert_eq!(ui.state, "a-йc", "Cut does nothing");
+    assert!(ui.requests.is_empty(), "nothing reaches the clipboard");
+    assert!(ui.paste("xy"));
+    assert_eq!(ui.state, "xy");
+    ui.frame(size);
+    ui.key(Undo);
+    assert_eq!(ui.state, "a-йc");
+    ui.frame(size);
+
+    // A click maps through the bullets: the left edge is before the first char.
+    ui.key(Escape);
+    ui.pointer_down((15.0, 20.0), false);
+    ui.pointer_up((15.0, 20.0));
+    ui.text_input("_");
+    assert_eq!(ui.state, "_a-йc");
+}
+
+struct Dis {
+    off: bool,
+    n: u32,
+    under: u32,
+}
+
+#[test]
+fn disabled_button_ignores_taps_and_does_not_pass_them_on() {
+    let mut ui = Ui::new(Dis { off: true, n: 0, under: 0 }, |s: &Dis| {
+        zstack(button("go", |s: &mut Dis| s.n += 1).disabled(s.off).size(200.0, 100.0).place(Align::Start, Align::Start))
+            .fill()
+            .on_tap(|s: &mut Dis| s.under += 1)
+    });
+    let size = (400.0, 400.0);
+    ui.frame(size);
+    ui.pointer_down((100.0, 50.0), false);
+    assert!(!ui.animating, "no press feedback");
+    ui.pointer_up((100.0, 50.0));
+    assert_eq!((ui.state.n, ui.state.under), (0, 0));
+    ui.pointer_move((100.0, 50.0));
+    assert_eq!(ui.cursor, ruru::Cursor::Default, "no pointer cursor");
+
+    ui.state.off = false;
+    ui.frame(size);
+    ui.pointer_down((100.0, 50.0), false);
+    ui.pointer_up((100.0, 50.0));
+    assert_eq!((ui.state.n, ui.state.under), (1, 0));
+}

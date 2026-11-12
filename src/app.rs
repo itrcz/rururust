@@ -530,13 +530,17 @@ impl Clipboard {
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
 let sel = "";
+let field = false;
 export function clip_selection(s) { sel = s; }
+export function clip_field_focus(on) { field = on; }
 export function clip_write(s) {
   try { navigator.clipboard.writeText(s).catch(() => {}); } catch (_) {}
 }
 export function clip_install(onPaste, onCut) {
   window.addEventListener("keydown", (e) => {
     if ((e.metaKey || e.ctrlKey) && !e.altKey && ["KeyC", "KeyX", "KeyV"].includes(e.code)) e.stopPropagation();
+    // Tab moves between ruru's fields only while one has focus; otherwise the page keeps it.
+    if (e.key === "Tab" && !field) e.stopPropagation();
   }, true);
   const give = (e) => {
     if (!sel || !e.clipboardData) return false;
@@ -554,6 +558,7 @@ export function clip_install(onPaste, onCut) {
 "#)]
 extern "C" {
     fn clip_selection(s: &str);
+    fn clip_field_focus(on: bool);
     fn clip_write(s: &str);
     fn clip_install(on_paste: &wasm_bindgen::closure::Closure<dyn FnMut(String)>, on_cut: &wasm_bindgen::closure::Closure<dyn FnMut()>);
 }
@@ -666,6 +671,7 @@ impl<S: 'static> Runner<S> {
         }
         #[cfg(target_arch = "wasm32")]
         {
+            clip_field_focus(ui.has_focus());
             let sel = if ui.has_focus() {
                 self.clipboard.mirrored = None;
                 ui.selection_text().unwrap_or_default()
@@ -1090,6 +1096,8 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
                     Key::Named(NamedKey::End) => Some(KeyInput::End),
                     Key::Named(NamedKey::Enter) => Some(KeyInput::Enter),
                     Key::Named(NamedKey::Escape) => Some(KeyInput::Escape),
+                    Key::Named(NamedKey::Tab) if self.mods.shift_key() => Some(KeyInput::BackTab),
+                    Key::Named(NamedKey::Tab) => Some(KeyInput::Tab),
                     _ => None,
                 };
                 let command = self.mods.control_key() || self.mods.super_key();
