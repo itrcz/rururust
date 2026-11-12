@@ -4361,3 +4361,19 @@ fn scroll_bottom_overlay_uses_wrapped_height_for_tail_and_scrollbar_without_losi
     for _ in 0..3 {ui.frame(size);assert!(ui.has_focus());assert!(ui.text_input("x"));}
     assert_eq!(ui.state.text,"axxxb");
 }
+
+#[test]
+fn text_shimmer_sweeps_rich_text_too() {
+    // Rich text keeps its content in spans; the shimmer looks at the shaped text, so it
+    // lays its tinted strips (extra text commands) over plain and rich labels alike.
+    let count = |make: fn() -> View<()>| {
+        let mut ui = Ui::new((), move |_: &()| vstack(make().text_shimmer(1.0, Color::WHITE)).place(Align::Start, Align::Start));
+        ui.frame((400.0, 200.0));
+        (texts(&ui).len(), ui.animating)
+    };
+    let plain = count(|| text("Thinking"));
+    let rich = count(|| rich_text(vec![Span::new("Think"), Span::new("ing").bold()]));
+    assert!(plain.0 > 1 && plain.1, "plain {plain:?}");
+    assert!(rich.0 > 1 && rich.1, "rich {rich:?}");
+    assert!(!count(|| rich_text(Vec::new())).1, "empty text has nothing to sweep: no frames");
+}

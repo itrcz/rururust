@@ -1587,7 +1587,7 @@ impl<S> Painter<'_, S> {
                         } else {self.fill(&cxf,marker,cursor.radius*scale,Fill::Solid(cursor.color),None);}
                     }
                 }
-                if let Some((period, highlight)) = st.text_shimmer.filter(|_| box_.intersects(&clip) && xf.opacity > 0.0 && !t.content.is_empty()) {
+                if let Some((period, highlight)) = st.text_shimmer.filter(|_| box_.intersects(&clip) && xf.opacity > 0.0 && !crate::text::shaped_text(&t.spans, &t.content).is_empty()) {
                     // Reuse the shaped run and atlas. Narrow clips tint only the glyphs under
                     // the moving band; neither hit testing nor text selection is duplicated.
                     self.spin = true;
