@@ -207,6 +207,17 @@ impl<S> Painter<'_, S> {
     }
 
     /// Selection highlight, I-beam and link areas of a text view; called before its glyphs.
+    /// Highlights the bytes `range` of the shaped text `key` whose origin is the local point
+    /// `at`, in the subtree's selection color: selected text in fields and `.selectable()`.
+    pub(super) fn paint_selection(&mut self, xf: &Xf, key: u64, range: std::ops::Range<usize>, at: (f32, f32)) {
+        let mut rects = Vec::new();
+        self.text.range_rects(key, range, &mut rects);
+        let (color, radius) = (self.tctx.color, self.look.theme.control.selection_radius);
+        for q in rects {
+            self.fill(xf, Rect::new(at.0 + q.x, at.1 + q.y, q.w, q.h), radius, Fill::Solid(color), None);
+        }
+    }
+
     /// `at` is the local origin of the text, `node` its number.
     pub(super) fn text_extras(&mut self, xf: &Xf, id: u64, key: u64, spans: &[Span], content: &str, at: (f32, f32), size: (f32, f32), node: u32) {
         if let Some((area, _)) = self.tctx.area.clone() {
@@ -220,12 +231,7 @@ impl<S> Painter<'_, S> {
                     let len = shaped_text(spans, content).len();
                     let a = if s.lo.at() == me { s.lo.byte as usize } else { 0 };
                     let b = if s.hi.at() == me { (s.hi.byte as usize).min(len) } else { len };
-                    let mut rects = Vec::new();
-                    self.text.range_rects(key, a..b, &mut rects);
-                    let c = self.tctx.color;
-                    for q in rects {
-                        self.fill(xf, Rect::new(at.0 + q.x, at.1 + q.y, q.w, q.h), 2.0, Fill::Solid(c), None);
-                    }
+                    self.paint_selection(xf, key, a..b, at);
                 }
             }
             // One id for all texts of an area: moving between them costs no frame.

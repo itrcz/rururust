@@ -570,8 +570,9 @@ impl<S> Painter<'_, S> {
         let size = l.node.size;
         let ((x, y), from) = place(l.anchor, size, l.placement, self.screen);
         // Grows a little out of the anchor while it fades in.
-        let k = 0.94 + 0.06 * tc;
-        let xf = Xf { s: k, tx: from.0 * (1.0 - k), ty: from.1 * (1.0 - k), opacity: tc, text_reveal: None, hover_scope: None, clip: self.screen, clip_r: 0.0, clip_smooth: false, clip_sq: 0, shape_sq: 0, border_hidden: 0, px: self.px, fg: l.fg };
+        let k0 = self.look.theme.motion.popup_scale;
+        let mut xf = Xf { opacity: tc, ..Xf::screen(self.screen, l.fg, self.px) };
+        xf.scale_about(from.0, from.1, k0 + (1.0 - k0) * tc);
         let body = xf.rect(Rect::new(x, y, size.0, size.1));
         let tip = matches!(l.kind, LayerKind::Tooltip);
         if let (LayerKind::Popover(d), true) = (&l.kind, l.open) {

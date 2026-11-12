@@ -92,3 +92,9 @@ impl Color {
     pub const TEAL: Color = Color::hex(0x40C8E0);
     pub const GRAY: Color = Color::hex(0x8E8E93);
 }
+
+/// Hermite ease of `x` clamped to 0..=1: flat at both ends, like the shader built-in.
+pub(crate) fn smoothstep(x: f32) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    x * x * (3.0 - 2.0 * x)
+}

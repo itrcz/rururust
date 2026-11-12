@@ -75,8 +75,7 @@ impl Run {
     fn progress(&self, byte: usize, now: f32, duration: f32) -> f32 {
         let i = self.births.partition_point(|(b, _)| *b <= byte).saturating_sub(1);
         let born = self.births.get(i).map_or(now - duration, |b| b.1);
-        let t = ((now - born) / duration).clamp(0.0, 1.0);
-        t * t * (3.0 - 2.0 * t)
+        crate::types::smoothstep((now - born) / duration)
     }
 }
 

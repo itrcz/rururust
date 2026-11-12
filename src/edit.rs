@@ -744,12 +744,7 @@ impl<S> Painter<'_, S> {
 
         let sel = ed.range();
         if focused && !sel.is_empty() && pre.is_none() {
-            let mut rects = Vec::new();
-            self.text.range_rects(key_v, sel.clone(), &mut rects);
-            for q in rects {
-                let q = Rect::new(origin.0 + q.x, origin.1 + q.y, q.w, q.h);
-                self.fill(&cxf, q, 3.0, Fill::Solid(self.tctx.color), None);
-            }
+            self.paint_selection(&cxf, key_v, sel.clone(), origin);
         }
         if f.value.is_empty() && pre.is_none() {
             let (key_p, size_p) = self.text.measure(&spec(&f.placeholder, f.size, f.line_height, f.tracking, f.weight), wrap);

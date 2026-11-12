@@ -37,6 +37,15 @@ pub(crate) const KIND_GLASS: f32 = 2.0;
 pub(crate) const KIND_IMAGE: f32 = 3.0;
 pub(crate) const KIND_MORPH: f32 = 4.0;
 
+// Flag bits packed into `np.w` (bits 0-3: square clip corners, 4-7: square shape corners,
+// 10-13: hidden border edges). The shader reads the same numbers.
+/// A fill that covers only the outside of its rounded corners (`.mask_corners()`).
+pub(crate) const FLAG_CORNER_MASK: u32 = 256;
+/// Glass lit from the sides rather than from above (`Glass::horizontal_light`).
+pub(crate) const FLAG_HORIZONTAL_LIGHT: u32 = 512;
+/// A border whose color fades along the view (`n0`, `n1` carry the fade, not geometry).
+pub(crate) const FLAG_BORDER_FADE: u32 = 16384;
+
 /// One GPU instance. Units are logical points; the shader applies the scale factor.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -70,9 +79,6 @@ pub struct TextCmd {
     /// Fade in from the leading clip edge over this many points (full text height).
     pub leading_fade: f32,
 }
-
-/// Length of the `Truncate::Fade` ramp in points.
-const FADE_W: f32 = 28.0;
 
 pub enum Cmd {
     Quad(Quad),
@@ -596,6 +602,17 @@ pub(crate) fn snap_rect(r: Rect, px: f32) -> Rect {
 }
 
 impl Xf {
+    /// No transform: screen points, clipped to `clip`, text in `fg`, snapped at `px`.
+    fn screen(clip: Rect, fg: Color, px: f32) -> Xf {
+        Xf { s: 1.0, tx: 0.0, ty: 0.0, opacity: 1.0, text_reveal: None, hover_scope: None, clip, clip_r: 0.0, clip_smooth: false, clip_sq: 0, shape_sq: 0, border_hidden: 0, fg, px }
+    }
+    /// Scales what follows by `k` about the local point `(cx, cy)`, which stays put on
+    /// screen: press squeeze, reveal, popovers growing out of their anchor.
+    fn scale_about(&mut self, cx: f32, cy: f32, k: f32) {
+        self.tx += cx * (1.0 - k) * self.s;
+        self.ty += cy * (1.0 - k) * self.s;
+        self.s *= k;
+    }
     fn rect(&self, r: Rect) -> Rect {
         Rect::new(r.x * self.s + self.tx, r.y * self.s + self.ty, r.w * self.s, r.h * self.s)
     }
@@ -986,22 +1003,8 @@ impl<S> Painter<'_, S> {
         let t = self.spring_with(m.id, slot::PICKER_MENU, 0.0, 1.0, theme.motion.bouncy).x;
         let k = 0.8 + 0.2 * t;
         let (ax, ay) = (m.anchor.x + m.anchor.w * 0.5, if down { y } else { y + h });
-        let xf = Xf {
-            s: k,
-            tx: ax * (1.0 - k),
-            ty: ay * (1.0 - k),
-            opacity: t.clamp(0.0, 1.0),
-            text_reveal: None,
-            hover_scope: None,
-            clip: screen,
-            clip_r: 0.0,
-            clip_smooth: false,
-            clip_sq: 0,
-            shape_sq: 0,
-            border_hidden: 0,
-            fg: m.fg,
-            px: self.px,
-        };
+        let mut xf = Xf { opacity: t.clamp(0.0, 1.0), ..Xf::screen(screen, m.fg, self.px) };
+        xf.scale_about(ax, ay, k);
         let r = Rect::new(x, y, w, h);
         let radius = theme.control.picker_radius;
         self.shadow(&xf, r, radius, theme.shadow.bar, true);
@@ -1099,7 +1102,7 @@ impl<S> Painter<'_, S> {
         let mut q = self.quad(xf, r, radius, KIND_GLASS);
         q.c0 = g.tint.arr();
         q.c1 = [g.saturation, g.depth * xf.s, g.rim, g.dispersion];
-        if g.horizontal_light { q.np[3] = ((q.np[3] as u32) | 512) as f32; }
+        if g.horizontal_light { q.np[3] = ((q.np[3] as u32) | FLAG_HORIZONTAL_LIGHT) as f32; }
         q.p1[0] = g.frost * xf.s;
         q.p1[1] = g.refraction;
         if let Some((w, c)) = border {
@@ -1107,6 +1110,18 @@ impl<S> Painter<'_, S> {
             q.p0[1] = xf.line(w);
         }
         self.list.cmds.push(Cmd::Quad(q));
+    }
+
+    /// Covers the outside of the rounded corners of `r` in `color`, except the corners in
+    /// `square` (bit 0 top left, then clockwise): `.mask_corners()`, `.mask_backdrop_corners()`.
+    fn paint_corner_mask(&mut self, mut xf: Xf, r: Rect, st: &crate::view::Style, (color, square): (Color, u8)) {
+        xf.shape_sq = square | st.square_corners;
+        self.smooth = st.smooth || st.glass.is_some();
+        self.fill(&xf, r, st.radius, Fill::Solid(color), None);
+        if let Some(Cmd::Quad(q)) = self.list.cmds.last_mut() {
+            q.np[3] = ((q.np[3] as u32) | FLAG_CORNER_MASK) as f32;
+        }
+        self.smooth = false;
     }
 
     fn paint(&mut self, v: View<S>, ln: &LNode, origin: (f32, f32), xf: Xf, id: u64) {
@@ -1157,11 +1172,8 @@ impl<S> Painter<'_, S> {
 
         if let Some(shown) = st.reveal {
             let progress = self.spring(id, slot::REVEAL, if shown { 1.0 } else { 0.0 });
-            let scale = 0.5 + 0.5 * progress.max(0.0);
-            let (cx, cy) = (r.x + r.w * 0.5, r.y + r.h * 0.5);
-            xf.tx += cx * (1.0 - scale) * xf.s;
-            xf.ty += cy * (1.0 - scale) * xf.s;
-            xf.s *= scale;
+            let from = self.look.theme.motion.reveal_scale;
+            xf.scale_about(r.x + r.w * 0.5, r.y + r.h * 0.5, from + (1.0 - from) * progress.max(0.0));
             xf.opacity *= progress.clamp(0.0, 1.0);
         }
 
@@ -1172,12 +1184,10 @@ impl<S> Painter<'_, S> {
         // Press feedback: a quick, quiet dim with a barely-there squeeze. No bounce.
         if v.on_tap.is_some() || v.on_double_tap.is_some() || tap_menu {
             let p = self.crisp(id, slot::PRESS, if self.pressed == Some(id) { 1.0 } else { 0.0 });
-            let k = 1.0 - (1.0 - st.press_scale) * p;
-            let (cx, cy) = (r.x + r.w * 0.5, r.y + r.h * 0.5);
-            xf.tx += cx * (1.0 - k) * xf.s;
-            xf.ty += cy * (1.0 - k) * xf.s;
-            xf.s *= k;
-            xf.opacity *= 1.0 - (1.0 - st.press_opacity) * p;
+            let motion = &self.look.theme.motion;
+            let (scale, opacity) = (st.press_scale.unwrap_or(motion.press_scale), st.press_opacity.unwrap_or(motion.press_opacity));
+            xf.scale_about(r.x + r.w * 0.5, r.y + r.h * 0.5, 1.0 - (1.0 - scale) * p);
+            xf.opacity *= 1.0 - (1.0 - opacity) * p;
         }
 
         let sr = xf.rect_px(r);
@@ -1191,14 +1201,8 @@ impl<S> Painter<'_, S> {
 
         // Clear only the underlying scene at the corners. Painting this before the
         // surface keeps its shadow continuous across the masked backdrop.
-        if let Some((color, square)) = st.backdrop_corner_mask {
-            let mut mxf = xf;
-            mxf.shape_sq = square | st.square_corners;
-            self.smooth = st.smooth || st.glass.is_some();
-            self.fill(&mxf, r, st.radius, Fill::Solid(color), None);
-            if let Some(Cmd::Quad(q)) = self.list.cmds.last_mut() {
-                q.np[3] = ((q.np[3] as u32) | 256) as f32;
-            }
+        if let Some(mask) = st.backdrop_corner_mask {
+            self.paint_corner_mask(xf, r, &st, mask);
         }
         self.smooth = st.smooth;
         let translucent = st.glass.is_some() || !matches!(st.bg, Some(Fill::Solid(c)) if c.a >= 1.0);
@@ -1524,15 +1528,16 @@ impl<S> Painter<'_, S> {
                 let mut clip = if t.lines > 0 { xf.clip.intersect(&box_.inflate(1.0)) } else { xf.clip };
                 let mut fade = (ln.fade && t.truncate == Truncate::Fade).then(|| {
                     let line_h = (t.size * t.line_height).round() * xf.s;
-                    let w = (FADE_W * xf.s).min(box_.w * 0.5);
+                    let w = (self.look.theme.control.fade_width * xf.s).min(box_.w * 0.5);
                     Rect::new(box_.x + box_.w - w, box_.y + box_.h - line_h, w, line_h)
                 });
                 let mut leading_fade = 0.0;
                 if let Some((speed,inset,fade_width))=st.hover_marquee {
+                    let fade_width=fade_width.unwrap_or(self.look.theme.control.fade_width);
                     let hovered=xf.hover_scope.unwrap_or_else(||self.hovered.contains(&id));
                     let width=(inner.w-if hovered {inset}else{0.0}).max(0.0);
                     let distance=(ln.marquee_width-width).max(0.0);
-                    let (offset,running)=self.marquees.offset(id,ln.text,distance,speed,hovered,self.time,self.frame);
+                    let (offset,running)=self.marquees.offset(id,ln.text,distance,speed,hovered,self.time,self.frame,self.look.theme.motion.marquee_return);
                     self.spin|=running;
                     let leading=st.hover_marquee_leading_outset;
                     let visible=xf.rect(Rect::new(inner.x-leading,inner.y,width+leading,inner.h));
@@ -1801,14 +1806,8 @@ impl<S> Painter<'_, S> {
                 self.hit(&xf, id, csr.inflate(8.0), Action::Slider(x0, range * xf.s, steps, f));
             }
         }
-        if let Some((mut mxf, (color, square))) = corner_mask {
-            mxf.shape_sq = square | st.square_corners;
-            self.smooth = st.smooth || st.glass.is_some();
-            self.fill(&mxf, r, st.radius, Fill::Solid(color), None);
-            if let Some(Cmd::Quad(q)) = self.list.cmds.last_mut() {
-                q.np[3] = ((q.np[3] as u32) | 256) as f32;
-            }
-            self.smooth = false;
+        if let Some((mxf, mask)) = corner_mask {
+            self.paint_corner_mask(mxf, r, &st, mask);
         }
         if let Some((ixf, sh)) = inset {
             self.smooth = st.smooth;
@@ -1822,7 +1821,7 @@ impl<S> Painter<'_, S> {
                 if let Some(Cmd::Quad(q)) = self.list.cmds.last_mut() {
                     q.n0 = color.arr();
                     q.n1 = [fraction, if trailing { 1.0 } else { 0.0 }, 0.0, 0.0];
-                    q.np[3] = ((q.np[3] as u32) | 16384) as f32;
+                    q.np[3] = ((q.np[3] as u32) | FLAG_BORDER_FADE) as f32;
                 }
             }
             self.smooth = false;
@@ -2143,22 +2142,7 @@ impl<S: 'static> Ui<S> {
         let paint_sel = self.sel.for_paint();
         let blink = self.ed.blink_at.map_or(0.0, |t| (now - t).as_secs_f32());
         let fg = look.theme.color.text;
-        let xf = Xf {
-            s: 1.0,
-            tx: 0.0,
-            ty: 0.0,
-            opacity: 1.0,
-            text_reveal: None,
-            hover_scope: None,
-            clip: Rect::new(0.0, 0.0, size.0, size.1),
-            clip_r: 0.0,
-            clip_smooth: false,
-            clip_sq: 0,
-            shape_sq: 0,
-            border_hidden: 0,
-            fg,
-            px: self.scale,
-        };
+        let xf = Xf::screen(Rect::new(0.0, 0.0, size.0, size.1), fg, self.scale);
         let frame = self.frame;
         let mut p = Painter {
             list: &mut self.list,

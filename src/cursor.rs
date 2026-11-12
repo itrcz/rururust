@@ -12,7 +12,7 @@ pub(super) fn pose(time:f32,period:f32,duration:f32)->Pose {
         return Pose {shape:2.0,rotation:0.0,scale,animate:true,wake:None};
     }
     let active=phase-circle_hold;
-    let smooth=|x:f32|{let x=x.clamp(0.0,1.0);x*x*(3.0-2.0*x)};
+    use crate::types::smoothstep as smooth;
     let shape=if active<duration {2.0-smooth(active/duration)}
         else if active<duration+triangle_hold {1.0}
         else {1.0+smooth((active-duration-triangle_hold)/duration)};

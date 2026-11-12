@@ -5,8 +5,8 @@
 //! glass the frame goes straight to the screen in a single pass.
 
 use crate::text::TextSystem;
-use crate::types::{Color, Rect};
-use crate::ui::{Cmd, DrawList, Quad, TextCmd, KIND_GLASS, KIND_IMAGE, KIND_SHADOW};
+use crate::types::{smoothstep, Color, Rect};
+use crate::ui::{Cmd, DrawList, Quad, TextCmd, FLAG_HORIZONTAL_LIGHT, KIND_GLASS, KIND_IMAGE, KIND_SHADOW};
 use crate::view::Image;
 use std::collections::HashMap;
 use glyphon::{Cache, ColorMode, Resolution, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport};
@@ -777,7 +777,7 @@ impl Renderer {
             for (b, p) in panes.iter().enumerate() {
                 if b == a || p.1 != snap || quads[p.0].p0[2] > 0.0
                     || (quads[p.0].np[3] as u32) & 240 != 0
-                    || (quads[qa].np[3] as u32 & 512) != (quads[p.0].np[3] as u32 & 512)
+                    || (quads[qa].np[3] as u32 & FLAG_HORIZONTAL_LIGHT) != (quads[p.0].np[3] as u32 & FLAG_HORIZONTAL_LIGHT)
                     || quads[qa].c0 != quads[p.0].c0 || quads[qa].c1 != quads[p.0].c1
                     || quads[qa].p1 != quads[p.0].p1 {
                     continue;
@@ -1102,7 +1102,7 @@ fn fade_parts(t: &TextCmd, scale: f32) -> impl Iterator<Item = (TextBounds, f32)
     [(head, 1.0), (start, 1.0)].into_iter().chain((0..n).map(move |k| {
         let (l, r) = (left + (right - left) * k / n, left + (right - left) * (k + 1) / n);
         let a = 1.0 - (k as f32 + 0.5) / n as f32;
-        (TextBounds { left: l, right: r, ..line }, a * a * (3.0 - 2.0 * a))
+        (TextBounds { left: l, right: r, ..line }, smoothstep(a))
     })).flat_map(move |(part, alpha)| {
         // Split only the leading ramp; keep the middle as one fully opaque area.
         let end = (leading_start + leading_fade).round() as i32;
@@ -1112,9 +1112,8 @@ fn fade_parts(t: &TextCmd, scale: f32) -> impl Iterator<Item = (TextBounds, f32)
         std::iter::once((solid, alpha)).chain((0..n).map(move |k| {
             let left = part.left + (ramp_end - part.left) * k / n;
             let right = part.left + (ramp_end - part.left) * (k + 1) / n;
-            let a = (((left + right) as f32 * 0.5 - leading_start)
-                / leading_fade).clamp(0.0, 1.0);
-            (TextBounds { left, right, ..part }, alpha * a * a * (3.0 - 2.0 * a))
+            let a = ((left + right) as f32 * 0.5 - leading_start) / leading_fade;
+            (TextBounds { left, right, ..part }, alpha * smoothstep(a))
         }))
     })
 }

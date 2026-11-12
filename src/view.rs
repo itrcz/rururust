@@ -287,13 +287,15 @@ pub(crate) struct Style {
     pub glass: Option<Glass>,
     pub glass_fade: f32,
     pub opacity: f32,
-    pub press_scale: f32,
-    pub press_opacity: f32,
+    /// Press feedback; `None` = the theme's `motion.press_scale` / `press_opacity`.
+    pub press_scale: Option<f32>,
+    pub press_opacity: Option<f32>,
     pub reveal: Option<bool>,
     pub text_reveal: Option<TextReveal>,
     pub text_shimmer: Option<(f32, Color)>,
     pub text_cursor: Option<TextCursor>,
-    pub hover_marquee: Option<(f32, f32, f32)>,
+    /// Speed, trailing inset, fade width (`None` = the theme's `control.fade_width`).
+    pub hover_marquee: Option<(f32, f32, Option<f32>)>,
     pub hover_marquee_leading_outset: f32,
     pub hover_scope: bool,
     pub hover_offset: Option<(f32,f32)>,
@@ -349,6 +351,12 @@ pub(crate) const PAD_B: u8 = 8;
 const PAD_ALL: u8 = PAD_L | PAD_T | PAD_R | PAD_B;
 pub(crate) const SET_RADIUS: u8 = 16;
 
+/// Bit `i` for every `false` in `on` (corners clockwise from top left, or edges clockwise from
+/// the top): the corners drawn square, the border edges hidden.
+fn corner_bits(on: [bool; 4]) -> u8 {
+    on.iter().enumerate().fold(0, |mask, (i, on)| mask | if *on { 0 } else { 1 << i })
+}
+
 impl Default for Style {
     fn default() -> Self {
         Style {
@@ -369,8 +377,8 @@ impl Default for Style {
             glass: None,
             glass_fade: 0.0,
             opacity: 1.0,
-            press_scale: 0.98,
-            press_opacity: 0.7,
+            press_scale: None,
+            press_opacity: None,
             reveal: None,
             text_reveal: None,
             text_shimmer: None,
@@ -955,7 +963,8 @@ impl<S> View<S> {
         self.style.bg = Some(Fill::Linear(from, to, angle_deg));
         self
     }
-    /// Corner radius with iOS-style continuous (squircle) corners.
+    /// Corner radius. Corners are circular arcs, as on macOS; add [`smooth`](View::smooth) for
+    /// iOS-style continuous (squircle) ones. Glass always has continuous corners.
     pub fn radius(mut self, r: f32) -> Self {
         self.style.radius = r;
         self.style.set |= SET_RADIUS;
@@ -969,26 +978,21 @@ impl<S> View<S> {
     /// Select rounded corners, clockwise from top left. Uses the radius set by `.radius()`.
     /// The same corners apply to the background, border, shadows and child clipping.
     pub fn round_corners(mut self, corners: [bool; 4]) -> Self {
-        self.style.square_corners = corners.iter().enumerate()
-            .fold(0, |mask, (i, round)| mask | if *round { 0 } else { 1 << i });
+        self.style.square_corners = corner_bits(corners);
         self
     }
     /// Cover the exterior of selected rounded corners with a solid color, after painting
     /// this view and its children. Corners run clockwise from top left. Uses the view's exact
     /// measured size and radius; useful around glass without hiding its backdrop inside.
     pub fn mask_corners(mut self, color: Color, corners: [bool; 4]) -> Self {
-        let square = corners.iter().enumerate()
-            .fold(0, |mask, (i, round)| mask | if *round { 0 } else { 1 << i });
-        self.style.corner_mask = Some((color, square));
+        self.style.corner_mask = Some((color, corner_bits(corners)));
         self
     }
     /// Cover the backdrop outside selected rounded corners before this view's shadows,
     /// material and children. Unlike `.mask_corners()`, this preserves soft surface shadows.
     /// Corners run clockwise from top left and follow the measured size and radius.
     pub fn mask_backdrop_corners(mut self, color: Color, corners: [bool; 4]) -> Self {
-        let square = corners.iter().enumerate()
-            .fold(0, |mask, (i, round)| mask | if *round { 0 } else { 1 << i });
-        self.style.backdrop_corner_mask = Some((color, square));
+        self.style.backdrop_corner_mask = Some((color, corner_bits(corners)));
         self
     }
     pub fn border(mut self, width: f32, color: Color) -> Self {
@@ -998,8 +1002,7 @@ impl<S> View<S> {
     /// Select visible border edges, clockwise from top: top, right, bottom, left.
     /// Adjacent enabled edges share their rounded corner. Hidden edges do not inset child clips.
     pub fn border_edges(mut self, edges: [bool; 4]) -> Self {
-        self.style.border_hidden = edges.iter().enumerate()
-            .fold(0, |mask, (i, visible)| mask | if *visible { 0 } else { 1 << i });
+        self.style.border_hidden = corner_bits(edges);
         self
     }
     /// A soft drop shadow `y` points below the view. Replaces the first (key) shadow.
@@ -1077,7 +1080,8 @@ impl<S> View<S> {
         attach(&mut self,cursor);self
     }
 
-    /// Sweep a soft highlight across a plain text label without changing its layout.
+    /// Text only: sweep a soft highlight across a label, plain or `rich_text`, without changing
+    /// its layout. Not inherited: on a stack (or `markdown`) put it on the text views inside.
     /// Only visible labels request animation frames. Pass zero to disable the effect.
     pub fn text_shimmer(mut self, seconds: f32, highlight: Color) -> Self {
         self.style.text_shimmer = (seconds.is_finite() && seconds > 0.0).then_some((seconds, highlight));
@@ -1179,10 +1183,10 @@ impl<S> View<S> {
     /// Split only: use the main pane's complete border as the resize highlight instead of a straight
     /// divider. Keeps its radius and selected corners; defaults to the theme's divider style.
     pub fn highlight_main_border(mut self) -> Self {
-        if let Some(split) = self.extras().split.as_mut() { split.highlight_main_border = true; }
+        if let Some(sp) = self.extra.as_mut().and_then(|x| x.split.as_mut()) { sp.highlight_main_border = true; }
         self
     }
-    /// Fade the main border's resize highlight into its resting color across `fraction`
+    /// Split only: fade the main border's resize highlight into its resting color across `fraction`
     /// of the main pane's width, starting at the divider. Enables main-border highlighting.
     pub fn highlight_main_border_fade(mut self, fraction: f32) -> Self {
         if let Some(sp) = self.extra.as_mut().and_then(|x| x.split.as_mut()) {
@@ -1191,12 +1195,12 @@ impl<S> View<S> {
         }
         self
     }
-    /// Show a centered resize grip that stretches on hover and while dragging.
+    /// Split only: show a centered resize grip that stretches on hover and while dragging.
     pub fn resize_grip(mut self) -> Self {
         if let Some(sp) = self.extra.as_mut().and_then(|x| x.split.as_mut()) { sp.resize_grip = true; }
         self
     }
-    /// Place the resize grip's center `inset` points above the split's bottom edge.
+    /// Split only: place the resize grip's center `inset` points above the split's bottom edge.
     pub fn resize_grip_at_bottom(mut self, inset: f32) -> Self {
         if let Some(sp) = self.extra.as_mut().and_then(|x| x.split.as_mut()) {
             sp.resize_grip = true;
@@ -1310,10 +1314,12 @@ impl<S> View<S> {
         }
         self
     }
-    /// Show a long single-line label once from start to end while hovered, then stop.
+    /// Text only: show a long single-line label once from start to end while hovered, then stop.
     /// `speed` is points/second; `trailing_inset` reserves space for overlaid hover actions;
-    /// `fade_width` softens the moving text's trailing edge. At rest the full width is used,
-    /// with a hard clip. Short labels never animate. Leaving returns the text smoothly in 180 ms.
+    /// `fade_width` softens the moving text's trailing edge (a negative width takes the theme's
+    /// `control.fade_width`, the same ramp as `Truncate::Fade`). At rest the full width is used,
+    /// with a hard clip. Short labels never animate. Leaving returns the text smoothly in
+    /// `motion.marquee_return` (180 ms).
     /// Put `.hover_scope()` on a surrounding row to keep scrolling over its action buttons.
     pub fn hover_marquee(mut self, speed: f32, trailing_inset: f32, fade_width: f32) -> Self {
         if let Kind::Text(t) = &mut self.kind {
@@ -1321,12 +1327,12 @@ impl<S> View<S> {
             self.style.hover_marquee = Some((
                 if speed.is_finite() {speed.max(1.0)}else{1.0},
                 if trailing_inset.is_finite() {trailing_inset.max(0.0)}else{0.0},
-                if fade_width.is_finite() {fade_width.max(0.0)}else{0.0},
+                if fade_width < 0.0 {None} else if fade_width.is_finite() {Some(fade_width)} else {Some(0.0)},
             ));
         }
         self
     }
-    /// Let scrolling text paint into the leading row padding, without moving its resting
+    /// Text only, with `.hover_marquee()`: let scrolling text paint into the leading row padding, without moving its resting
     /// position or changing the trailing action inset. The extra space fades in using the
     /// marquee fade width, capped by this outset. The ancestor clip is still respected.
     pub fn hover_marquee_leading_outset(mut self, points:f32) -> Self {
@@ -1345,7 +1351,7 @@ impl<S> View<S> {
         self.style.hover_offset=Some((x,y));self
     }
 
-    /// Center lines of multi-line text.
+    /// Text only: center lines of multi-line text.
     pub fn centered(mut self) -> Self {
         if let Kind::Text(t) = &mut self.kind {
             t.center = true;
@@ -1397,15 +1403,16 @@ impl<S> View<S> {
         self.style.reveal = Some(shown);
         self
     }
-    /// Opacity while pressed (default 0.7). Set to 1.0 for scale-only press feedback.
+    /// Opacity while pressed (the theme's `motion.press_opacity`, 0.7). Set to 1.0 for
+    /// scale-only press feedback.
     pub fn press_opacity(mut self, opacity: f32) -> Self {
-        self.style.press_opacity = opacity.clamp(0.0, 1.0);
+        self.style.press_opacity = Some(opacity.clamp(0.0, 1.0));
         self
     }
-    /// Scale while pressed (default 0.98). Use 1.0 to keep labels stationary while
+    /// Scale while pressed (the theme's `motion.press_scale`, 0.98). Use 1.0 to keep labels stationary while
     /// retaining the dimmed press feedback, e.g. `button("Model", |_| {}).press_scale(1.0)`.
     pub fn press_scale(mut self, scale: f32) -> Self {
-        self.style.press_scale = scale.clamp(0.0, 1.0);
+        self.style.press_scale = Some(scale.clamp(0.0, 1.0));
         self
     }
     /// Pressing on this view moves the window, as a title bar does; a double click zooms it.

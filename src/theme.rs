@@ -186,6 +186,10 @@ pub struct Controls {
     pub scrollbar_track_opacity: f32,
     pub tip_padding: (f32, f32),
     pub tip_radius: f32,
+    /// Length of the ramp of `Truncate::Fade`, and of a `.hover_marquee()` edge by default.
+    pub fade_width: f32,
+    /// Corner radius of selected-text highlights (text fields and `.selectable()` text).
+    pub selection_radius: f32,
 }
 
 /// Shadow presets.
@@ -313,6 +317,8 @@ impl Theme {
                 scrollbar_track_opacity: 0.06,
                 tip_padding: (9.0, 5.0),
                 tip_radius: 9.0,
+                fade_width: 28.0,
+                selection_radius: 2.0,
             },
             shadow: Shadows {
                 control: Shadow::new(Color::BLACK.alpha(0.25), 8.0, 3.0),
