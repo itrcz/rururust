@@ -1406,11 +1406,6 @@ impl<S> Painter<'_, S> {
                 };
                 let (cx, vel) = self.spring_v(id, 5, target);
                 let p = self.spring(id, 6, if held { 1.0 } else { 0.0 });
-                for (i, (key, ts)) in ln.texts.iter().enumerate() {
-                    let near = (1.0 - (center(i) - cx).abs() / tab_w).clamp(0.0, 1.0);
-                    let color = xf.fg.alpha(xf.fg.a * (0.6 + 0.4 * near));
-                    self.label(&xf, *key, (center(i) - ts.0 * 0.5, r.y + (r.h - ts.1) * 0.5), *ts, color);
-                }
                 // Liquid: it swells when grabbed and stretches along its motion.
                 let stretch = (vel.abs() * 0.035).min(tab_w * 0.6);
                 let lw = tab_w * (1.0 + 0.14 * p) + stretch;
@@ -1433,6 +1428,13 @@ impl<S> Painter<'_, S> {
                 // The drop swells and stretches as it slides: no pixel steps.
                 let lxf = Xf { px: 0.0, ..xf };
                 self.glass(&lxf, lens, lh * 0.5, drop, None);
+                // Labels are foreground content: glass samples only the backdrop,
+                // never the glyphs, including while the lens is dragged between tabs.
+                for (i, (key, ts)) in ln.texts.iter().enumerate() {
+                    let near = (1.0 - (center(i) - cx).abs() / tab_w).clamp(0.0, 1.0);
+                    let color = xf.fg.alpha(xf.fg.a * (0.6 + 0.4 * near));
+                    self.label(&xf, *key, (center(i) - ts.0 * 0.5, r.y + (r.h - ts.1) * 0.5), *ts, color);
+                }
                 self.hit(&xf, id, csr.inflate(4.0), Action::Tabs {
                         x0: (r.x + tabs_pad) * xf.s + xf.tx,
                         tab_w: tab_w * xf.s,
@@ -1480,7 +1482,7 @@ impl<S> Painter<'_, S> {
                     let visible=xf.rect(Rect::new(inner.x-leading,inner.y,width+leading,inner.h));
                     clip=xf.clip.intersect(&visible);
                     leading_fade = (leading.min(fade_width) * xf.s).min(clip.w);
-                    fade=(hovered && offset<distance-0.5 && fade_width>0.0).then(|| {
+                    fade=(offset<distance-0.5 && fade_width>0.0).then(|| {
                         let width=(fade_width*xf.s).min(visible.w);
                         Rect::new(visible.x+visible.w-width,visible.y,width,visible.h)
                     });

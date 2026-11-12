@@ -156,10 +156,22 @@ fn tab_drop_selects_on_tap_and_on_drag_release() {
     struct T {
         tab: usize,
     }
+    fn labels_above_glass(ui:&Ui<T>) {
+        let mut labels=0;let mut panes=0;
+        for cmd in &ui.list.cmds {match cmd {
+            ruru::Cmd::Text(_)=>labels+=1,
+            ruru::Cmd::Quad(q) if q.p0[3]==2.0=>{
+                panes+=1;assert_eq!(labels,0,"glass must not sample the tab labels");
+            },_=>{},
+        }}
+        assert_eq!(panes,2,"both the bar and moving lens retain their glass");
+        assert_eq!(labels,3,"each label is painted once, above the glass");
+    }
     let mut ui = Ui::new(T { tab: 0 }, |s: &T| {
         zstack(tab_bar(&["One", "Two", "Three"], s.tab, |s: &mut T, i| s.tab = i).place(Align::Start, Align::Start)).fill()
     });
     ui.frame((400.0, 200.0));
+    labels_above_glass(&ui);
     // Three equal tabs: the bar is 6 pt of padding + 3 tabs + 6 pt.
     let tab_w = 40.0 + 44.0; // rough; only the ordering of the taps matters below
     ui.pointer_down((6.0 + tab_w * 2.5, 28.0), false);
@@ -167,12 +179,15 @@ fn tab_drop_selects_on_tap_and_on_drag_release() {
     assert_eq!(ui.state.tab, 2);
     // Grab the drop, drag it left and let go below the bar: the tab under it wins.
     ui.frame((400.0, 200.0));
+    labels_above_glass(&ui);
     ui.pointer_down((6.0 + tab_w * 2.5, 28.0), false);
     ui.pointer_move((10.0, 150.0));
     ui.frame((400.0, 200.0));
+    labels_above_glass(&ui);
     assert!(ui.animating, "the drop is moving");
     ui.pointer_up((10.0, 150.0));
     assert_eq!(ui.state.tab, 0);
+    ui.frame((400.0,200.0));labels_above_glass(&ui);
 }
 
 #[test]
@@ -4058,7 +4073,7 @@ fn hover_marquee_uses_full_width_scrolls_once_and_returns_smoothly() {
     let size=(240.0,80.0);ui.frame(size);ui.frame(size);
     let text=|ui:&Ui<i32>|ui.list.cmds.iter().find_map(|c|if let ruru::Cmd::Text(t)=c {Some((t.pos,t.clip,t.fade))}else{None}).unwrap();
     let rest=text(&ui);
-    assert!(rest.2.is_none());assert_eq!(rest.1.x+rest.1.w,120.0);
+    assert!(rest.2.is_some());assert_eq!(rest.1.x+rest.1.w,120.0);
     assert!(!ui.animating && ui.wake_in.is_none());
     // The action overlays the label, so hover must come from the entire row's scope.
     ui.pointer_move((110.0,12.0));ui.frame(size);
@@ -4076,7 +4091,7 @@ fn hover_marquee_uses_full_width_scrolls_once_and_returns_smoothly() {
     std::thread::sleep(std::time::Duration::from_millis(60));ui.frame(size);
     let returning=text(&ui).0.0;assert!(returning>end.0.0 && returning<rest.0.0);
     std::thread::sleep(std::time::Duration::from_millis(160));ui.frame(size);ui.frame(size);
-    assert_eq!(text(&ui).0,rest.0);assert!(text(&ui).2.is_none());
+    assert_eq!(text(&ui).0,rest.0);assert!(text(&ui).2.is_some());
     assert_eq!(text(&ui).1.w,120.0);
     assert!(!ui.animating && ui.wake_in.is_none(),"the completed return does not repaint");
 }

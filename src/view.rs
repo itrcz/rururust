@@ -1806,7 +1806,7 @@ pub fn picker<S, T: AsRef<str>>(options: &[T], selected: usize, on_select: impl 
 }
 /// Floating glass tab bar. A glass "drop" marks the selected tab: it flows to a tab when
 /// you tap it, and while held it swells past the bar and can be dragged across the tabs,
-/// bending everything underneath like a lens.
+/// bending the backdrop like a lens. Labels are painted above the glass and stay sharp.
 pub fn tab_bar<S, T: AsRef<str>>(labels: &[T], selected: usize, on_select: impl Fn(&mut S, usize) + 'static) -> View<S> {
     let labels: Vec<String> = labels.iter().map(|l| l.as_ref().to_string()).collect();
     let selected = selected.min(labels.len().saturating_sub(1));
