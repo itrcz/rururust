@@ -1002,6 +1002,17 @@ impl<S> View<S> {
         self.style.corner_mask = Some((color, corner_bits(corners)));
         self
     }
+    /// `icon_button` only: the glyph's size in points, instead of the theme's
+    /// `control.icon_button_glyph`: `icon_button(&icons.x, close).size(22.0, 22.0).icon_size(14.0)`.
+    pub fn icon_size(mut self, pt: f32) -> Self {
+        if let (Role::IconButton, Kind::Stack { children, .. }) = (self.style.role, &mut self.kind) {
+            for c in children.iter_mut().filter(|c| matches!(c.kind, Kind::Image(..))) {
+                c.style.width = Dim::Fixed(pt);
+                c.style.height = Dim::Fixed(pt);
+            }
+        }
+        self
+    }
     /// After `.mask_corners()`: paint that mask under this view (before its shadows, material
     /// and children) instead of over it, so soft surface shadows stay visible on the mask.
     pub fn mask_under(mut self) -> Self {

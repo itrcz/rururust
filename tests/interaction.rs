@@ -4795,3 +4795,12 @@ fn disabled_button_ignores_taps_and_does_not_pass_them_on() {
     ui.pointer_up((100.0, 50.0));
     assert_eq!((ui.state.n, ui.state.under), (1, 0));
 }
+
+#[test]
+fn icon_size_overrides_the_theme_glyph() {
+    let img = Image::from_rgba(2, 2, vec![255; 16]);
+    let mut ui = Ui::new((), move |_: &()| zstack(icon_button(&img, |_: &mut ()| {}).size(22.0, 22.0).icon_size(14.0)));
+    ui.frame((100.0, 100.0));
+    let glyph = ui.list.cmds.iter().find_map(|c| match c { ruru::Cmd::Quad(q) if q.p0[3] == 3.0 => Some(q.rect), _ => None }).expect("glyph");
+    assert_eq!((glyph[2], glyph[3]), (14.0, 14.0));
+}
