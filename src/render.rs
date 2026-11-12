@@ -1097,11 +1097,26 @@ fn fade_parts(t: &TextCmd, scale: f32) -> impl Iterator<Item = (TextBounds, f32)
             (TextBounds { bottom: top, ..clip }, TextBounds { right: left, ..line }, line, left, right, ((right - left) / 2).clamp(1, 24))
         }
     };
+    let leading_fade = t.leading_fade * scale;
+    let leading_start = t.clip.x * scale;
     [(head, 1.0), (start, 1.0)].into_iter().chain((0..n).map(move |k| {
         let (l, r) = (left + (right - left) * k / n, left + (right - left) * (k + 1) / n);
         let a = 1.0 - (k as f32 + 0.5) / n as f32;
         (TextBounds { left: l, right: r, ..line }, a * a * (3.0 - 2.0 * a))
-    }))
+    })).flat_map(move |(part, alpha)| {
+        // Split only the leading ramp; keep the middle as one fully opaque area.
+        let end = (leading_start + leading_fade).round() as i32;
+        let ramp_end = end.min(part.right);
+        let n = if leading_fade > 0.0 { (ramp_end - part.left).clamp(0, 24) } else { 0 };
+        let solid = TextBounds { left: if n > 0 { ramp_end } else { part.left }, ..part };
+        std::iter::once((solid, alpha)).chain((0..n).map(move |k| {
+            let left = part.left + (ramp_end - part.left) * k / n;
+            let right = part.left + (ramp_end - part.left) * (k + 1) / n;
+            let a = (((left + right) as f32 * 0.5 - leading_start)
+                / leading_fade).clamp(0.0, 1.0);
+            (TextBounds { left, right, ..part }, alpha * a * a * (3.0 - 2.0 * a))
+        }))
+    })
 }
 
 fn union(a: &Rect, b: &Rect) -> Rect {
@@ -1221,6 +1236,7 @@ fn text_words(out: &mut Vec<u32>, t: &TextCmd) {
     let (c, k) = (t.color, t.clip);
     out.extend_from_slice(&[t.key as u32, (t.key >> 32) as u32, f(t.pos.0), f(t.pos.1), f(t.size.0), f(t.size.1)]);
     out.extend_from_slice(&[f(t.scale), f(c.r), f(c.g), f(c.b), f(c.a), f(k.x), f(k.y), f(k.w), f(k.h)]);
+    out.push(f(t.leading_fade));
     match t.fade {
         Some(r) => out.extend_from_slice(&[1, f(r.x), f(r.y), f(r.w), f(r.h)]),
         None => out.push(0),
@@ -1258,6 +1274,25 @@ fn on_pixel(v: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn marquee_fades_both_edges_without_overlapping_strips() {
+        let t = TextCmd { key: 0, pos: (10.0, 0.0), size: (100.0, 20.0), scale: 1.0,
+            color: Color::hex(0xFFFFFF), clip: Rect::new(0.0, 0.0, 100.0, 20.0),
+            fade: Some(Rect::new(90.0, 0.0, 10.0, 20.0)), leading_fade: 10.0 };
+        for scale in [1.0, 2.0] {
+            let mut pixels = vec![Vec::new(); (100.0 * scale) as usize];
+            for (bounds, alpha) in fade_parts(&t, scale) {
+                if bounds.bottom <= bounds.top { continue; }
+                for x in bounds.left..bounds.right { pixels[x as usize].push(alpha); }
+            }
+            assert!(pixels.iter().all(|p|p.len() == 1), "each pixel is drawn exactly once");
+            assert!(pixels[0][0] < 0.05);
+            assert!(pixels.last().unwrap()[0] < 0.05);
+            assert_eq!(pixels[(50.0 * scale) as usize][0], 1.0);
+            assert_eq!(pixels[(10.0 * scale) as usize][0], 1.0, "resting title stays opaque");
+        }
+    }
 
     #[test]
     fn plan_covers_what_glass_reads_and_what_each_level_needs() {

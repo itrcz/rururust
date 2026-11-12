@@ -67,6 +67,8 @@ pub struct TextCmd {
     /// Where the text fades out: alpha falls from 1 at the left of this rect to 0 at its
     /// right; text to the right of it is hidden. `Truncate::Fade`.
     pub fade: Option<Rect>,
+    /// Fade in from the leading clip edge over this many points (full text height).
+    pub leading_fade: f32,
 }
 
 /// Length of the `Truncate::Fade` ramp in points.
@@ -822,6 +824,7 @@ impl<S> Painter<'_, S> {
             color: color.alpha(color.a * xf.opacity),
             clip: xf.clip,
             fade: None,
+            leading_fade: 0.0,
         }));
     }
 
@@ -1466,14 +1469,17 @@ impl<S> Painter<'_, S> {
                     let w = (FADE_W * xf.s).min(box_.w * 0.5);
                     Rect::new(box_.x + box_.w - w, box_.y + box_.h - line_h, w, line_h)
                 });
+                let mut leading_fade = 0.0;
                 if let Some((speed,inset,fade_width))=st.hover_marquee {
                     let hovered=xf.hover_scope.unwrap_or_else(||self.hovered.contains(&id));
                     let width=(inner.w-if hovered {inset}else{0.0}).max(0.0);
                     let distance=(ln.marquee_width-width).max(0.0);
                     let (offset,running)=self.marquees.offset(id,ln.text,distance,speed,hovered,self.time,self.frame);
                     self.spin|=running;
-                    let visible=xf.rect(Rect::new(inner.x,inner.y,width,inner.h));
+                    let leading=st.hover_marquee_leading_outset;
+                    let visible=xf.rect(Rect::new(inner.x-leading,inner.y,width+leading,inner.h));
                     clip=xf.clip.intersect(&visible);
+                    leading_fade = (leading.min(fade_width) * xf.s).min(clip.w);
                     fade=(hovered && offset<distance-0.5 && fade_width>0.0).then(|| {
                         let width=(fade_width*xf.s).min(visible.w);
                         Rect::new(visible.x+visible.w-width,visible.y,width,visible.h)
@@ -1498,6 +1504,7 @@ impl<S> Painter<'_, S> {
                         color: xf.fg.alpha(xf.fg.a * xf.opacity),
                         clip,
                         fade,
+                        leading_fade,
                     }));
                 }
                 if let Some(cursor)=st.text_cursor {
@@ -1537,7 +1544,7 @@ impl<S> Painter<'_, S> {
                         let alpha = (1.0 - distance * distance).max(0.0).powi(3);
                         self.list.cmds.push(Cmd::Text(TextCmd {
                             key: ln.text, pos, size: (box_.w, box_.h), scale,
-                            color: highlight.alpha(highlight.a * xf.opacity * alpha), clip: mask, fade,
+                            color: highlight.alpha(highlight.a * xf.opacity * alpha), clip: mask, fade, leading_fade,
                         }));
                     }
                 }
@@ -2233,6 +2240,7 @@ impl<S: 'static> Ui<S> {
             color: Color::hex(0x7CFF9B),
             clip,
             fade: None,
+            leading_fade: 0.0,
         }));
     }
 

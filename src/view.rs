@@ -294,6 +294,7 @@ pub(crate) struct Style {
     pub text_shimmer: Option<(f32, Color)>,
     pub text_cursor: Option<TextCursor>,
     pub hover_marquee: Option<(f32, f32, f32)>,
+    pub hover_marquee_leading_outset: f32,
     pub hover_scope: bool,
     pub hover_offset: Option<(f32,f32)>,
     pub fg: Option<Color>,
@@ -375,6 +376,7 @@ impl Default for Style {
             text_shimmer: None,
             text_cursor: None,
             hover_marquee: None,
+            hover_marquee_leading_outset: 0.0,
             hover_scope: false,
             hover_offset: None,
             fg: None,
@@ -1311,7 +1313,7 @@ impl<S> View<S> {
     /// Show a long single-line label once from start to end while hovered, then stop.
     /// `speed` is points/second; `trailing_inset` reserves space for overlaid hover actions;
     /// `fade_width` softens the moving text's trailing edge. At rest the full width is used,
-    /// with a hard clip. Short labels never animate. Leaving resets the text immediately.
+    /// with a hard clip. Short labels never animate. Leaving returns the text smoothly in 180 ms.
     /// Put `.hover_scope()` on a surrounding row to keep scrolling over its action buttons.
     pub fn hover_marquee(mut self, speed: f32, trailing_inset: f32, fade_width: f32) -> Self {
         if let Kind::Text(t) = &mut self.kind {
@@ -1322,6 +1324,13 @@ impl<S> View<S> {
                 if fade_width.is_finite() {fade_width.max(0.0)}else{0.0},
             ));
         }
+        self
+    }
+    /// Let scrolling text paint into the leading row padding, without moving its resting
+    /// position or changing the trailing action inset. The extra space fades in using the
+    /// marquee fade width, capped by this outset. The ancestor clip is still respected.
+    pub fn hover_marquee_leading_outset(mut self, points:f32) -> Self {
+        self.style.hover_marquee_leading_outset=if points.is_finite() {points.max(0.0)}else{0.0};
         self
     }
     /// Use this container's hover area for descendant `.hover_marquee()` labels.

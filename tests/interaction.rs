@@ -4048,7 +4048,7 @@ fn collapsed_split_can_hide_its_divider_without_interrupting_the_current_drag() 
 
 
 #[test]
-fn hover_marquee_uses_full_width_at_rest_scrolls_once_and_resets() {
+fn hover_marquee_uses_full_width_scrolls_once_and_returns_smoothly() {
     let mut ui=Ui::new(0,|_:&i32| {
         zstack((
             text("A fairly long sidebar title that needs room").hover_marquee(5000.0,24.0,8.0).fill_width(),
@@ -4070,10 +4070,15 @@ fn hover_marquee_uses_full_width_at_rest_scrolls_once_and_resets() {
     assert_eq!(text(&ui).0,end.0,"never loop while hovered");
     ui.pointer_down((110.0,12.0),false);ui.pointer_up((110.0,12.0));
     assert_eq!(ui.state,1,"hover scope does not intercept the action");
-    ui.pointer_move((220.0,60.0));
-    for _ in 0..40 {ui.frame(size);std::thread::sleep(std::time::Duration::from_millis(8));}
+    ui.pointer_move((220.0,60.0));ui.frame(size);
+    assert!((text(&ui).0.0-end.0.0).abs()<1.0,"leaving does not snap the title back");
+    assert!(ui.animating);
+    std::thread::sleep(std::time::Duration::from_millis(60));ui.frame(size);
+    let returning=text(&ui).0.0;assert!(returning>end.0.0 && returning<rest.0.0);
+    std::thread::sleep(std::time::Duration::from_millis(160));ui.frame(size);ui.frame(size);
     assert_eq!(text(&ui).0,rest.0);assert!(text(&ui).2.is_none());
     assert_eq!(text(&ui).1.w,120.0);
+    assert!(!ui.animating && ui.wake_in.is_none(),"the completed return does not repaint");
 }
 
 #[test]
