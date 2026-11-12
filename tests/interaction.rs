@@ -4377,3 +4377,50 @@ fn text_shimmer_sweeps_rich_text_too() {
     assert!(rich.0 > 1 && rich.1, "rich {rich:?}");
     assert!(!count(|| rich_text(Vec::new())).1, "empty text has nothing to sweep: no frames");
 }
+
+#[test]
+fn press_opacity_comes_from_the_theme_and_the_modifier_wins() {
+    // The alpha of a held button's label relative to its resting alpha, once settled.
+    let held = |opacity: Option<f32>| {
+        let mut ui = Ui::new(0, move |_: &i32| {
+            let b = button("Dim", |s: &mut i32| *s += 1).size(200.0, 60.0);
+            match opacity { Some(o) => b.press_opacity(o), None => b }
+        });
+        let mut theme = Theme::dark();
+        theme.motion.press_opacity = 0.4;
+        ui.set_theme(theme);
+        ui.frame((200.0, 60.0));
+        let alpha = |ui: &Ui<i32>| ui.list.cmds.iter().find_map(|c| match c { ruru::Cmd::Text(t) => Some(t.color.a), _ => None }).unwrap();
+        let before = alpha(&ui);
+        ui.pointer_down((100.0, 30.0), false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            ui.frame((200.0, 60.0));
+            if !ui.animating || std::time::Instant::now() >= deadline { break; }
+        }
+        let k = alpha(&ui) / before;
+        ui.pointer_up((100.0, 30.0));
+        assert_eq!(ui.state, 1, "the tap still lands");
+        k
+    };
+    assert!((held(None) - 0.4).abs() < 0.01, "theme default: {}", held(None));
+    assert!((held(Some(0.6)) - 0.6).abs() < 0.01);
+    assert_eq!(held(Some(1.0)), 1.0, "1.0 keeps the label fully opaque");
+}
+
+#[test]
+fn glass_fade_reaches_the_glass_quad_and_ignores_bad_heights() {
+    let fade = |h: Option<f32>| {
+        let mut ui = Ui::new((), move |_: &()| {
+            let pane = rect().size(200.0, 80.0).glass();
+            zstack(match h { Some(h) => pane.glass_fade(h), None => pane }).place(Align::Start, Align::Start)
+        });
+        ui.frame((300.0, 200.0));
+        ui.list.cmds.iter().find_map(|c| match c { ruru::Cmd::Quad(q) if q.p0[3] == 2.0 => Some(q.p0[2]), _ => None }).expect("a glass quad")
+    };
+    assert_eq!(fade(None), 0.0);
+    assert_eq!(fade(Some(24.0)), 24.0);
+    assert_eq!(fade(Some(-5.0)), 0.0);
+    assert_eq!(fade(Some(f32::NAN)), 0.0);
+}
