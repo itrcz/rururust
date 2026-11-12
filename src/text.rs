@@ -1010,7 +1010,7 @@ mod tests {
                 match i % 5 {
                     1 => s.bold(),
                     2 => s.code(),
-                    3 => s.size(22.0).italic(),
+                    3 => s.font_size(22.0).italic(),
                     4 => s.color(crate::types::Color::rgba(1.0, 0.0, 0.0, 1.0)),
                     _ => s,
                 }

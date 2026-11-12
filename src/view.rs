@@ -470,7 +470,7 @@ impl Span {
         self
     }
     /// Font size of this run in points; its line grows to fit.
-    pub fn size(mut self, pt: f32) -> Self {
+    pub fn font_size(mut self, pt: f32) -> Self {
         self.size = Some(pt.max(1.0));
         self
     }
@@ -496,14 +496,14 @@ impl Span {
         self.link = Some(url.into());
         self
     }
-    /// An OpenType feature for this run: `Span::new("1/2").feature(*b"frac", 1)`.
-    pub fn feature(mut self, tag: [u8; 4], value: u32) -> Self {
+    /// An OpenType feature for this run: `Span::new("1/2").font_feature(*b"frac", 1)`.
+    pub fn font_feature(mut self, tag: [u8; 4], value: u32) -> Self {
         self.features.push((tag, value));
         self
     }
     /// Digits of equal width (`tnum`): counters and times that change in place do not jiggle.
     pub fn tabular(self) -> Self {
-        self.feature(*b"tnum", 1)
+        self.font_feature(*b"tnum", 1)
     }
 }
 
@@ -999,11 +999,12 @@ impl<S> View<S> {
         self.style.corner_mask = Some((color, corner_bits(corners)));
         self
     }
-    /// Cover the backdrop outside selected rounded corners before this view's shadows,
-    /// material and children. Unlike `.mask_corners()`, this preserves soft surface shadows.
-    /// Corners run clockwise from top left and follow the measured size and radius.
-    pub fn mask_backdrop_corners(mut self, color: Color, corners: [bool; 4]) -> Self {
-        self.style.backdrop_corner_mask = Some((color, corner_bits(corners)));
+    /// After `.mask_corners()`: paint that mask under this view (before its shadows, material
+    /// and children) instead of over it, so soft surface shadows stay visible on the mask.
+    pub fn mask_under(mut self) -> Self {
+        if let Some(mask) = self.style.corner_mask.take() {
+            self.style.backdrop_corner_mask = Some(mask);
+        }
         self
     }
     pub fn border(mut self, width: f32, color: Color) -> Self {
@@ -1550,12 +1551,16 @@ impl<S> View<S> {
     /// ```ignore
     /// button("…", |_| {}).menu(menu(vec![MenuItem::action("Rename", |s: &mut App| s.rename())]))
     /// ```
-    pub fn menu(self, content: View<S>) -> Self {
-        self.menu_at(Placement::bottom().start(), content)
+    pub fn menu(mut self, content: View<S>) -> Self {
+        self.extras().pop = Some(Pop { opens: Opens::Tap, placement: Placement::bottom().start(), content: Box::new(content) });
+        self
     }
-    /// [`menu`](View::menu) on another side, e.g. `Placement::top().start()` above an avatar.
-    pub fn menu_at(mut self, placement: Placement, content: View<S>) -> Self {
-        self.extras().pop = Some(Pop { opens: Opens::Tap, placement, content: Box::new(content) });
+    /// After `.menu()` or `.context_menu()`: another side, e.g. `Placement::top().start()`
+    /// above an avatar. Same shape as [`tooltip_at`](View::tooltip_at).
+    pub fn menu_at(mut self, placement: Placement) -> Self {
+        if let Some(pop) = self.extra.as_mut().and_then(|e| e.pop.as_mut()) {
+            pop.placement = placement;
+        }
         self
     }
     /// A secondary (right) click on this view opens `content` at the pointer.

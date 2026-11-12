@@ -1105,7 +1105,7 @@ fn letter_spacing_weight_and_size_of_spans() {
     let semi = text_size(|| rich_text(vec![Span::new("Semibold words").weight(Weight::Semibold)]));
     let bold = text_size(|| rich_text(vec![Span::new("Semibold words").bold()]));
     assert!(regular.0 < semi.0 && semi.0 < bold.0, "{regular:?} {semi:?} {bold:?}");
-    let big = text_size(|| rich_text(vec![Span::new("a "), Span::new("Big").size(34.0)]));
+    let big = text_size(|| rich_text(vec![Span::new("a "), Span::new("Big").font_size(34.0)]));
     assert!(big.1 >= 44.0 && regular.1 == 22.0, "{big:?}");
 }
 
@@ -3776,7 +3776,7 @@ fn backdrop_corner_mask_precedes_shadows_material_and_children() {
     let mut ui = Ui::new(80.0f32, |height: &f32| zstack(rect().size(10.0,10.0).background(Color::WHITE))
         .size(100.0,*height).radius(20.0).smooth().glass_with(Glass::regular())
         .shadow(Color::BLACK.alpha(0.1),12.0,3.0)
-        .mask_backdrop_corners(Color::BLACK,[false,false,true,true]));
+        .mask_corners(Color::BLACK,[false,false,true,true]).mask_under());
     for height in [80.0,140.0] {
         ui.state=height;ui.frame((200.0,180.0));
         let quads: Vec<_> = ui.list.cmds.iter().filter_map(|c|match c {ruru::Cmd::Quad(q)=>Some(q),_=>None}).collect();

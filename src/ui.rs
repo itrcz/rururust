@@ -1123,7 +1123,7 @@ impl<S> Painter<'_, S> {
     }
 
     /// Covers the outside of the rounded corners of `r` in `color`, except the corners in
-    /// `square` (bit 0 top left, then clockwise): `.mask_corners()`, `.mask_backdrop_corners()`.
+    /// `square` (bit 0 top left, then clockwise): `.mask_corners()`, `.mask_corners().mask_under()`.
     fn paint_corner_mask(&mut self, mut xf: Xf, r: Rect, st: &crate::view::Style, (color, square): (Color, u8)) {
         xf.shape_sq = square | st.square_corners;
         self.smooth = st.smooth || st.glass.is_some();

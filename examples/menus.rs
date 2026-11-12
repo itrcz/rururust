@@ -240,7 +240,7 @@ fn sidebar(s: &Demo) -> View<Demo> {
     .padding(6.0)
     .radius(8.0)
     .hover(Color::WHITE.alpha(0.06))
-    .menu_at(Placement::top().start(), profile_menu(s));
+    .menu(profile_menu(s)).menu_at(Placement::top().start());
     vstack((
         text("Recents").font_size(12.0).color(DIM).padding_ltrb(10.0, 0.0, 0.0, 4.0),
         vstack(rows).spacing(1.0),
@@ -318,7 +318,7 @@ fn view(s: &Demo, env: &Env) -> View<Demo> {
         spacer(),
         text(if s.pinned { "📌 Rust for cross-platform" } else { "Rust for cross-platform" }).font_size(13.0).weight(Weight::Semibold),
         spacer(),
-        icon_button(&s.icons.more).tooltip("More").menu_at(Placement::bottom().end().gap(4.5).margin(6.5), more_menu(s).menu_style(mac_menu())),
+        icon_button(&s.icons.more).tooltip("More").menu(more_menu(s).menu_style(mac_menu())).menu_at(Placement::bottom().end().gap(4.5).margin(6.5)),
     ))
     .padding_xy(12.0, 8.0)
     .height(44.0);
