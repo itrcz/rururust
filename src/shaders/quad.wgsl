@@ -117,12 +117,13 @@ fn sd_morph(p:vec2f, half:vec2f, radius:f32, phase:f32, rotation:f32)->f32 {
     let q=vec2f(cos(rotation)*p.x+sin(rotation)*p.y,-sin(rotation)*p.x+cos(rotation)*p.y);
     let extent=min(half.x,half.y)*0.86;
     let square=sd_round_box(q,vec2f(extent),min(radius,extent));
-    // Offset the three edges inward before expanding by the corner radius. This
-    // rounds the tips without growing the silhouette or changing the other shapes.
-    let roundness=clamp(radius,0.0,extent*0.35);
-    let tip=-extent+sqrt(5.0)*roundness;
-    let base=extent-roundness;
-    let side=extent-(1.0+sqrt(5.0))*0.5*roundness;
+    // An equilateral triangle whose centroid and circumcenter are both the origin.
+    // The rounded silhouette fits inside the same circle at every rotation angle.
+    let roundness=clamp(radius,0.0,extent*0.25);
+    let core=extent-2.0*roundness;
+    let tip=-core;
+    let base=core*0.5;
+    let side=core*sqrt(3.0)*0.5;
     let triangle=sd_triangle(q,vec2f(0.0,tip),vec2f(side,base),vec2f(-side,base))-roundness;
     let circle=length(q)-extent;
     if phase<1.0 {return mix(square,triangle,phase);}

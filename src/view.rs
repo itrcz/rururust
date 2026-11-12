@@ -258,8 +258,8 @@ pub(crate) struct TextReveal {
 }
 
 /// An adornment after the last text leaf. `reserve` keeps layout stable while
-/// `size` changes. A positive cycle period morphs square → triangle → circle,
-/// briefly rotating during transitions and sleeping between them.
+/// `size` changes. A positive cycle period occasionally morphs the circle into a
+/// rotating triangle and back. The circle pulses gently around the same fixed center.
 #[derive(Clone,Copy,Debug)]
 pub struct TextCursor {
     pub size:f32,pub reserve:f32,pub gap:f32,pub radius:f32,pub color:Color,
@@ -288,6 +288,7 @@ pub(crate) struct Style {
     pub glass_fade: f32,
     pub opacity: f32,
     pub press_scale: f32,
+    pub press_opacity: f32,
     pub reveal: Option<bool>,
     pub text_reveal: Option<TextReveal>,
     pub text_shimmer: Option<(f32, Color)>,
@@ -368,6 +369,7 @@ impl Default for Style {
             glass_fade: 0.0,
             opacity: 1.0,
             press_scale: 0.98,
+            press_opacity: 0.7,
             reveal: None,
             text_reveal: None,
             text_shimmer: None,
@@ -1384,6 +1386,11 @@ impl<S> View<S> {
     /// A hidden or disappearing subtree does not receive pointer input or show attachments.
     pub fn reveal(mut self, shown: bool) -> Self {
         self.style.reveal = Some(shown);
+        self
+    }
+    /// Opacity while pressed (default 0.7). Set to 1.0 for scale-only press feedback.
+    pub fn press_opacity(mut self, opacity: f32) -> Self {
+        self.style.press_opacity = opacity.clamp(0.0, 1.0);
         self
     }
     /// Scale while pressed (default 0.98). Use 1.0 to keep labels stationary while

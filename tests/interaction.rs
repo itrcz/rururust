@@ -4088,7 +4088,7 @@ fn hover_marquee_does_not_animate_or_fade_fitting_labels() {
 
 fn tail_cursor(waiting:bool)->TextCursor {
     TextCursor {size:if waiting {16.0}else{7.0},reserve:16.0,gap:5.0,radius:1.5,
-        color:Color::rgba(0.91,0.13,0.37,1.0),cycle_period:if waiting {2.2}else{0.0},transition_duration:0.55}
+        color:Color::rgba(0.91,0.13,0.37,1.0),cycle_period:if waiting {5.0}else{0.0},transition_duration:0.55}
 }
 fn tail_marker<S:'static>(ui:&Ui<S>)->Vec<[f32;4]> {
     ui.list.cmds.iter().filter_map(|cmd|match cmd {ruru::Cmd::Quad(q) if q.c0[0]==0.91 && q.c0[1]==0.13=>Some(q.rect),_=>None}).collect()
@@ -4138,13 +4138,15 @@ fn text_cursor_empty_waiting_line_is_visible() {
 }
 
 #[test]
-fn text_cursor_waiting_holds_without_continuous_frames_between_morphs() {
+fn text_cursor_circle_pulses_without_moving_its_center() {
     let mut ui=Ui::new((),|_:&()|text("Still waiting").text_cursor(tail_cursor(true)).place(Align::Start,Align::Start));
-    ui.frame((300.0,100.0));
+    ui.frame((300.0,100.0));let before=tail_marker(&ui)[0];
     std::thread::sleep(std::time::Duration::from_millis(650));
-    ui.frame((300.0,100.0));ui.frame((300.0,100.0));
-    assert!(!ui.animating,"hold phase must sleep instead of drawing at display rate");
-    assert!(ui.wake_in.is_some_and(|delay|delay>0.5 && delay<2.2));
+    ui.frame((300.0,100.0));ui.frame((300.0,100.0));let after=tail_marker(&ui)[0];
+    assert!(ui.animating,"the waiting circle pulses while visible");
+    assert!(after[2]<before[2] && after[2]>before[2]*0.91);
+    assert!((before[0]+before[2]/2.0-after[0]-after[2]/2.0).abs()<0.01);
+    assert!((before[1]+before[3]/2.0-after[1]-after[3]/2.0).abs()<0.01);
 }
 
 #[test]

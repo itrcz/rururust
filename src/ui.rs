@@ -1118,7 +1118,7 @@ impl<S> Painter<'_, S> {
             xf.tx += cx * (1.0 - k) * xf.s;
             xf.ty += cy * (1.0 - k) * xf.s;
             xf.s *= k;
-            xf.opacity *= 1.0 - 0.3 * p;
+            xf.opacity *= 1.0 - (1.0 - st.press_opacity) * p;
         }
 
         let sr = xf.rect_px(r);
@@ -1512,7 +1512,8 @@ impl<S> Painter<'_, S> {
                         let pose=cursor::pose(self.time,cursor.cycle_period,cursor.transition_duration);
                         self.spin|=pose.animate;
                         if let Some(delay)=pose.wake {self.wake=Some(self.wake.map_or(delay,|wake|wake.min(delay)));}
-                        let marker=Rect::new(at.0,at.1+(height*scale-size)*0.5,size,size);
+                        let draw_size=size*pose.scale;
+                        let marker=Rect::new(at.0+(size-draw_size)*0.5,at.1+(height*scale-draw_size)*0.5,draw_size,draw_size);
                         let cxf=Xf {s:1.0,tx:0.0,ty:0.0,px:0.0,clip,opacity:xf.opacity,..xf};
                         if cursor.cycle_period>0.0 && cursor.transition_duration>0.0 {
                             let mut quad=self.quad(&cxf,marker,cursor.radius*scale,KIND_MORPH);
