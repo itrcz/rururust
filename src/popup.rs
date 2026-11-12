@@ -259,18 +259,21 @@ pub struct MenuItem<S> {
     shortcut: Option<String>,
     disabled: bool,
     checked: bool,
+    keep_open: bool,
     /// Row height instead of the style's (for a section, without the gap above it).
     height: Option<f32>,
 }
 
 impl<S> MenuItem<S> {
     fn new(kind: ItemKind<S>, label: String) -> Self {
-        MenuItem { kind, label, hint: None, icon: None, shortcut: None, disabled: false, checked: false, height: None }
+        MenuItem { kind, label, hint: None, icon: None, shortcut: None, disabled: false, checked: false, keep_open: false, height: None }
     }
     /// A row that runs `f` and closes the menu.
     pub fn action(label: impl Into<String>, f: impl Fn(&mut S) + 'static) -> Self {
         Self::new(ItemKind::Action(Box::new(f)), label.into())
     }
+    /// For independent choices within one panel: invoke the action without dismissing it.
+    pub fn keep_open(mut self) -> Self {self.keep_open=true;self}
     /// A row with a chevron that opens `items` beside the menu (hover, click or →).
     pub fn submenu(label: impl Into<String>, items: Vec<MenuItem<S>>) -> Self {
         Self::new(ItemKind::Submenu(items), label.into())
@@ -620,6 +623,7 @@ impl<S> Painter<'_, S> {
         }
         if let Some(p) = x.pop {
             let managed_open = self.open_menu == Some(id);
+            let select_open=match &p.opens {Opens::State(open,_)=>*open,_=>managed_open};
             match p.opens {
                 Opens::Tap => self.hit(xf, id, sr, Action::OpenMenu),
                 Opens::Context => self.hit(xf, id ^ 0x5EC0, sr, Action::Secondary(None, id)),
@@ -645,6 +649,7 @@ impl<S> Painter<'_, S> {
                     fg: xf.fg,
                 });
             }
+            if x.select_popup {self.hit(xf,id,sr,Action::SelectAnchor {open:select_open});}
         }
         if let Some(tip) = x.tip {
             let placement = x.tip_at.unwrap_or(Placement::bottom().gap(6.0));
@@ -757,7 +762,7 @@ impl<S> Painter<'_, S> {
                     self.zones.push(Zone { id: rid, rect: srow, round: NO_ROUND, cursor: None, blocks: false, tip: false });
                     match kind {
                         ItemKind::Action(f) if enabled => {
-                            self.hits.push(Hit { id: rid, rect: srow, round: NO_ROUND, action: Action::MenuPick(f, self.layer.dismiss.clone()) });
+                            self.hits.push(Hit { id: rid, rect: srow, round: NO_ROUND, action: Action::MenuPick(f, if it.keep_open {None}else{self.layer.dismiss.clone()}) });
                             nav.push((rid, Nav::Act));
                         }
                         ItemKind::Submenu(sub_items) => {
@@ -905,6 +910,7 @@ impl<S: 'static> Ui<S> {
             let st = self.menu_state.entry(nav.id).or_default();
             match nav.rows.iter().position(|(rid, k)| *k != Nav::Skip && self.hovered.contains(rid)) {
                 Some(i) => {
+                    self.menu_keyboard=Some(nav.id);
                     st.hl = Some(i);
                     st.sub = (nav.rows[i].1 == Nav::Sub).then_some(i);
                 }
@@ -920,10 +926,24 @@ impl<S: 'static> Ui<S> {
         if self.focus.is_some() && matches!(key, KeyInput::Left | KeyInput::Right) {
             return None;
         }
-        let nav = self.menu_nav.iter().rev().find(|n| n.keys)?;
+        let last=self.menu_nav.iter().rev().find(|n|n.keys)?;
+        let peers:Vec<_>=self.menu_nav.iter().filter(|n|n.keys&&n.parent==last.parent).collect();
+        let index=peers.iter().position(|n|Some(n.id)==self.menu_keyboard).unwrap_or(0);
+        let nav=peers[index];
         let (id, parent) = (nav.id, nav.parent);
         let rows: Vec<(u64, Nav)> = nav.rows.clone();
         let hl = self.menu_state.get(&id).and_then(|s| s.hl).filter(|&i| i < rows.len() && rows[i].1 != Nav::Skip);
+        // Peer lists in a compound choice panel share one dismissal boundary. Left/right
+        // switch columns, while a highlighted submenu retains the usual Right behavior.
+        if peers.len()>1 && matches!(key,KeyInput::Left|KeyInput::Right)
+            && !(key==KeyInput::Right&&hl.is_some_and(|i|rows[i].1==Nav::Sub)) {
+            let next=if key==KeyInput::Right {(index+1).min(peers.len()-1)}else{index.saturating_sub(1)};
+            let peer=peers[next];self.menu_keyboard=Some(peer.id);
+            let first=peer.rows.iter().position(|(_,kind)|*kind!=Nav::Skip);
+            self.menu_state.entry(peer.id).or_default().hl=first;
+            return Some(true);
+        }
+        self.menu_keyboard=Some(id);
         let st = self.menu_state.entry(id).or_default();
         match key {
             KeyInput::Up | KeyInput::Down => {

@@ -347,6 +347,7 @@ enum Action<S> {
     /// Tab bar: screen x of the first tab, width of one tab, number of tabs.
     Tabs { x0: f32, tab_w: f32, n: usize, on_select: Box<dyn Fn(&mut S, usize)> },
     OpenMenu,
+    SelectAnchor {open:bool},
     Dismiss,
     Pick(usize, Rc<dyn Fn(&mut S, usize)>),
     /// `.window_drag()` area: a press moves the window.
@@ -1174,7 +1175,11 @@ impl<S> Painter<'_, S> {
         if disabled {
             (v.on_tap, v.on_double_tap) = (None, None);
             (st.hover, st.hover_fg) = (None, None);
-            xf.opacity *= self.look.theme.control.disabled_opacity;
+            let button=matches!(st.role,crate::view::Role::Button|crate::view::Role::SecondaryButton|crate::view::Role::PlainButton);
+            if let Some((bg,fg))=self.look.theme.control.disabled_button_colors.filter(|_|button) {
+                st.bg=if st.role==crate::view::Role::PlainButton {None}else{Some(bg.into())};
+                st.fg=Some(fg);st.glass=None;st.border=None;st.shadow.fill(None);
+            }else{xf.opacity *= self.look.theme.control.disabled_opacity;}
         }
         if st.animate_radius { st.radius = self.crisp(id, slot::RADIUS, st.radius.max(0.0)).max(0.0); }
         xf.shape_sq = st.square_corners;
@@ -1953,6 +1958,7 @@ pub struct Ui<S> {
     menu_state: HashMap<u64, MenuState>,
     /// Menus on screen in the last frame, innermost last.
     menu_nav: Vec<MenuNav>,
+    menu_keyboard: Option<u64>,
     /// `.shortcut()`s of the last frame.
     shortcuts: Vec<(Shortcut, Box<dyn Fn(&mut S)>)>,
     /// The view with a tooltip the mouse rests on.
@@ -2021,6 +2027,7 @@ impl<S: 'static> Ui<S> {
             ctx_at: (0.0, 0.0),
             menu_state: HashMap::new(),
             menu_nav: Vec::new(),
+            menu_keyboard: None,
             shortcuts: Vec::new(),
             tip: None,
             tip_seen: None,
@@ -2495,9 +2502,14 @@ impl<S: 'static> Ui<S> {
         if !hit.is_some_and(|i| matches!(self.hits[i].action, Action::Tap(..))) { self.ptr.tap = None; }
         self.ptr.pressed = hit.map(|i| self.hits[i].id);
         if let Some(Action::Outside(d)) = hit.map(|i| &self.hits[i].action) {
-            // macOS: the click that closes a popover does nothing else.
             let d = d.clone();
+            // Only an explicitly marked select directly below this overlay may receive
+            // the same click. Do not search through another control or modal backdrop.
+            let replacement=hit.and_then(|i|self.hits[..i].iter().rposition(|h|h.contains(pos)))
+                .filter(|&i|matches!(self.hits[i].action,Action::SelectAnchor {open:false}));
             self.run_dismiss(d);
+            self.ptr.pressed=None;
+            if let Some(i)=replacement {self.blur();self.activate(i);}
             return true;
         }
         self.ptr.bar = None;
@@ -2694,6 +2706,10 @@ impl<S: 'static> Ui<S> {
     /// Does what a click on hit `i` does.
     fn activate(&mut self, i: usize) {
         let id = self.hits[i].id;
+        if matches!(self.hits[i].action,Action::SelectAnchor {..}) {
+            if let Some(anchor)=self.hits[..i].iter().rposition(|h|h.id==id&&matches!(h.action,Action::Tap(..)|Action::OpenMenu)) {self.activate(anchor);}
+            return;
+        }
         // Dismiss the source menu before its action can open another application layer.
         if let Action::MenuPick(_, Some(d)) = &self.hits[i].action {
             self.run_dismiss(d.clone());

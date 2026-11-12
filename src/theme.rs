@@ -153,6 +153,9 @@ pub struct Controls {
     pub button_hover: Color,
     /// Opacity of a `.disabled(true)` button or other tappable view.
     pub disabled_opacity: f32,
+    /// Optional opaque (background, foreground) for disabled text buttons. Plain buttons
+    /// keep a clear background. Replaces glass and opacity dimming; other controls retain it.
+    pub disabled_button_colors: Option<(Color, Color)>,
     pub field_padding: (f32, f32),
     /// Text fields and pickers.
     pub field_radius: f32,
@@ -318,6 +321,7 @@ impl Theme {
                 button_radius: 14.0,
                 button_hover: Color::WHITE.alpha(0.14),
                 disabled_opacity: 0.4,
+                disabled_button_colors: None,
                 field_padding: (14.0, 12.0),
                 field_radius: 12.0,
                 picker_padding: (14.0, 10.0),

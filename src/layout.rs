@@ -509,7 +509,8 @@ fn layout_attached<S>(x: &crate::view::Extras<S>, lx: &mut Lx, id: u64, node: &m
         };
         let pid = pop_id(id);
         if open || fading(lx, pid) {
-            node.pop = Some(Box::new(layout(&p.content, (None, None), lx, pid)));
+            let width=if p.match_anchor_width {Some(node.size.0)} else {None};
+            node.pop = Some(Box::new(layout(&p.content, (width, None), lx, pid)));
         }
     }
     if let Some(t) = &x.tip {

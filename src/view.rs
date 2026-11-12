@@ -787,11 +787,13 @@ pub(crate) struct Pop<S> {
     pub opens: Opens<S>,
     pub placement: Placement,
     pub content: Box<View<S>>,
+    pub match_anchor_width: bool,
 }
 
 /// Rarely used attachments, boxed so that a plain view stays small.
 pub(crate) struct Extras<S> {
     pub pop: Option<Pop<S>>,
+    pub select_popup: bool,
     pub tip: Option<Box<View<S>>>,
     /// A default tooltip (label, key hint), built with the theme by `theme::apply`.
     pub tip_text: Option<(String, Option<String>)>,
@@ -838,7 +840,7 @@ impl<S> View<S> {
     }
 
     fn extras(&mut self) -> &mut Extras<S> {
-        self.extra.get_or_insert_with(|| Box::new(Extras { pop: None, tip: None, tip_text: None, tip_at: None, shortcuts: Vec::new(), secondary: None, pointer: None, split: None }))
+        self.extra.get_or_insert_with(|| Box::new(Extras { pop: None, select_popup: false, tip: None, tip_text: None, tip_at: None, shortcuts: Vec::new(), secondary: None, pointer: None, split: None }))
     }
 
     /// Observes mouse motion anywhere in the window while this view is visible. The
@@ -1568,7 +1570,7 @@ impl<S> View<S> {
         on_dismiss: impl Fn(&mut S) + 'static,
         content: View<S>,
     ) -> Self {
-        self.extras().pop = Some(Pop { opens: Opens::State(open, Rc::new(on_dismiss)), placement, content: Box::new(content) });
+        self.extras().pop = Some(Pop { opens: Opens::State(open, Rc::new(on_dismiss)), placement, content: Box::new(content), match_anchor_width: false });
         self
     }
     /// A tap on this view opens `content` (usually a [`menu`]) below it; choosing an item, a
@@ -1579,9 +1581,22 @@ impl<S> View<S> {
     /// button("…", |_| {}).menu(menu(vec![MenuItem::action("Rename", |s: &mut App| s.rename())]))
     /// ```
     pub fn menu(mut self, content: View<S>) -> Self {
-        self.extras().pop = Some(Pop { opens: Opens::Tap, placement: Placement::bottom().start(), content: Box::new(content) });
+        self.extras().pop = Some(Pop { opens: Opens::Tap, placement: Placement::bottom().start(), content: Box::new(content), match_anchor_width: false });
         self
     }
+    /// Make the attached menu/popover exactly as wide as its measured anchor. Recomputed
+    /// during layout, including window resizes; the content should fill the offered width.
+    pub fn match_anchor_width(mut self) -> Self {
+        self.extras().select_popup=true;
+        if let Some(pop) = self.extra.as_mut().and_then(|e|e.pop.as_mut()) {
+            pop.match_anchor_width = true;
+            pop.content.style.width = Dim::Fill;
+        }
+        self
+    }
+    /// Opt-in choice anchor: clicking another such anchor switches open popovers in one
+    /// press. Ordinary outside clicks still only dismiss, including modal boundaries.
+    pub fn select_popup(mut self) -> Self {self.extras().select_popup=true;self}
     /// After `.menu()` or `.context_menu()`: another side, e.g. `Placement::top().start()`
     /// above an avatar. Same shape as [`tooltip_at`](View::tooltip_at).
     pub fn menu_at(mut self, placement: Placement) -> Self {
@@ -1593,7 +1608,7 @@ impl<S> View<S> {
     /// A secondary (right) click on this view opens `content` at the pointer.
     pub fn context_menu(mut self, content: View<S>) -> Self {
         let placement = Placement::bottom().start().gap(2.0);
-        self.extras().pop = Some(Pop { opens: Opens::Context, placement, content: Box::new(content) });
+        self.extras().pop = Some(Pop { opens: Opens::Context, placement, content: Box::new(content), match_anchor_width: false });
         self
     }
     /// Runs `f` on a secondary (right) click on this view.

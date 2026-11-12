@@ -4775,11 +4775,13 @@ struct Dis {
 
 #[test]
 fn disabled_button_ignores_taps_and_does_not_pass_them_on() {
+    for colors in [None,Some((Color::hex(0x292624),Color::hex(0x8E8780)))] {
     let mut ui = Ui::new(Dis { off: true, n: 0, under: 0 }, |s: &Dis| {
         zstack(button("go", |s: &mut Dis| s.n += 1).disabled(s.off).size(200.0, 100.0).place(Align::Start, Align::Start))
             .fill()
             .on_tap(|s: &mut Dis| s.under += 1)
     });
+    let mut theme=Theme::dark();theme.control.disabled_button_colors=colors;ui.set_theme(theme);
     let size = (400.0, 400.0);
     ui.frame(size);
     ui.pointer_down((100.0, 50.0), false);
@@ -4794,6 +4796,7 @@ fn disabled_button_ignores_taps_and_does_not_pass_them_on() {
     ui.pointer_down((100.0, 50.0), false);
     ui.pointer_up((100.0, 50.0));
     assert_eq!((ui.state.n, ui.state.under), (1, 0));
+    }
 }
 
 #[test]
