@@ -11,7 +11,7 @@
 
 use crate::types::Color;
 use crate::ui::popup::MenuStyle;
-use crate::view::{hstack, text, Glass, Kind, Role, Shadow, SliderStyle, TextRole, View, Weight};
+use crate::view::{hstack, text, Dim, Glass, Kind, Role, Shadow, SliderStyle, TextRole, View, Weight};
 use std::rc::Rc;
 
 /// Colors and metrics of the built-in widgets. Start from [`Theme::dark`] or [`Theme::light`]
@@ -186,6 +186,26 @@ pub struct Controls {
     pub scrollbar_track_opacity: f32,
     pub tip_padding: (f32, f32),
     pub tip_radius: f32,
+    /// Plate of the default tooltip; `None` = `color.popover`.
+    pub tip_background: Option<Color>,
+    /// Its hairline (`border` wide); `None` = `color.border`, `Some(Color::CLEAR)` = none.
+    pub tip_border: Option<Color>,
+    /// Its label; `None` = `color.text` at 92 %.
+    pub tip_text: Option<Color>,
+    /// Key chip of `.tooltip_shortcut()`: fill (`None` = `color.text` at 14 %), padding, radius.
+    pub tip_chip: Option<Color>,
+    pub tip_chip_padding: (f32, f32),
+    pub tip_chip_radius: f32,
+    /// `icon_button`: side of its square, size of its glyph, corner radius.
+    pub icon_button: f32,
+    pub icon_button_glyph: f32,
+    pub icon_button_radius: f32,
+    /// Thickness of a `progress_bar`.
+    pub progress_bar: f32,
+    /// Diameter and stroke of a `progress_ring`.
+    pub progress_ring: (f32, f32),
+    /// Glyph of a `tab_bar` tab with `.tab_icons()`.
+    pub tab_icon: f32,
     /// Length of the ramp of `Truncate::Fade`, and of a `.hover_marquee()` edge by default.
     pub fade_width: f32,
     /// Corner radius of selected-text highlights (text fields and `.selectable()` text).
@@ -317,6 +337,18 @@ impl Theme {
                 scrollbar_track_opacity: 0.06,
                 tip_padding: (9.0, 5.0),
                 tip_radius: 9.0,
+                tip_background: None,
+                tip_border: None,
+                tip_text: None,
+                tip_chip: None,
+                tip_chip_padding: (5.0, 1.5),
+                tip_chip_radius: 5.0,
+                icon_button: 28.0,
+                icon_button_glyph: 16.0,
+                icon_button_radius: 7.0,
+                progress_bar: 4.0,
+                progress_ring: (20.0, 2.5),
+                tab_icon: 18.0,
                 fade_width: 28.0,
                 selection_radius: 2.0,
             },
@@ -527,26 +559,26 @@ impl Look {
 
 /// The default tooltip: a plate with the label and an optional key chip.
 fn tooltip<S>(t: &Theme, label: String, keys: Option<String>) -> View<S> {
-    let c = &t.color;
+    let (c, ct) = (&t.color, &t.control);
     let label = text(label).style(TextStyle { weight: Weight::Medium, ..t.text.caption });
     let row = match keys {
         Some(k) => hstack((
             label,
             text(k)
                 .style(TextStyle { weight: Weight::Medium, ..t.text.caption2 })
-                .padding_xy(5.0, 1.5)
-                .background(c.text.alpha(0.14))
-                .radius(5.0),
+                .padding_xy(ct.tip_chip_padding.0, ct.tip_chip_padding.1)
+                .background(ct.tip_chip.unwrap_or(c.text.alpha(0.14)))
+                .radius(ct.tip_chip_radius),
         ))
         .spacing(7.0),
         None => hstack(label),
     };
-    row.padding_xy(t.control.tip_padding.0, t.control.tip_padding.1)
-        .background(c.popover)
-        .border(t.control.border, c.border)
-        .radius(t.control.tip_radius)
+    row.padding_xy(ct.tip_padding.0, ct.tip_padding.1)
+        .background(ct.tip_background.unwrap_or(c.popover))
+        .border(ct.border, ct.tip_border.unwrap_or(c.border))
+        .radius(ct.tip_radius)
         .shadow_with(t.shadow.tip)
-        .color(c.text.alpha(0.92))
+        .color(ct.tip_text.unwrap_or(c.text.alpha(0.92)))
 }
 
 /// Fills in what the built-in widgets of a freshly built tree left to the theme: their
@@ -566,6 +598,29 @@ pub(crate) fn apply<S>(v: &mut View<S>, look: &Look) {
                 st.hover.get_or_insert(k.button_hover);
                 (k.button_padding, k.button_radius)
             }
+            Role::SecondaryButton => {
+                st.bg.get_or_insert(t.color.fill.into());
+                st.fg.get_or_insert(t.color.text);
+                st.hover.get_or_insert(t.color.hover);
+                (k.button_padding, k.button_radius)
+            }
+            Role::PlainButton => {
+                st.fg.get_or_insert(t.color.text);
+                st.hover.get_or_insert(t.color.hover);
+                (k.button_padding, k.button_radius)
+            }
+            Role::IconButton => {
+                st.fg.get_or_insert(t.color.text_muted);
+                st.hover.get_or_insert(t.color.hover);
+                st.hover_fg.get_or_insert(t.color.text);
+                for d in [&mut st.width, &mut st.height] {
+                    if *d == Dim::Auto {
+                        *d = Dim::Fixed(k.icon_button);
+                    }
+                }
+                ((0.0, 0.0), k.icon_button_radius)
+            }
+            Role::Progress => ((0.0, 0.0), 0.0),
             Role::Field | Role::Picker => {
                 st.bg.get_or_insert(t.color.fill.into());
                 let pad = if st.role == Role::Field { k.field_padding } else { k.picker_padding };
@@ -585,6 +640,18 @@ pub(crate) fn apply<S>(v: &mut View<S>, look: &Look) {
         }
         if st.set & SET_RADIUS == 0 {
             st.radius = radius;
+        }
+    }
+    if v.style.role == Role::IconButton {
+        // The glyph keeps the theme's size inside a resized button; `.size()` on it wins.
+        if let Kind::Stack { children, .. } = &mut v.kind {
+            for c in children.iter_mut().filter(|c| matches!(c.kind, Kind::Image(..))) {
+                for d in [&mut c.style.width, &mut c.style.height] {
+                    if *d == Dim::Auto {
+                        *d = Dim::Fixed(t.control.icon_button_glyph);
+                    }
+                }
+            }
         }
     }
     match &mut v.kind {

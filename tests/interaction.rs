@@ -4424,3 +4424,202 @@ fn glass_fade_reaches_the_glass_quad_and_ignores_bad_heights() {
     assert_eq!(fade(Some(-5.0)), 0.0);
     assert_eq!(fade(Some(f32::NAN)), 0.0);
 }
+
+#[test]
+fn secondary_and_plain_buttons_take_their_look_from_the_theme() {
+    let t = Theme::dark();
+    let mut ui = Ui::new(0, |_: &i32| vstack((
+        button("Save", |s: &mut i32| *s += 1).size(200.0, 40.0),
+        button("Cancel", |s: &mut i32| *s += 10).secondary().size(200.0, 40.0),
+        button("More", |s: &mut i32| *s += 100).plain().size(200.0, 40.0),
+        button("Odd", |_: &mut i32| {}).secondary().background(Color::RED).size(200.0, 40.0),
+    )).place(Align::Start, Align::Start));
+    let size = (300.0, 200.0);
+    ui.frame(size);
+    assert_eq!(quads(&ui, t.color.accent), vec![[0.0, 0.0, 200.0, 40.0]], "primary: accent");
+    assert_eq!(quads(&ui, t.color.fill), vec![[0.0, 40.0, 200.0, 40.0]], "secondary: neutral fill");
+    assert_eq!(quads(&ui, Color::RED).len(), 1, "an explicit background still wins");
+    let label = |ui: &Ui<i32>, i: usize| texts(ui)[i].color;
+    assert_eq!(label(&ui, 1), t.color.text);
+    assert_eq!(label(&ui, 2), t.color.text);
+    // The ghost has no plate until hovered, then the theme's hover tint.
+    ui.pointer_move((100.0, 100.0));
+    rest(&mut ui, size);
+    assert_eq!(quads(&ui, t.color.hover), vec![[0.0, 80.0, 200.0, 40.0]]);
+    for (y, n) in [(20.0, 1), (60.0, 11), (100.0, 111)] {
+        ui.pointer_down((100.0, y), false);
+        ui.pointer_up((100.0, y));
+        assert_eq!(ui.state, n);
+    }
+    // `.plain()` still strips a text field.
+    let mut ui = Ui::new((), |_: &()| vstack(text_field("", "", |_: &mut (), _| {}).plain().width(100.0)).place(Align::Start, Align::Start));
+    ui.frame(size);
+    assert!(quads(&ui, t.color.fill).is_empty());
+}
+
+#[test]
+fn icon_button_is_a_themed_square_that_composes() {
+    let t = Theme::dark();
+    let glyph = Image::from_rgba(8, 8, vec![255; 256]);
+    let g2 = glyph.clone();
+    let mut ui = Ui::new(0, move |_: &i32| hstack((
+        icon_button(&glyph, |s: &mut i32| *s += 1).tooltip("More"),
+        icon_button(&glyph, |s: &mut i32| *s += 10).size(40.0, 40.0).radius(20.0).background(Color::RED),
+        icon_button(&g2, |s: &mut i32| *s += 100).rotation(90.0),
+    )).align(Align::Start).place(Align::Start, Align::Start));
+    let size = (300.0, 100.0);
+    ui.frame(size);
+    let imgs = image_quads(&ui);
+    assert_eq!(imgs.len(), 3);
+    assert_eq!(imgs[0].rect, [6.0, 6.0, 16.0, 16.0], "a 16 pt glyph centred in a 28 pt square");
+    assert_eq!(imgs[1].rect, [28.0 + 12.0, 12.0, 16.0, 16.0], "the glyph keeps its size in a bigger button");
+    assert_eq!(quads(&ui, Color::RED), vec![[28.0, 0.0, 40.0, 40.0]]);
+    let red = ui.list.cmds.iter().find_map(|c| match c { ruru::Cmd::Quad(q) if q.c0 == Color::RED.arr4() => Some(q.p0[0]), _ => None });
+    assert_eq!(red, Some(20.0), "round with .radius(half)");
+    assert_eq!(imgs[0].c1[2], t.color.text_muted.r, "muted glyph at rest");
+    assert!((imgs[2].n1[0] - std::f32::consts::FRAC_PI_2).abs() < 1e-5, "turned a quarter clockwise");
+    assert_eq!(imgs[0].n1[0], 0.0);
+    for (x, y, n) in [(14.0, 14.0, 1), (27.0, 27.0, 2), (30.0, 35.0, 12), (60.0, 50.0, 12), (80.0, 14.0, 112)] {
+        ui.pointer_down((x, y), false);
+        ui.pointer_up((x, y));
+        assert_eq!(ui.state, n, "tap at {x},{y}");
+    }
+    // Hover: the theme's tint and the glyph lights up to the text color.
+    ui.pointer_move((14.0, 14.0));
+    rest(&mut ui, size);
+    assert_eq!(quads(&ui, t.color.hover), vec![[0.0, 0.0, 28.0, 28.0]]);
+    assert_eq!(image_quads(&ui)[0].c1[2], t.color.text.r);
+}
+
+#[test]
+fn rotation_glides_to_a_new_angle_and_rests() {
+    let glyph = Image::from_rgba(4, 4, vec![255; 64]);
+    let mut ui = Ui::new(false, move |open: &bool| zstack(icon(&glyph).rotation(if *open { 90.0 } else { 0.0 })).place(Align::Start, Align::Start));
+    let size = (100.0, 100.0);
+    ui.frame(size);
+    assert!(!ui.animating, "no turn on first appearance");
+    assert_eq!(image_quads(&ui)[0].n1[0], 0.0);
+    ui.state = true;
+    ui.frame(size);
+    let mut seen = Vec::new();
+    for _ in 0..400 {
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        ui.frame(size);
+        seen.push(image_quads(&ui)[0].n1[0]);
+        if !ui.animating { break; }
+    }
+    assert!(seen.iter().any(|a| *a > 0.2 && *a < 1.3), "passes through the middle: {seen:?}");
+    assert!(!ui.animating);
+    assert!((seen.last().unwrap() - std::f32::consts::FRAC_PI_2).abs() < 1e-4);
+    assert_eq!(image_quads(&ui)[0].rect, [0.0, 0.0, 22.0, 22.0], "layout does not turn");
+}
+
+#[test]
+fn progress_bar_fills_with_the_theme_and_glides() {
+    let t = Theme::dark();
+    let mut ui = Ui::new(0.5f32, |v: &f32| vstack(progress_bar(*v).width(200.0)).place(Align::Start, Align::Start));
+    let size = (300.0, 100.0);
+    ui.frame(size);
+    let h = t.control.progress_bar;
+    assert_eq!(quads(&ui, t.color.fill_strong), vec![[0.0, 0.0, 200.0, h]], "track");
+    let fill = |ui: &Ui<f32>| quads(ui, t.color.accent)[0][2];
+    assert!((fill(&ui) - (h + (200.0 - h) * 0.5)).abs() < 0.01);
+    assert!(!ui.animating);
+    ui.state = 1.0;
+    ui.frame(size);
+    assert!(ui.animating, "a new value glides");
+    settle_long(&mut ui, size);
+    assert!((fill(&ui) - 200.0).abs() < 0.01);
+    ui.state = 0.0;
+    settle_long(&mut ui, size);
+    assert!(quads(&ui, t.color.accent).is_empty(), "empty at zero");
+    // `.color()` on the bar recolors the fill.
+    let mut ui = Ui::new((), |_: &()| vstack(progress_bar(0.3).color(Color::GREEN).width(100.0)).place(Align::Start, Align::Start));
+    ui.frame(size);
+    assert_eq!(quads(&ui, Color::GREEN).len(), 1);
+}
+
+#[test]
+fn progress_ring_has_a_track_and_an_arc() {
+    let t = Theme::dark();
+    let dots = |v: f32| {
+        let mut ui = Ui::new((), move |_: &()| vstack(progress_ring(v)).place(Align::Start, Align::Start));
+        ui.frame((100.0, 100.0));
+        let track = ui.list.cmds.iter().filter(|c| matches!(c, ruru::Cmd::Quad(q) if q.border == t.color.fill_strong.arr4() && q.c0[3] == 0.0)).count();
+        let d = t.control.progress_ring.0;
+        let arc: Vec<[f32; 4]> = quads(&ui, t.color.accent);
+        assert!(arc.iter().all(|r| r[0] >= -0.01 && r[1] >= -0.01 && r[0] + r[2] <= d + 0.01 && r[1] + r[3] <= d + 0.01), "inside the ring");
+        (track, arc.len())
+    };
+    assert_eq!(dots(0.0), (1, 0));
+    let (track, half) = dots(0.5);
+    let (_, full) = dots(1.0);
+    assert_eq!(track, 1);
+    assert!(half > 8 && full > half * 3 / 2, "half {half} full {full}");
+}
+
+#[test]
+fn tab_icons_sit_before_the_labels() {
+    let glyph = Image::from_rgba(4, 4, vec![255; 64]);
+    let width = |icons: bool| {
+        let g = glyph.clone();
+        let mut ui = Ui::new(0usize, move |s: &usize| {
+            let bar = tab_bar(&["One", "Two"], *s, |s: &mut usize, i| *s = i);
+            zstack(if icons { bar.tab_icons(&[&g, &g]) } else { bar }).place(Align::Start, Align::Start)
+        });
+        ui.frame((600.0, 200.0));
+        let imgs = image_quads(&ui);
+        let label_x = texts(&ui)[0].pos.0;
+        (imgs.len(), imgs.first().map(|q| q.rect), label_x)
+    };
+    let (n, _, plain_x) = width(false);
+    assert_eq!(n, 0);
+    let (n, first, x) = width(true);
+    assert_eq!(n, 2);
+    let r = first.unwrap();
+    let g = Theme::dark().control.tab_icon;
+    assert_eq!((r[2], r[3]), (g, g));
+    assert!(r[0] + g < x, "glyph left of the label");
+    assert!(x > plain_x, "labels move right to make room");
+}
+
+#[test]
+fn tooltip_look_comes_from_the_theme() {
+    let mut ui = Ui::new((), |_: &()| zstack(rect().size(30.0, 30.0).tooltip_shortcut("Back", "⌘[").place(Align::Start, Align::Start)).fill());
+    let mut theme = Theme::dark();
+    theme.motion.tip_delay = 0.0;
+    theme.control.tip_background = Some(Color::RED);
+    theme.control.tip_border = Some(Color::GREEN);
+    theme.control.tip_chip = Some(Color::BLUE);
+    theme.control.tip_chip_radius = 3.0;
+    ui.set_theme(theme);
+    let size = (300.0, 200.0);
+    ui.frame(size);
+    ui.pointer_move((15.0, 15.0));
+    ui.frame(size);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    rest(&mut ui, size);
+    assert_eq!(quads(&ui, Color::RED).len(), 1, "plate");
+    assert!(ui.list.cmds.iter().any(|c| matches!(c, ruru::Cmd::Quad(q) if q.border == Color::GREEN.arr4())), "hairline");
+    let chip = ui.list.cmds.iter().find_map(|c| match c { ruru::Cmd::Quad(q) if q.c0 == Color::BLUE.arr4() => Some(q.p0[0]), _ => None });
+    assert_eq!(chip, Some(3.0), "key chip and its radius");
+}
+
+trait Arr4 {
+    fn arr4(self) -> [f32; 4];
+}
+impl Arr4 for Color {
+    fn arr4(self) -> [f32; 4] {
+        [self.r, self.g, self.b, self.a]
+    }
+}
+
+/// Frames until springs rest, with a deadline instead of a frame count (load-proof).
+fn settle_long(ui: &mut Ui<impl Sized + 'static>, size: (f32, f32)) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        ui.frame(size);
+        if !ui.animating || std::time::Instant::now() >= deadline { break; }
+    }
+}

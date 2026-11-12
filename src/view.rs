@@ -299,6 +299,8 @@ pub(crate) struct Style {
     pub hover_marquee_leading_outset: f32,
     pub hover_scope: bool,
     pub hover_offset: Option<(f32,f32)>,
+    /// Turn of pictures in this subtree, degrees clockwise (`.rotation()`).
+    pub rotation: Option<f32>,
     pub fg: Option<Color>,
     pub place: Option<(Align, Align)>,
     pub sticky: bool,
@@ -339,6 +341,12 @@ pub(crate) struct Style {
 pub(crate) enum Role {
     None,
     Button,
+    /// `button(..).secondary()`: neutral fill.
+    SecondaryButton,
+    /// `button(..).plain()`: no fill, a tint under the pointer.
+    PlainButton,
+    IconButton,
+    Progress,
     Field,
     Picker,
     Tabs,
@@ -387,6 +395,7 @@ impl Default for Style {
             hover_marquee_leading_outset: 0.0,
             hover_scope: false,
             hover_offset: None,
+            rotation: None,
             fg: None,
             place: None,
             sticky: false,
@@ -743,7 +752,9 @@ pub(crate) enum Kind<S> {
     Image(Image, bool),
     TextField(crate::ui::edit::Field<S>),
     Picker { options: Vec<String>, selected: usize, on_select: Rc<dyn Fn(&mut S, usize)>, label: TextData },
-    Tabs { labels: Vec<String>, selected: usize, on_select: Box<dyn Fn(&mut S, usize)> },
+    Tabs { labels: Vec<String>, icons: Vec<Image>, selected: usize, on_select: Box<dyn Fn(&mut S, usize)> },
+    /// Value 0..=1; a ring instead of a bar.
+    Progress { value: f32, ring: bool },
     Empty,
     Activity { stroke: f32, period: f32 },
     Spacer,
@@ -1107,6 +1118,18 @@ impl<S> View<S> {
 
     pub fn opacity(mut self, o: f32) -> Self {
         self.style.opacity = o;
+        self
+    }
+    /// Turns the pictures in this view (`image`, `icon`, the glyph of an `icon_button`) by
+    /// `degrees` clockwise about their own centers; a new angle glides there on the theme's
+    /// `motion.smooth` spring. Layout, hit areas, backgrounds and text do not turn, and nested
+    /// rotations add up. A disclosure chevron:
+    ///
+    /// ```ignore
+    /// icon(&chevron).rotation(if open { 90.0 } else { 0.0 })
+    /// ```
+    pub fn rotation(mut self, degrees: f32) -> Self {
+        self.style.rotation = degrees.is_finite().then_some(degrees);
         self
     }
     /// Text color, inherited by all descendants.
@@ -1817,7 +1840,7 @@ pub fn picker<S, T: AsRef<str>>(options: &[T], selected: usize, on_select: impl 
 pub fn tab_bar<S, T: AsRef<str>>(labels: &[T], selected: usize, on_select: impl Fn(&mut S, usize) + 'static) -> View<S> {
     let labels: Vec<String> = labels.iter().map(|l| l.as_ref().to_string()).collect();
     let selected = selected.min(labels.len().saturating_sub(1));
-    let mut v = View::new(Kind::Tabs { labels, selected, on_select: Box::new(on_select) });
+    let mut v = View::new(Kind::Tabs { labels, icons: Vec::new(), selected, on_select: Box::new(on_select) });
     v.style.role = Role::Tabs;
     v
 }
@@ -1843,4 +1866,62 @@ pub fn slider<S>(value: f32, on_change: impl Fn(&mut S, f32) + 'static) -> View<
 /// ```
 pub fn menu<S>(items: Vec<MenuItem<S>>) -> View<S> {
     View::new(Kind::Menu { items, style: None })
+}
+
+/// A square button with a glyph, for toolbars and row actions: the glyph is painted in
+/// `color.text_muted` and lights up to `color.text` under a `color.hover` tint. Size, glyph
+/// size and corner radius come from the theme (`control.icon_button`, `icon_button_glyph`,
+/// `icon_button_radius`); `.size()`, `.radius()`, `.color()`, `.hover()` and `.hover_color()`
+/// override them, and it takes `.tooltip()` like any view. Round: `.radius()` of half the size.
+///
+/// ```ignore
+/// icon_button(&icons.more, |s: &mut App| s.menu = true).tooltip("More")
+/// icon_button(&icons.send, send).size(32.0, 32.0).radius(16.0).background(t.color.accent)
+/// ```
+pub fn icon_button<S>(img: &Image, on_tap: impl Fn(&mut S) + 'static) -> View<S> {
+    let mut b = zstack(View::new(Kind::Image(img.clone(), true))).on_tap(on_tap);
+    b.style.role = Role::IconButton;
+    b
+}
+
+/// A determinate progress bar for `value` in 0..=1. Fills the available width; the track
+/// (`color.fill_strong`), the fill (`color.accent`, or the view's own `.color()`) and the
+/// thickness (`control.progress_bar`) come from the theme. A new value glides there on the
+/// theme's `motion.smooth` spring.
+pub fn progress_bar<S>(value: f32) -> View<S> {
+    let mut v = View::new(Kind::Progress { value: unit(value), ring: false }).fill_width();
+    v.style.role = Role::Progress;
+    v
+}
+
+/// A determinate progress ring for `value` in 0..=1, filling clockwise from the top. Like
+/// [`progress_bar`]; diameter and stroke are the theme's `control.progress_ring`, `.size()`
+/// changes the diameter. The fill color should be opaque (the arc is built of overlapping dots).
+pub fn progress_ring<S>(value: f32) -> View<S> {
+    let mut v = View::new(Kind::Progress { value: unit(value), ring: true });
+    v.style.role = Role::Progress;
+    v
+}
+
+fn unit(v: f32) -> f32 {
+    if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 }
+}
+
+impl<S> View<S> {
+    /// Button only: the secondary look, a neutral `color.fill` plate with `color.text`
+    /// instead of the accent. See also [`plain`](View::plain) for a borderless one.
+    pub fn secondary(mut self) -> Self {
+        if self.style.role == Role::Button {
+            self.style.role = Role::SecondaryButton;
+        }
+        self
+    }
+    /// Tab bar only: a glyph before each tab's label, in the label's color; the first icon
+    /// goes to the first tab and so on. Sized by the theme's `control.tab_icon`.
+    pub fn tab_icons(mut self, images: &[&Image]) -> Self {
+        if let Kind::Tabs { icons, .. } = &mut self.kind {
+            *icons = images.iter().map(|i| (*i).clone()).collect();
+        }
+        self
+    }
 }

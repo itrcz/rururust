@@ -199,19 +199,27 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
             node.texts.push((key,size));
             (size.0+reserved,size.1)
         }
-        Kind::Tabs { labels, .. } => {
+        Kind::Tabs { labels, icons, .. } => {
             let mut widest = 0.0f32;
             let t = &lx.look.theme;
             let (font, k) = (t.text.subhead, t.control);
+            // A glyph and a gap of half its size go before every label once any tab has one.
+            let glyph = if icons.is_empty() { 0.0 } else { k.tab_icon * 1.5 };
             for l in labels {
                 let spec = TextSpec { spans: &[], text: l, size: font.size, weight: 600, line_height: font.line_height, ..Default::default() };
                 let m = lx.text.measure(&spec, None);
-                widest = widest.max(m.1 .0);
+                widest = widest.max(m.1 .0 + glyph);
                 node.texts.push(m);
             }
             ((widest + k.tab_extra) * labels.len() as f32 + 2.0 * k.tab_padding, k.tab_height)
         }
         Kind::Toggle(..) => lx.look.theme.control.toggle,
+        Kind::Progress { ring: false, .. } => (inner.0.unwrap_or(200.0), lx.look.theme.control.progress_bar),
+        Kind::Progress { ring: true, .. } => {
+            let d = lx.look.theme.control.progress_ring.0;
+            let side = |dim: Dim, offer: Option<f32>| if dim == Dim::Auto { d } else { offer.unwrap_or(d) };
+            (side(dim_w, inner.0), side(dim_h, inner.1))
+        }
         Kind::Slider(.., st) => {
             let s = st.as_deref().unwrap_or(&lx.look.slider);
             (inner.0.unwrap_or(200.0), s.knob_size.max(s.track_height))

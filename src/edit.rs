@@ -161,14 +161,20 @@ impl<S> View<S> {
     }
     /// Text field without its own look: no background, padding, corners or focus ring.
     /// Put it in a container styled the way the app needs (e.g. a chat composer).
+    ///
+    /// Button: the borderless (ghost) look, no fill and `color.text`, with a `color.hover`
+    /// tint under the pointer; padding and radius stay the theme's button ones.
     pub fn plain(mut self) -> Self {
+        use crate::view::Role;
         if let Some(f) = self.field() {
             f.plain = true;
-            self.style.role = crate::view::Role::None;
+            self.style.role = Role::None;
             self.style.bg = None;
             self.style.border = None;
             self.style.radius = 0.0;
             self.style.padding = [0.0; 4];
+        } else if matches!(self.style.role, Role::Button | Role::SecondaryButton) {
+            self.style.role = Role::PlainButton;
         }
         self
     }

@@ -183,6 +183,10 @@ pub(crate) mod slot {
     pub const BAR_WIDE: u8 = 20;
     /// A split's resize grip while dragged (on the divider's id).
     pub const DIVIDER_HELD: u8 = 21;
+    /// `.rotation()` angle.
+    pub const ROTATION: u8 = 22;
+    /// `progress_bar` / `progress_ring` value.
+    pub const PROGRESS: u8 = 23;
 }
 
 /// The spring of `(id, slot)`: made at `initial` with `params` the first time it is seen,
@@ -568,6 +572,8 @@ struct Xf {
     border_hidden: u8,
     fg: Color,
     /// Device pixels per point, for snapping to the pixel grid; 0 turns snapping off for
+    /// Turn of pictures, radians clockwise about each picture's own center (`.rotation()`).
+    rot: f32,
     /// what is drawn with it (a knob or lens that swells on a spring: steps would show).
     px: f32,
 }
@@ -604,7 +610,7 @@ pub(crate) fn snap_rect(r: Rect, px: f32) -> Rect {
 impl Xf {
     /// No transform: screen points, clipped to `clip`, text in `fg`, snapped at `px`.
     fn screen(clip: Rect, fg: Color, px: f32) -> Xf {
-        Xf { s: 1.0, tx: 0.0, ty: 0.0, opacity: 1.0, text_reveal: None, hover_scope: None, clip, clip_r: 0.0, clip_smooth: false, clip_sq: 0, shape_sq: 0, border_hidden: 0, fg, px }
+        Xf { s: 1.0, tx: 0.0, ty: 0.0, opacity: 1.0, text_reveal: None, hover_scope: None, clip, clip_r: 0.0, clip_smooth: false, clip_sq: 0, shape_sq: 0, border_hidden: 0, fg, px, rot: 0.0 }
     }
     /// Scales what follows by `k` about the local point `(cx, cy)`, which stays put on
     /// screen: press squeeze, reveal, popovers growing out of their anchor.
@@ -922,6 +928,10 @@ impl<S> Painter<'_, S> {
         let (uw, uh) = (r.w / (iw * k) * 0.5, r.h / (ih * k) * 0.5);
         q.c0 = [0.5 - uw, 0.5 - uh, 0.5 + uw, 0.5 + uh];
         q.c1[0] = self.list.images.len() as f32;
+        if xf.rot != 0.0 {
+            // Images only: the shader turns the picture inside its own (unturned) rect.
+            q.n1[0] = xf.rot;
+        }
         if let Some((w, c)) = border {
             q.border = c.arr();
             q.p0[1] = xf.line(w);
@@ -1166,6 +1176,10 @@ impl<S> Painter<'_, S> {
             let amount=self.crisp(id,slot::HOVER_OFFSET,if xf.hover_scope.unwrap_or(false) {1.0}else{0.0});
             xf.tx+=x*amount*xf.s;xf.ty+=y*amount*xf.s;
         }
+        if let Some(deg) = st.rotation {
+            let smooth = self.look.theme.motion.smooth;
+            xf.rot += self.spring_with(id, slot::ROTATION, deg, deg, smooth).x.to_radians();
+        }
         if let Some(fg) = st.fg {
             xf.fg = fg;
         }
@@ -1279,6 +1293,43 @@ impl<S> Painter<'_, S> {
         let csr = if pad == [0.0; 4] { sr } else { xf.rect_px(cr) };
         match v.kind {
             Kind::Empty | Kind::Spacer => {}
+            Kind::Progress { value, ring } => {
+                let smooth = self.look.theme.motion.smooth;
+                let v = self.spring_with(id, slot::PROGRESS, value, value, smooth).x.clamp(0.0, 1.0);
+                let (track, fill, stroke) = {
+                    let t = &self.look.theme;
+                    (t.color.fill_strong, st.fg.unwrap_or(t.color.accent), t.control.progress_ring.1)
+                };
+                // The fill grows on a spring: drawn as is, not in pixel steps.
+                let fxf = Xf { px: 0.0, ..xf };
+                if ring {
+                    let d = cr.w.min(cr.h);
+                    let stroke = stroke.min(d * 0.5);
+                    let o = (cr.x + (cr.w - d) * 0.5, cr.y + (cr.h - d) * 0.5);
+                    self.fill(&xf, Rect::new(o.0, o.1, d, d), d * 0.5, Fill::Solid(Color::CLEAR), Some((stroke, track)));
+                    if v > 0.0 && stroke > 0.0 {
+                        // The arc is a row of round dots a quarter stroke apart (no arc in the
+                        // shader): the scallops between them stay far below a pixel.
+                        let radius = (d - stroke) * 0.5;
+                        let center = (o.0 + d * 0.5, o.1 + d * 0.5);
+                        let arc = v * std::f32::consts::TAU;
+                        let n = ((arc * radius / (stroke * 0.25)).ceil() as usize).clamp(1, 512);
+                        for i in 0..=n {
+                            let a = arc * i as f32 / n as f32 - std::f32::consts::FRAC_PI_2;
+                            let dot = Rect::new(center.0 + a.cos() * radius - stroke * 0.5, center.1 + a.sin() * radius - stroke * 0.5, stroke, stroke);
+                            self.fill(&fxf, dot, stroke * 0.5, Fill::Solid(fill), None);
+                        }
+                    }
+                } else {
+                    let h = cr.h;
+                    self.fill(&xf, cr, h * 0.5, Fill::Solid(track), None);
+                    if v > 0.0 {
+                        // Starts as a dot, so the rounded ends never pinch.
+                        let w = h + (cr.w - h).max(0.0) * v;
+                        self.fill(&fxf, Rect::new(cr.x, cr.y, w, h), h * 0.5, Fill::Solid(fill), None);
+                    }
+                }
+            }
             Kind::Activity {stroke,period} => {
                 let diameter=(r.w-pad[0]-pad[2]).min(r.h-pad[1]-pad[3]).max(0.0);
                 let stroke=stroke.min(diameter);
@@ -1451,7 +1502,7 @@ impl<S> Painter<'_, S> {
                 }
             }
             Kind::TextField(f) => self.paint_field(f, &st, r, sr, xf, id),
-            Kind::Tabs { labels, selected, on_select } => {
+            Kind::Tabs { labels, icons, selected, on_select } => {
                 let (tabs_pad, drop_tint, lift) = (self.look.theme.control.tab_padding, self.look.theme.control.tab_drop, self.look.theme.shadow.lift);
                 let n = labels.len().max(1);
                 let r = cr;
@@ -1493,7 +1544,14 @@ impl<S> Painter<'_, S> {
                 for (i, (key, ts)) in ln.texts.iter().enumerate() {
                     let near = (1.0 - (center(i) - cx).abs() / tab_w).clamp(0.0, 1.0);
                     let color = xf.fg.alpha(xf.fg.a * (0.6 + 0.4 * near));
-                    self.label(&xf, *key, (center(i) - ts.0 * 0.5, r.y + (r.h - ts.1) * 0.5), *ts, color);
+                    let mut x = center(i) - ts.0 * 0.5;
+                    if let Some(img) = icons.get(i) {
+                        let g = self.look.theme.control.tab_icon;
+                        x = center(i) - (g * 1.5 + ts.0) * 0.5;
+                        self.picture(&xf, Rect::new(x, r.y + (r.h - g) * 0.5, g, g), 0.0, img, Some(color), None);
+                        x += g * 1.5;
+                    }
+                    self.label(&xf, *key, (x, r.y + (r.h - ts.1) * 0.5), *ts, color);
                 }
                 self.hit(&xf, id, csr.inflate(4.0), Action::Tabs {
                         x0: (r.x + tabs_pad) * xf.s + xf.tx,

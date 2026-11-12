@@ -67,6 +67,9 @@ fn vs(@builtin(vertex_index) vi: u32, in: Instance) -> VOut {
         o.n0 = in.n0; // Border gradient target color.
         o.n1 = in.n1; // Relative fade length and direction, not geometry.
     }
+    if in.p0.w == 3.0 {
+        o.n1 = in.n1; // Picture: x is its turn in radians, not geometry.
+    }
     // w: packed rendering flags, not a length.
     o.np = vec4f(in.np.xyz * s, in.np.w);
     return o;
@@ -370,7 +373,13 @@ fn fs(in: VOut) -> @location(0) vec4f {
     } else if kind == 3.0 {
         // Picture: c0 is the visible part of it in UV space. Pick the mip that matches
         // the on-screen size so a large photo shown small doesn't shimmer.
-        let uv = mix(in.c0.xy, in.c0.zw, p / (half * 2.0) + 0.5);
+        // A turned picture (`.rotation()`) samples the point that turns onto this pixel; what
+        // turns in from outside the picture is transparent. The frame itself stays upright.
+        let turn = in.n1.x;
+        let pr = vec2f(cos(turn) * p.x + sin(turn) * p.y, -sin(turn) * p.x + cos(turn) * p.y);
+        let out = max(abs(pr.x) - half.x, abs(pr.y) - half.y);
+        let inside = select(1.0, clamp(0.5 - out, 0.0, 1.0), turn != 0.0);
+        let uv = mix(in.c0.xy, in.c0.zw, pr / (half * 2.0) + 0.5);
         let texels = (in.c0.z - in.c0.x) * f32(textureDimensions(img).x);
         let lod = max(log2(texels / max(half.x * 2.0, 1.0)), 0.0);
         col = textureSampleLevel(img, samp, uv, lod);
@@ -393,6 +402,7 @@ fn fs(in: VOut) -> @location(0) vec4f {
             // Template glyph: its alpha is the shape, the colour comes from the text colour.
             col = vec4f(in.c1.zw, in.p1.x, 1.0) * (in.p1.y * col.a);
         }
+        col *= inside;
     } else {
         let dir = in.p1.xy;
         let extent = abs(dir.x) * half.x + abs(dir.y) * half.y;
