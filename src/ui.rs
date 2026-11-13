@@ -156,6 +156,7 @@ pub(crate) mod slot {
     /// Tab bar drop: position and swelling while held.
     pub const TAB_DROP: u8 = 5;
     pub const TAB_HELD: u8 = 6;
+    pub const TAB_WIDTH: u8 = 24;
     /// Fade of a layer (popover, menu, tooltip) or a modal.
     pub const FADE: u8 = 7;
     /// Scroll bar visibility.
@@ -344,8 +345,8 @@ enum Action<S> {
     Swallow,
     /// Text field (see `edit.rs`).
     Field(Box<edit::FieldHit<S>>),
-    /// Tab bar: screen x of the first tab, width of one tab, number of tabs.
-    Tabs { x0: f32, tab_w: f32, n: usize, on_select: Box<dyn Fn(&mut S, usize)> },
+    /// Tab bar: right edges in screen coordinates; hit testing follows measured widths.
+    Tabs { ends: Vec<f32>, disabled: Vec<usize>, on_select: Box<dyn Fn(&mut S, usize)> },
     OpenMenu,
     SelectAnchor {open:bool},
     Dismiss,
@@ -589,12 +590,6 @@ pub(crate) fn snap(v: f32, px: f32) -> f32 {
     (v * px + 0.5).floor() / px
 }
 
-/// The scale text is rasterized at for a view scaled by `s`: steps of 1/16, so an animation
-/// rasterizes each glyph at a couple of sizes rather than at a new one every frame.
-pub(crate) fn text_scale(s: f32) -> f32 {
-    (s * 16.0).round() / 16.0
-}
-
 /// Both edges of `r` on the pixel grid. A hairline (half a pixel or more) that would
 /// round away stays one pixel thick, centered where it was; anything thinner (a panel
 /// collapsing to nothing) is let go, so it meets its neighbour.
@@ -651,20 +646,15 @@ impl Xf {
     /// Where text whose box starts at the local point `p` (from [`at_px`](Self::at_px)) and is
     /// `size` big goes on screen, and the scale its glyphs are rasterized at.
     ///
-    /// The scale is quantized to 1/16 (each new size rasterizes every glyph again and floods
-    /// the atlas), so the glyphs are a little bigger or smaller than the scaled box; the
-    /// difference is split around the box's center, which keeps text where the quads around
-    /// it are and halves the step when the quantized scale changes. Glyphon truncates the
-    /// glyph row to whole pixels, so a row a hair above its resting one would be drawn a
-    /// pixel short until the scale reached 1; the row is rounded here instead, and the list
-    /// says where the glyphs land. At rest (`s` = 1) this is `p` itself.
-    fn text_at(&self, p: (f32, f32), size: (f32, f32)) -> ((f32, f32), f32) {
-        let k = text_scale(self.s);
-        let d = (self.s - k) * 0.5;
-        let x = p.0 * self.s + self.tx + size.0 * d;
-        let y = p.1 * self.s + self.ty + size.1 * d;
+    /// Glyphs follow exactly the same affine transform as their surrounding surface.
+    /// Quantizing their scale and centering the difference makes long labels slide
+    /// sideways whenever the raster size crosses a step. Only the glyph row is snapped,
+    /// because glyphon places rows on whole device pixels.
+    fn text_at(&self, p: (f32, f32), _size: (f32, f32)) -> ((f32, f32), f32) {
+        let x = p.0 * self.s + self.tx;
+        let y = p.1 * self.s + self.ty;
         let y = if self.px > 0.0 { (y * self.px).round() / self.px } else { y };
-        ((x, y), k)
+        ((x, y), self.s)
     }
     /// A border width `w` (points) on screen: never thinner than one device pixel, and a
     /// whole number of them while it is thin, so a hairline is one solid row of pixels.
@@ -1473,8 +1463,7 @@ impl<S> Painter<'_, S> {
                 let mut cxf = xf;
                 let pos = match mode {
                     OverlayMode::Modal => {
-                        // Fade at the final geometry: scaling long text through quantized
-                        // glyph sizes makes its horizontal position drift and jump.
+                        // Dialogs fade and rise at their final size.
                         cxf.opacity *= tc;
                         (cx, r.y + (r.h - h) * 0.5 + style.rise * (1.0 - tc))
                     }
@@ -1522,12 +1511,18 @@ impl<S> Painter<'_, S> {
                 }
             }
             Kind::TextField(f) => self.paint_field(f, &st, r, sr, xf, id),
-            Kind::Tabs { labels, icons, selected, on_select } => {
+            Kind::Tabs { labels, icons, disabled, selected, on_select, .. } => {
                 let (tabs_pad, drop_tint, lift) = (self.look.theme.control.tab_padding, self.look.theme.control.tab_drop, self.look.theme.shadow.lift);
-                let n = labels.len().max(1);
-                let r = cr;
-                let tab_w = (r.w - 2.0 * tabs_pad) / n as f32;
-                let center = |i: usize| r.x + tabs_pad + tab_w * (i as f32 + 0.5);
+                let n=labels.len();
+                if n==0 {return;}
+                let selected=selected.min(n-1);
+                let r=cr;
+                let widths=&ln.tab_widths;
+                let mut edge=r.x+tabs_pad;
+                let mut starts=Vec::with_capacity(n);
+                let mut ends=Vec::with_capacity(n);
+                for &width in widths {starts.push(edge);edge+=width;ends.push(edge);}
+                let center=|i:usize|starts[i]+widths[i]/2.0;
                 let held = self.pressed == Some(id);
                 // The drop rests on the selected tab; while held it follows the pointer.
                 let target = if held {
@@ -1535,6 +1530,13 @@ impl<S> Painter<'_, S> {
                 } else {
                     center(selected)
                 };
+                let target_width=if held {
+                    let right=(0..n).find(|&i|center(i)>=target).unwrap_or(n-1);
+                    let left=right.saturating_sub(1);
+                    let fraction=if left==right{0.0}else{((target-center(left))/(center(right)-center(left))).clamp(0.0,1.0)};
+                    widths[left]+(widths[right]-widths[left])*fraction
+                }else{widths[selected]};
+                let tab_w=self.spring(id,slot::TAB_WIDTH,target_width).max(1.0);
                 let (cx, vel) = self.spring_v(id, slot::TAB_DROP, target);
                 let p = self.spring(id, slot::TAB_HELD, if held { 1.0 } else { 0.0 });
                 // Liquid: it swells when grabbed and stretches along its motion.
@@ -1546,39 +1548,54 @@ impl<S> Painter<'_, S> {
                     let sh = Shadow { color: lift.color.alpha(lift.color.a * p), ..lift };
                     self.shadow(&Xf { px: 0.0, ..xf }, lens, lh * 0.5, sh, true);
                 }
+                // At the top/bottom rim the refracted ray must not reach the glyphs:
+                // otherwise separate RGB samples pull isolated coloured dots into the rim.
+                // Size the optical bevel from the actual vertical text/icon clearance.
+                let label_height=ln.texts.iter().map(|(_,size)|size.1).fold(0.0f32,f32::max)
+                    .max(if icons.is_empty(){0.0}else{self.look.theme.control.tab_icon});
+                let optical_depth=((lh-label_height).max(0.0)*0.3).clamp(1.0,6.0);
                 let drop = Glass {
                     tint: drop_tint.alpha(drop_tint.a * (1.0 - 0.7 * p.clamp(0.0, 1.0))),
                     saturation: 1.25,
-                    frost: 1.5 * (1.0 - p.clamp(0.0, 1.0)),
+                    frost: 0.0,
                     refraction: 1.0,
-                    depth: 16.0,
+                    depth: optical_depth,
                     dispersion: 0.6,
                     rim: 0.55,
                     horizontal_light: false,
                 };
-                // The drop swells and stretches as it slides: no pixel steps.
-                let lxf = Xf { px: 0.0, ..xf };
-                self.glass(&lxf, lens, lh * 0.5, drop, None);
-                // Labels are foreground content: glass samples only the backdrop,
-                // never the glyphs, including while the lens is dragged between tabs.
+                // Labels form part of the lens backdrop: its rim refracts the letters,
+                // while zero frost keeps the center readable. Never draw a sharp duplicate.
                 for (i, (key, ts)) in ln.texts.iter().enumerate() {
-                    let near = (1.0 - (center(i) - cx).abs() / tab_w).clamp(0.0, 1.0);
-                    let color = xf.fg.alpha(xf.fg.a * (0.6 + 0.4 * near));
+                    let near = (1.0 - (center(i) - cx).abs() / widths[i]).clamp(0.0, 1.0);
+                    let unavailable=disabled.contains(&i);
+                    let color=if unavailable {
+                        self.look.theme.control.disabled_button_colors.map(|(_,fg)|fg).unwrap_or(xf.fg.alpha(self.look.theme.control.disabled_opacity))
+                    }else{xf.fg.alpha(xf.fg.a*(0.6+0.4*near))};
+                    let cell=Rect::new(starts[i],r.y+tabs_pad,widths[i],r.h-2.0*tabs_pad);
+                    if unavailable {
+                        if let Some((bg,_))=self.look.theme.control.disabled_button_colors {
+                            self.fill(&xf,cell,cell.h/2.0,Fill::Solid(bg),None);
+                        }
+                        self.zone(&xf,id,xf.rect(cell),Some(Cursor::Default));
+                    }
+                    let mut label_xf=xf;
+                    label_xf.clip_to(xf.rect(cell),0.0,false);
                     let mut x = center(i) - ts.0 * 0.5;
                     if let Some(img) = icons.get(i) {
                         let g = self.look.theme.control.tab_icon;
                         x = center(i) - (g * 1.5 + ts.0) * 0.5;
-                        self.picture(&xf, Rect::new(x, r.y + (r.h - g) * 0.5, g, g), 0.0, img, Some(color), None);
+                        self.picture(&label_xf, Rect::new(x, r.y + (r.h - g) * 0.5, g, g), 0.0, img, Some(color), None);
                         x += g * 1.5;
                     }
-                    self.label(&xf, *key, (x, r.y + (r.h - ts.1) * 0.5), *ts, color);
+                    self.label(&label_xf, *key, (x, r.y + (r.h - ts.1) * 0.5), *ts, color);
                 }
-                self.hit(&xf, id, csr.inflate(4.0), Action::Tabs {
-                        x0: (r.x + tabs_pad) * xf.s + xf.tx,
-                        tab_w: tab_w * xf.s,
-                        n,
-                        on_select,
-                    });
+                if !disabled.contains(&selected) {
+                    self.glass(&Xf {px:0.0,..xf},lens,lh*0.5,drop,None);
+                }
+                self.hit(&xf,id,csr.inflate(4.0),Action::Tabs {
+                    ends:ends.iter().map(|x|x*xf.s+xf.tx).collect(),disabled,on_select,
+                });
             }
             Kind::Picker { options, selected, on_select, label } => {
                 let text_style=label.text_style();
@@ -2501,6 +2518,10 @@ impl<S: 'static> Ui<S> {
         }
         if !hit.is_some_and(|i| matches!(self.hits[i].action, Action::Tap(..))) { self.ptr.tap = None; }
         self.ptr.pressed = hit.map(|i| self.hits[i].id);
+        if let Some(Action::Tabs {ends,disabled,..})=hit.map(|i|&self.hits[i].action) {
+            let index=ends.iter().position(|&end|pos.0<end).unwrap_or(ends.len().saturating_sub(1));
+            if disabled.contains(&index){self.ptr.pressed=None;return true;}
+        }
         if let Some(Action::Outside(d)) = hit.map(|i| &self.hits[i].action) {
             let d = d.clone();
             // Only an explicitly marked select directly below this overlay may receive
@@ -2687,9 +2708,9 @@ impl<S: 'static> Ui<S> {
         }
         // A dragged tab drop selects whatever tab it is released over, even off the bar.
         if let Some(h) = pressed.and_then(|id| self.hits.iter().find(|h| h.id == id)) {
-            if let Action::Tabs { x0, tab_w, n, on_select } = &h.action {
-                let index = ((pos.0 - x0) / tab_w).floor().clamp(0.0, (*n - 1) as f32) as usize;
-                on_select(&mut self.state, index);
+            if let Action::Tabs { ends, disabled, on_select } = &h.action {
+                let index=ends.iter().position(|&end|pos.0<end).unwrap_or(ends.len().saturating_sub(1));
+                if !disabled.contains(&index){on_select(&mut self.state,index);}
                 return true;
             }
         }

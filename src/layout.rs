@@ -67,6 +67,8 @@ pub(crate) struct LNode {
     pub shift: f32,
     /// Shaped labels with their sizes (Tabs nodes only).
     pub texts: Vec<(u64, (f32, f32))>,
+    /// Measured or explicitly supplied width of each tab.
+    pub tab_widths: Vec<f32>,
     /// Text that did not fit its lines and fades out (Text nodes only).
     pub fade: bool,
     /// Children are bigger than the node right now (`.animate()` in motion): cut them.
@@ -199,19 +201,17 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
             node.texts.push((key,size));
             (size.0+reserved,size.1)
         }
-        Kind::Tabs { labels, icons, .. } => {
-            let mut widest = 0.0f32;
+        Kind::Tabs { labels, icons, widths, .. } => {
             let t = &lx.look.theme;
             let (font, k) = (t.text.subhead, t.control);
-            // A glyph and a gap of half its size go before every label once any tab has one.
-            let glyph = if icons.is_empty() { 0.0 } else { k.tab_icon * 1.5 };
-            for l in labels {
+            for (index,l) in labels.iter().enumerate() {
                 let spec = TextSpec { spans: &[], text: l, size: font.size, weight: 600, line_height: font.line_height, ..Default::default() };
                 let m = lx.text.measure(&spec, None);
-                widest = widest.max(m.1 .0 + glyph);
+                let glyph=if icons.get(index).is_some(){k.tab_icon*1.5}else{0.0};
+                node.tab_widths.push(widths.get(index).copied().flatten().unwrap_or(m.1.0+glyph+k.tab_extra).max(1.0));
                 node.texts.push(m);
             }
-            ((widest + k.tab_extra) * labels.len() as f32 + 2.0 * k.tab_padding, k.tab_height)
+            (node.tab_widths.iter().sum::<f32>() + 2.0*k.tab_padding, k.tab_height)
         }
         Kind::Toggle(..) => lx.look.theme.control.toggle,
         Kind::Progress { ring: false, .. } => (inner.0.unwrap_or(200.0), lx.look.theme.control.progress_bar),

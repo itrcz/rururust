@@ -688,3 +688,24 @@ pub(crate) fn apply<S>(v: &mut View<S>, look: &Look) {
         }
     }
 }
+
+impl Theme {
+    /// Natural widths of text-only tabs, using the same shaping and padding as `tab_bar`.
+    /// Useful when splitting a tab collection into visible tabs and an overflow menu.
+    pub fn tab_widths(&self, labels: &[&str]) -> Vec<f32> {
+        thread_local! {
+            static TEXT: std::cell::RefCell<crate::text::TextSystem> = std::cell::RefCell::new(crate::text::TextSystem::new());
+        }
+        TEXT.with(|cache| {
+            let mut text = cache.borrow_mut();
+            text.set_fonts(&self.font, &self.mono);
+            let widths = labels.iter().map(|label| {
+                let spec = crate::text::TextSpec { text: label, size: self.text.subhead.size,
+                    weight: 600, line_height: self.text.subhead.line_height, ..Default::default() };
+                text.measure(&spec, None).1.0 + self.control.tab_extra
+            }).collect();
+            text.end_frame();
+            widths
+        })
+    }
+}

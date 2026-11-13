@@ -1051,8 +1051,7 @@ impl Renderer {
                         // Glyphon truncates the row; the painter already put it on a whole
                         // pixel, this only keeps an unsnapped one from falling short.
                         top: (t.pos.1 * scale).round(),
-                        // Already quantized by the painter (`text_scale`), which places the
-                        // text for exactly this scale.
+                        // Use the surface transform unchanged so text and its plate scale together.
                         scale: t.scale * scale,
                         bounds,
                         default_color: glyphon::Color::rgba(to8(c.r), to8(c.g), to8(c.b), to8(c.a * a)),

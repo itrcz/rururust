@@ -156,12 +156,12 @@ fn tab_drop_selects_on_tap_and_on_drag_release() {
     struct T {
         tab: usize,
     }
-    fn labels_above_glass(ui:&Ui<T>) {
+    fn labels_under_lens(ui:&Ui<T>) {
         let mut labels=0;let mut panes=0;
         for cmd in &ui.list.cmds {match cmd {
             ruru::Cmd::Text(_)=>labels+=1,
             ruru::Cmd::Quad(q) if q.p0[3]==2.0=>{
-                panes+=1;assert_eq!(labels,0,"glass must not sample the tab labels");
+                panes+=1;assert_eq!(labels,if panes==1{0}else{3},"the moving lens must sample all labels");
             },_=>{},
         }}
         assert_eq!(panes,2,"both the bar and moving lens retain their glass");
@@ -171,23 +171,61 @@ fn tab_drop_selects_on_tap_and_on_drag_release() {
         zstack(tab_bar(&["One", "Two", "Three"], s.tab, |s: &mut T, i| s.tab = i).place(Align::Start, Align::Start)).fill()
     });
     ui.frame((400.0, 200.0));
-    labels_above_glass(&ui);
-    // Three equal tabs: the bar is 6 pt of padding + 3 tabs + 6 pt.
+    labels_under_lens(&ui);
+    // Tap inside the third natural-width tab.
     let tab_w = 40.0 + 44.0; // rough; only the ordering of the taps matters below
     ui.pointer_down((6.0 + tab_w * 2.5, 28.0), false);
     ui.pointer_up((6.0 + tab_w * 2.5, 28.0));
     assert_eq!(ui.state.tab, 2);
     // Grab the drop, drag it left and let go below the bar: the tab under it wins.
     ui.frame((400.0, 200.0));
-    labels_above_glass(&ui);
+    labels_under_lens(&ui);
     ui.pointer_down((6.0 + tab_w * 2.5, 28.0), false);
     ui.pointer_move((10.0, 150.0));
     ui.frame((400.0, 200.0));
-    labels_above_glass(&ui);
+    labels_under_lens(&ui);
     assert!(ui.animating, "the drop is moving");
     ui.pointer_up((10.0, 150.0));
     assert_eq!(ui.state.tab, 0);
-    ui.frame((400.0,200.0));labels_above_glass(&ui);
+    ui.frame((400.0,200.0));labels_under_lens(&ui);
+}
+
+#[test]
+fn tabs_measure_each_label_and_honor_individual_width_overrides() {
+    for fixed in [false,true] {
+        let mut ui=Ui::new(0usize,move |s:&usize| {
+            let bar=tab_bar(&["I","A much longer tab","中"],*s,|s:&mut usize,i|*s=i);
+            zstack(if fixed{bar.tab_widths(&[Some(70.0),None,Some(110.0)])}else{bar}).place(Align::Start,Align::Start)
+        });
+        let size=(700.0,200.0);ui.frame(size);
+        let t=Theme::dark();let pad=t.control.tab_padding;let extra=t.control.tab_extra;
+        let labels=texts(&ui).iter().map(|c|(c.pos,c.size)).collect::<Vec<_>>();
+        let widths=labels.iter().enumerate().map(|(i,(_,size))|if fixed&&i==0{70.0}else if fixed&&i==2{110.0}else{size.0+extra}).collect::<Vec<_>>();
+        assert!(widths[1]>widths[0]);
+        let mut edge=pad;
+        for i in 0..3 {
+            assert!((labels[i].0.0+labels[i].1.0/2.0-(edge+widths[i]/2.0)).abs()<0.6,"label centered in its own width: fixed={fixed}, index={i}, labels={labels:?}, widths={widths:?}, padding={pad}");
+            // A point just inside each right edge catches equal-width hit testing.
+            let at=(edge+widths[i]-1.0,20.0);ui.pointer_down(at,false);ui.pointer_up(at);assert_eq!(ui.state,i);ui.frame(size);
+            edge+=widths[i];
+        }
+        let glass=ui.list.cmds.iter().filter_map(|c|match c{ruru::Cmd::Quad(q) if q.p0[3]==2.0=>Some(q.rect),_=>None}).collect::<Vec<_>>();
+        assert!((glass[0][2]-(edge+pad)).abs()<0.1,"bar hugs the sum of tab widths");
+        for _ in 0..100 {std::thread::sleep(std::time::Duration::from_millis(8));ui.frame(size);}
+        let lens=ui.list.cmds.iter().filter_map(|c|match c{ruru::Cmd::Quad(q) if q.p0[3]==2.0=>Some(q.rect),_=>None}).last().unwrap();
+        assert!((lens[2]-widths[2]).abs()<0.2,"lens settles to the selected width");
+        ui.pointer_down((edge-widths[2]/2.0,20.0),false);ui.pointer_move((pad+1.0,100.0));ui.frame(size);ui.pointer_up((pad+1.0,100.0));assert_eq!(ui.state,0);
+    }
+}
+
+#[test]
+fn disabled_tabs_ignore_taps_and_drag_release() {
+    let mut ui=Ui::new(1usize,|s:&usize|zstack(tab_bar(&["Yours","Templates"],*s,|s:&mut usize,i|*s=i).tab_disabled(&[0])).place(Align::Start,Align::Start));
+    let size=(400.0,200.0);ui.frame(size);
+    let labels=texts(&ui).iter().map(|c|(c.pos.0+c.size.0/2.0,20.0)).collect::<Vec<_>>();
+    ui.pointer_move(labels[0]);ui.frame(size);assert_eq!(ui.cursor,Cursor::Default);
+    ui.pointer_down(labels[0],false);ui.pointer_up(labels[0]);assert_eq!(ui.state,1);
+    ui.pointer_down(labels[1],false);ui.pointer_move(labels[0]);ui.frame(size);ui.pointer_up(labels[0]);assert_eq!(ui.state,1);
 }
 
 #[test]
@@ -3322,7 +3360,7 @@ fn menu_text_frames(scale: f32) -> Vec<(Vec<(f32, f32, f32)>, [f32; 4])> {
     let img = Image::from_rgba(2, 2, vec![255; 16]);
     let mut ui = Ui::new(false, move |s: &bool| {
         let items = vec![
-            MenuItem::action("Paste", |_: &mut bool| {}).icon(&img),
+            MenuItem::action("Paste a long label / Очень длинная строка", |_: &mut bool| {}).icon(&img),
             MenuItem::action("Bold", |_: &mut bool| {}).checked(true),
         ];
         rect()
@@ -3366,7 +3404,11 @@ fn menu_text_and_icon_settle_without_a_jump() {
         assert_eq!(rest.len(), 3, "icon row label, check mark, label");
         for (f, (t, icon)) in seen.iter().enumerate() {
             for (i, &(x, y, k)) in t.iter().enumerate() {
-                // What glyphon draws: rows on truncated pixels, glyphs at the quantized scale.
+                let surface_scale=icon[2]/rest_icon[2];
+                assert!((k-surface_scale).abs()<1e-5,"text and surface must share the exact scale");
+                let expected_x=icon[0]+(rest[i].0-rest_icon[0])*surface_scale;
+                assert!((x-expected_x).abs()<0.001,"text must not recenter during zoom: {x} != {expected_x}");
+                // What glyphon draws: rows on truncated pixels.
                 let row = (y + 1e-3).trunc();
                 let (rx, ry, _) = rest[i];
                 // Measured from the icon, which moves smoothly: never more than half a pixel
@@ -3374,7 +3416,7 @@ fn menu_text_and_icon_settle_without_a_jump() {
                 let (dx, dy) = (x - icon[0] - (rx - rest_icon[0]), row - icon[1] - (ry - rest_icon[1]));
                 if f + 7 >= n {
                     assert!(dy.abs() <= 0.5 + 1e-3 && dx.abs() < 0.5, "scale {scale}: text {i} off the icon by ({dx}, {dy}) at frame {f} of {n}");
-                    assert_eq!(k, 1.0, "scale {scale}: text {i} rasterized at {k} near the end");
+                    assert!((k-1.0).abs()<0.001, "scale {scale}: text {i} scale {k} near the end");
                 }
             }
         }

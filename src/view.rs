@@ -755,7 +755,7 @@ pub(crate) enum Kind<S> {
     Image(Image, bool),
     TextField(crate::ui::edit::Field<S>),
     Picker { options: Vec<String>, selected: usize, on_select: Rc<dyn Fn(&mut S, usize)>, label: TextData },
-    Tabs { labels: Vec<String>, icons: Vec<Image>, selected: usize, on_select: Box<dyn Fn(&mut S, usize)> },
+    Tabs { labels: Vec<String>, icons: Vec<Image>, widths: Vec<Option<f32>>, disabled: Vec<usize>, selected: usize, on_select: Box<dyn Fn(&mut S, usize)> },
     /// Value 0..=1; a ring instead of a bar.
     Progress { value: f32, ring: bool },
     Empty,
@@ -1883,11 +1883,12 @@ pub fn picker<S, T: AsRef<str>>(options: &[T], selected: usize, on_select: impl 
 }
 /// Floating glass tab bar. A glass "drop" marks the selected tab: it flows to a tab when
 /// you tap it, and while held it swells past the bar and can be dragged across the tabs,
-/// bending the backdrop like a lens. Labels are painted above the glass and stay sharp.
+/// bending the backdrop and labels like a lens. Each tab sizes to its own label and icon;
+/// use [`View::tab_widths`] to override individual widths.
 pub fn tab_bar<S, T: AsRef<str>>(labels: &[T], selected: usize, on_select: impl Fn(&mut S, usize) + 'static) -> View<S> {
     let labels: Vec<String> = labels.iter().map(|l| l.as_ref().to_string()).collect();
     let selected = selected.min(labels.len().saturating_sub(1));
-    let mut v = View::new(Kind::Tabs { labels, icons: Vec::new(), selected, on_select: Box::new(on_select) });
+    let mut v = View::new(Kind::Tabs { labels, icons: Vec::new(), widths: Vec::new(), disabled: Vec::new(), selected, on_select: Box::new(on_select) });
     v.style.role = Role::Tabs;
     v
 }
@@ -1961,6 +1962,20 @@ impl<S> View<S> {
         if self.style.role == Role::Button {
             self.style.role = Role::SecondaryButton;
         }
+        self
+    }
+    /// Tab widths in points, including the label's horizontal padding. `None` (or an
+    /// omitted entry) uses that tab's measured label and icon. Invalid widths use auto.
+    /// The bar's own `.width()` does not distribute extra space among its tabs.
+    pub fn tab_widths(mut self, values: &[Option<f32>]) -> Self {
+        if let Kind::Tabs { widths, .. } = &mut self.kind {
+            *widths = values.iter().map(|v|v.filter(|w|w.is_finite() && *w>0.0)).collect();
+        }
+        self
+    }
+    /// Visible but unavailable tabs: no selection or drag can activate these indices.
+    pub fn tab_disabled(mut self, indices: &[usize]) -> Self {
+        if let Kind::Tabs { disabled, .. } = &mut self.kind { *disabled=indices.to_vec(); }
         self
     }
     /// Tab bar only: a glyph before each tab's label, in the label's color; the first icon
