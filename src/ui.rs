@@ -19,6 +19,8 @@ mod reveal;
 mod marquee;
 #[path = "cursor.rs"]
 mod cursor;
+#[path = "modal.rs"]
+mod modal;
 
 #[path = "edit.rs"]
 pub(crate) mod edit;
@@ -45,6 +47,8 @@ pub(crate) const FLAG_CORNER_MASK: u32 = 256;
 pub(crate) const FLAG_HORIZONTAL_LIGHT: u32 = 512;
 /// A border whose color fades along the view (`n0`, `n1` carry the fade, not geometry).
 pub(crate) const FLAG_BORDER_FADE: u32 = 16384;
+pub(crate) const FLAG_EDGE_BLUR: u32 = 32768;
+pub(crate) const FLAG_EDGE_BLUR_TRAILING: u32 = 65536;
 
 /// One GPU instance. Units are logical points; the shader applies the scale factor.
 #[repr(C)]
@@ -66,6 +70,7 @@ pub struct Quad {
     pub np: [f32; 4],
 }
 
+#[derive(Clone)]
 pub struct TextCmd {
     pub key: u64,
     pub pos: (f32, f32),
@@ -80,6 +85,7 @@ pub struct TextCmd {
     pub leading_fade: f32,
 }
 
+#[derive(Clone)]
 pub enum Cmd {
     Quad(Quad),
     Text(TextCmd),
@@ -159,6 +165,7 @@ pub(crate) mod slot {
     pub const TAB_WIDTH: u8 = 24;
     pub const ICON_PROGRESS: u8 = 25;
     pub const COLLAPSE: u8 = 26;
+    pub const EDGE_BLUR: u8 = 27;
     /// Fade of a layer (popover, menu, tooltip) or a modal.
     pub const FADE: u8 = 7;
     /// Scroll bar visibility.
@@ -736,6 +743,7 @@ struct IconTimeline {
 }
 
 struct Painter<'a, S> {
+    modals: &'a mut HashMap<u64,modal::ModalFrame>,
     visible_clip: Option<Rect>,
     visible_events: Vec<(Box<dyn Fn(&mut S, std::ops::Range<usize>)>, std::ops::Range<usize>)>,
     list: &'a mut DrawList,
@@ -832,6 +840,15 @@ impl<S> Painter<'_, S> {
         let hidden = sp.hide_collapsed_divider && sp.collapse.as_ref().is_some_and(|c| c.0);
         let on = self.split_drag == Some(id) || self.hovered.contains(&div);
         let t = if hidden { 0.0 } else { self.crisp(div, slot::HOVER, if on { 1.0 } else { 0.0 }).clamp(0.0, 1.0) };
+        if let Some((fraction, frost, tint)) = sp.main_edge_blur {
+            // The broad material settles more slowly than the narrow divider highlight.
+            let smooth = self.look.theme.motion.smooth;
+            let target = if on && !hidden { 1.0 } else { 0.0 };
+            let amount = self.spring_with(div, slot::EDGE_BLUR, 0.0, target, smooth).x.clamp(0.0, 1.0);
+            if !hidden && amount > 0.001 && region > 0.0 {
+                main.style.edge_blur = Some((fraction, frost * amount, sp.trailing, tint.alpha(tint.a * amount)));
+            }
+        }
         if hidden { main.style.border_hidden |= if sp.trailing { 2 } else { 8 }; }
         if sp.highlight_main_border && !hidden {
             let (width, color) = main.style.border.unwrap_or((line, self.look.theme.color.divider));
@@ -1267,7 +1284,7 @@ impl<S> Painter<'_, S> {
         // would cover it otherwise.
         let late_border = st
             .border
-            .filter(|_| st.clip || ln.clip || st.hover.is_some() || st.glass.is_some() || st.border_fade.is_some() || !ln.children.is_empty())
+            .filter(|_| st.clip || ln.clip || st.hover.is_some() || st.glass.is_some() || st.border_fade.is_some() || st.edge_blur.is_some() || !ln.children.is_empty())
             .map(|b| (xf, b));
         // Inner shadows lie over the children too, like the border.
         let inset = st.inset.map(|sh| (xf, sh));
@@ -1493,6 +1510,7 @@ impl<S> Painter<'_, S> {
                 }
             }
             Kind::Overlay { open, mode, child, on_dismiss, style } => {
+                if mode==OverlayMode::Modal && !open {return;}
                 let target = if open { 1.0 } else { 0.0 };
                 let t = if mode == OverlayMode::Modal { self.fade(id, target) }
                     else { self.spring_from(id, slot::OVERLAY, 0.0, target) };
@@ -1521,6 +1539,7 @@ impl<S> Painter<'_, S> {
                 let pos = cxf.at_px(pos);
                 // Bars of what lies underneath go under the scrim with it.
                 self.flush_bars();
+                let modal_start=self.list.cmds.len();
                 if mode != OverlayMode::Toast {
                     if let Some(mut glass) = style.backdrop {
                         // Fade both the blur radius and its contribution; the dialog is
@@ -1538,11 +1557,16 @@ impl<S> Painter<'_, S> {
                         cursor: None, blocks: true, tip: false,
                     });
                 }
+                let modal_body=self.list.cmds.len();
                 let body = cxf.rect(Rect::new(pos.0, pos.1, w, h));
                 self.hits.push(Hit { id: child_id(id, 1, None), rect: body, round: NO_ROUND, action: Action::Swallow });
                 let cid = child_id(id, 0, child.key);
                 self.tbase = tbase;
                 self.paint(*child, cn, pos, cxf, cid);
+                if mode==OverlayMode::Modal {
+                    self.flush_bars();
+                    self.remember_modal(id,modal_start,modal_body,tc,style.rise*xf.s);
+                }
             }
             Kind::Collapse {child,..} => {
                 let p=ln.collapse_progress;
@@ -1937,7 +1961,8 @@ impl<S> Painter<'_, S> {
                         bar.rail = Some((rail, xf.fg.alpha(track_opacity * wide * a)));
                     }
                     let thumb = Rect::new(r.x + r.w - 2.0 - w, by + 4.0 + (track - len) * at, w, len);
-                    bar.thumb = Some((thumb, w * 0.5, xf.fg.alpha((0.45 + 0.1 * wide) * a)));
+                    let (idle, hovered) = self.look.theme.control.scrollbar_thumb_opacity;
+                    bar.thumb = Some((thumb, w * 0.5, xf.fg.alpha((idle + (hovered - idle) * wide).clamp(0.0, 1.0) * a)));
                     if a > 0.5 {
                         let y0 = (by + 4.0) * xf.s + xf.ty;
                         bar.hit = Some(Action::ScrollBar { scroll: id, y0, track: track * xf.s, len: len * xf.s, lo, hi, page: (r.h * 0.9).max(1.0) });
@@ -2005,6 +2030,19 @@ impl<S> Painter<'_, S> {
                 self.hit(&xf, id, csr.inflate(8.0), Action::Slider(x0, range * xf.s, steps, f));
             }
         }
+        if let Some((fraction, frost, trailing, tint)) = st.edge_blur {
+            let width = r.w * fraction;
+            let strip = Rect::new(if trailing { r.x + r.w - width } else { r.x }, r.y, width, r.h);
+            // Reuse the backdrop pyramid once for the whole strip. Varying the sampled
+            // radius per pixel avoids bands and leaves the far edge genuinely sharp.
+            self.glass(&xf, strip, 0.0, Glass { tint, saturation: 1.0,
+                frost, refraction: 0.0, depth: 0.0, dispersion: 0.0, rim: 0.0,
+                horizontal_light: false }, None);
+            if let Some(Cmd::Quad(q)) = self.list.cmds.last_mut() {
+                q.np[3] = ((q.np[3] as u32) | FLAG_EDGE_BLUR
+                    | if trailing { FLAG_EDGE_BLUR_TRAILING } else { 0 }) as f32;
+            }
+        }
         if let Some((mxf, mask)) = corner_mask {
             self.paint_corner_mask(mxf, r, &st, mask);
         }
@@ -2031,6 +2069,7 @@ impl<S> Painter<'_, S> {
 // ---------------------------------------------------------------- Ui
 
 pub struct Ui<S> {
+    modals: HashMap<u64,modal::ModalFrame>,
     pub state: S,
     view_fn: Box<dyn Fn(&S, &Env) -> View<S>>,
     pub text: TextSystem,
@@ -2117,6 +2156,7 @@ impl<S: 'static> Ui<S> {
     pub fn new<M>(state: S, view: impl ViewFn<S, M>) -> Self {
         Ui {
             state,
+            modals: HashMap::new(),
             view_fn: Box::new(move |s, env| view.build(s, env)),
             text: TextSystem::new(),
             list: DrawList::default(),
@@ -2321,6 +2361,7 @@ impl<S: 'static> Ui<S> {
         }
         self.size = size;
 
+        for modal in self.modals.values() {modal.retain_text(&mut self.text);}
         let mut view = (self.view_fn)(&self.state, &self.env());
         let look = self.look.clone();
         crate::theme::apply(&mut view, &look);
@@ -2349,6 +2390,7 @@ impl<S: 'static> Ui<S> {
         let xf = Xf::screen(Rect::new(0.0, 0.0, size.0, size.1), fg, self.scale);
         let frame = self.frame;
         let mut p = Painter {
+            modals: &mut self.modals,
             visible_clip: None,
             visible_events: Vec::new(),
             list: &mut self.list,
@@ -2401,6 +2443,7 @@ impl<S: 'static> Ui<S> {
         };
         p.paint(view, &root, (0.0, 0.0), xf, 1);
         p.flush_bars();
+        p.closing_modals();
         p.paint_layers();
         match p.menu.take() {
             Some(menu) => {
@@ -2559,6 +2602,8 @@ impl<S: 'static> Ui<S> {
         let shown = if h.collapsed { 0.0 } else { h.open };
         let grab = h.dir * (x - h.edge) / h.s - shown;
         self.split_drag = Some(SplitDrag { collapsed: h.collapsed, grab, hit: h });
+        self.notify_pointer();
+        self.update_hover();
         self.cursor = Cursor::ResizeH;
     }
 
@@ -2693,7 +2738,8 @@ impl<S: 'static> Ui<S> {
 
     /// Recomputes what is under the mouse; true if that changed (a frame is needed).
     fn update_hover(&mut self) -> bool {
-        let (ids, cursor, tip) = hover_at(&self.zones, self.mouse);
+        let mouse = self.mouse.filter(|_| self.split_drag.is_none());
+        let (ids, cursor, tip) = hover_at(&self.zones, mouse);
         // A dragged scroll bar thumb keeps the arrow wherever the pointer wanders.
         self.cursor = if self.ptr.bar.is_some() {
             Cursor::Default
@@ -2726,7 +2772,7 @@ impl<S: 'static> Ui<S> {
 
     fn notify_pointer(&mut self) -> bool {
         for observer in &self.pointer_observers {
-            let pos=self.mouse.map(|p|((p.0-observer.rect.x)/observer.scale,(p.1-observer.rect.y)/observer.scale));
+            let pos=self.mouse.filter(|_| self.split_drag.is_none()).map(|p|((p.0-observer.rect.x)/observer.scale,(p.1-observer.rect.y)/observer.scale));
             (observer.handler)(&mut self.state,pos);
         }
         !self.pointer_observers.is_empty()
@@ -2811,6 +2857,7 @@ impl<S: 'static> Ui<S> {
         let pressed = self.ptr.pressed.take();
         self.ptr.down = false;
         if self.ptr.bar.take().is_some() || self.split_drag.take().is_some() {
+            self.notify_pointer();
             self.update_hover();
             return true;
         }

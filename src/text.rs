@@ -612,6 +612,15 @@ impl TextSystem {
         Some(Shaped { buffer: &l.buffer, starts: &e.starts, size: l.size })
     }
 
+    /// Keep a closing modal’s text layout alive and prevent incremental shaping from reusing it.
+    pub(crate) fn retain_layout(&mut self,key:u64) {
+        let (key,slot)=split_key(key);
+        if let Some(entry)=self.entries.get_mut(&key) {
+            entry.used=self.frame;
+            if let Some(layout)=entry.layouts.get_mut(slot) {layout.used=self.frame;}
+        }
+    }
+
     /// The fonts, and the laid-out buffers behind keys from `measure`, for drawing.
     #[cfg(feature = "renderer")]
     pub(crate) fn for_drawing(&mut self) -> (&mut FontSystem, Buffers<'_>) {

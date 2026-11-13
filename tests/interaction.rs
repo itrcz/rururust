@@ -5030,3 +5030,90 @@ fn visible_rows_report_again_when_returning_to_a_cached_list() {
     ui.state.0=false;ui.frame(size);ui.state.0=true;ui.frame(size);
     assert_eq!(ui.state.1,2,"returning to a chat restores its visible markers even if its range is unchanged");
 }
+
+#[test]
+fn split_edge_blur_tracks_hover_drag_collapse_and_leaves_input_available() {
+    for trailing in [false,true] {
+        let mut ui=Ui::new((220.0f32,false,0usize),move |s:&(f32,bool,usize)| {
+            let view=split(s.0,|s:&mut (f32,bool,usize),w|s.0=w,
+                rect().min_width(100.0).max_width(350.0),
+                button("Main",|s:&mut (f32,bool,usize)|s.2+=1).fill()
+                    .background(Color::BLACK).border(1.0,Color::WHITE).radius(16.0).clip())
+                .blur_main_edge(0.3,18.0,Color::CLEAR).hide_collapsed_divider()
+                .collapsible(s.1,80.0,|s:&mut (f32,bool,usize),closed|s.1=closed);
+            if trailing {view.trailing()}else{view}
+        });
+        let size=(800.0,400.0);
+        let settle=|ui:&mut Ui<(f32,bool,usize)>| {
+            for _ in 0..250 {ui.frame(size);if !ui.animating {break;}std::thread::sleep(std::time::Duration::from_millis(4));}
+            assert!(!ui.animating,"no continuous redraw after settling");
+        };
+        let blur=|ui:&Ui<(f32,bool,usize)>|ui.list.cmds.iter().find_map(|c|match c {
+            ruru::Cmd::Quad(q) if q.p0[3]==2.0 && (q.np[3] as u32)&32768!=0=>Some(*q),_=>None,
+        });
+        settle(&mut ui);assert!(blur(&ui).is_none());
+        let x=if trailing {580.0}else{220.0};
+        ui.pointer_move((x,180.0));settle(&mut ui);
+        let q=blur(&ui).expect("hover reveals blur");
+        assert!((q.rect[2]-579.0*0.3).abs()<=1.0,"blur rect: {:?}",q.rect);
+        assert!((q.p1[0]-18.0).abs()<0.01);
+        assert_eq!((q.np[3] as u32)&65536!=0,trailing);
+        assert!((q.rect[0]-if trailing {579.0-q.rect[2]}else{221.0}).abs()<=1.0);
+        assert_eq!(ui.cursor,Cursor::ResizeH);
+        ui.pointer_down((x,180.0),false);ui.pointer_move((x+25.0,180.0));settle(&mut ui);
+        assert!(blur(&ui).is_some());
+        assert!((ui.state.0-if trailing{195.0}else{245.0}).abs()<1.0);
+        ui.pointer_up((x+25.0,180.0));ui.pointer_move((400.0,180.0));settle(&mut ui);
+        assert!(blur(&ui).is_none());
+        ui.pointer_down((400.0,180.0),false);ui.pointer_up((400.0,180.0));assert_eq!(ui.state.2,1);
+        ui.state.1=true;settle(&mut ui);ui.pointer_move((if trailing{799.0}else{1.0},180.0));settle(&mut ui);
+        assert!(blur(&ui).is_none());
+    }
+}
+
+#[test]
+fn removed_modal_fades_out_without_live_form_actions_and_can_reopen() {
+    const PANEL:Color=Color::rgba(0.23,0.41,0.63,1.0);
+    let mut ui=Ui::new((true,0usize),|s:&(bool,usize)|zstack((
+        button("Underlying",|s:&mut (bool,usize)|s.1+=10).fill(),
+        if s.0 {modal(true,|s:&mut (bool,usize)|s.0=false,
+            button("Dismissed form",|s:&mut (bool,usize)|s.1+=1)
+                .size(260.0,120.0).background(PANEL))
+                .modal_style(ModalStyle{rise:18.0,backdrop:Some(Glass::dark())})
+        }else{rect().size(0.0,0.0)},
+    )));
+    let size=(800.0,500.0);
+    let step=|ui:&mut Ui<(bool,usize)>|{std::thread::sleep(std::time::Duration::from_millis(16));ui.frame(size);};
+    let panel=|ui:&Ui<(bool,usize)>|ui.list.cmds.iter().find_map(|c|match c {
+        ruru::Cmd::Quad(q) if q.c0==[PANEL.r,PANEL.g,PANEL.b,PANEL.a]=>Some(*q),_=>None,
+    });
+    ui.frame(size);for _ in 0..50 {step(&mut ui);}
+    let open=panel(&ui).unwrap();ui.state.0=false;ui.frame(size);
+    assert!(panel(&ui).is_some(),"removed form keeps its last visual frame");
+    for _ in 0..5 {step(&mut ui);}
+    let fading=panel(&ui).unwrap();assert!(fading.p1[3]>0.0&&fading.p1[3]<open.p1[3]);
+    assert!(fading.rect[1]>open.rect[1]);
+    assert!(ui.list.cmds.iter().any(|c|matches!(c,ruru::Cmd::Text(t) if t.color.a>0.0&&t.color.a<0.99)),"text also fades");
+    ui.pointer_down((400.0,250.0),false);ui.pointer_up((400.0,250.0));assert_eq!(ui.state.1,0);
+    ui.state.0=true;ui.frame(size);assert!(panel(&ui).is_some());
+    for _ in 0..50 {step(&mut ui);}
+    assert!(panel(&ui).unwrap().p1[3]>0.99);
+    ui.state.0=false;ui.frame(size);for _ in 0..90 {step(&mut ui);}
+    assert!(panel(&ui).is_none());assert!(!ui.animating);
+    ui.pointer_down((400.0,250.0),false);ui.pointer_up((400.0,250.0));assert_eq!(ui.state.1,10);
+}
+
+#[test]
+fn scroll_to_end_reaches_bottom_of_a_row_taller_than_the_viewport() {
+    let mut ui=Ui::new(None::<u64>,|request:&Option<u64>| {
+        let rows=list(8,100.0,|i|rect().fill_width().height(if i==7{900.0}else{100.0}).background(Color::rgba(i as f32/10.0,0.2,0.3,1.0)));
+        scroll(if let Some(request)=request {rows.scroll_to_end(*request)}else{rows})
+    });
+    let size=(500.0,300.0);ui.frame(size);ui.state=Some(1);ui.frame(size);
+    for _ in 0..40 {std::thread::sleep(std::time::Duration::from_millis(16));ui.frame(size);}
+    let bottom=ui.list.cmds.iter().find_map(|c|match c {ruru::Cmd::Quad(q) if q.rect[3]==900.0=>Some(q.rect[1]+q.rect[3]),_=>None}).unwrap();
+    assert!((bottom-300.0).abs()<1.0,"last row ends at viewport bottom: {bottom}");
+    ui.wheel((300.0,150.0),200.0,ruru::WheelPhase::Line);ui.frame(size);
+    let bottom=ui.list.cmds.iter().find_map(|c|match c {ruru::Cmd::Quad(q) if q.rect[3]==900.0=>Some(q.rect[1]+q.rect[3]),_=>None}).unwrap();
+    assert!(bottom>400.0,"manual scrolling resumes after reaching the end");
+}

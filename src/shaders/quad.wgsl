@@ -325,7 +325,14 @@ fn fs(in: VOut) -> @location(0) vec4f {
         // differently per colour channel: most of the look is bent light, not blur.
         let nrm = dg.yz;
         let t = clamp(-d / depth, 0.0, 1.0);
-        let sigma = in.p1.x * 0.5 * g.scale;
+        var sigma = in.p1.x * 0.5 * g.scale;
+        var edge_fade = 1.0;
+        if (u32(in.np.w + 0.5) & 32768u) != 0u {
+            let x = clamp((in.xy.x - in.rect.x + half.x) / max(2.0 * half.x, 1.0), 0.0, 1.0);
+            let toward_edge = select(1.0 - x, x, (u32(in.np.w + 0.5) & 65536u) != 0u);
+            edge_fade = smoothstep(0.0, 1.0, toward_edge);
+            sigma *= edge_fade;
+        }
         // The snapshot is premultiplied: the glass works on straight colour and keeps the
         // backdrop's alpha, so over a transparent window it stays as see-through as the
         // window around it instead of turning into dark, opaque premultiplied colour.
@@ -351,8 +358,9 @@ fn fs(in: VOut) -> @location(0) vec4f {
         let luma = dot(bg, vec3f(0.2126, 0.7152, 0.0722));
         bg = mix(vec3f(luma), bg, in.c1.x);
         // The tint is laid over the backdrop and adds its own coverage.
-        let ga = ba + (1.0 - ba) * in.c0.a;
-        bg = (bg * ba * (1.0 - in.c0.a) + in.c0.rgb * in.c0.a) / max(ga, 1e-4);
+        let tint_alpha = in.c0.a * edge_fade;
+        let ga = ba + (1.0 - ba) * tint_alpha;
+        bg = (bg * ba * (1.0 - tint_alpha) + in.c0.rgb * tint_alpha) / max(ga, 1e-4);
 
         // Specular rim: a crisp line that takes its colour from what is behind the glass,
         // strongest on the edge facing the light (top-left), weaker on the opposite one.

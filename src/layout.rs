@@ -302,6 +302,9 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
             }
             lx.tail_viewport = tail_viewport;
             let cache = lx.text.lists.entry(id).or_default();
+            if let Some((usize::MAX,request))=target {
+                node.row_target=Some((*request,f32::MAX));
+            }
             if let Some((index,request))=target.filter(|(index,_)|*index<*count) {
                 node.row_target=Some((request,cache.heights[..index].iter().map(|h|if h.is_nan(){*row_h}else{*h}).sum::<f32>()+pad[1]));
             }

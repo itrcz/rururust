@@ -280,6 +280,7 @@ pub(crate) struct Style {
     pub border: Option<(f32, Color)>,
     pub border_hidden: u8,
     pub border_fade: Option<(Color, f32, bool)>,
+    pub edge_blur: Option<(f32, f32, bool, Color)>,
     /// Drop shadows, key then ambient (`.shadow()`, `.shadow_with()`).
     pub shadow: [Option<Shadow>; 2],
     /// Inner shadow or rim (`.shadow_with(Shadow::..inset())`).
@@ -383,6 +384,7 @@ impl Default for Style {
             border: None,
             border_hidden: 0,
             border_fade: None,
+            edge_blur: None,
             shadow: [None; 2],
             inset: None,
             glass: None,
@@ -822,6 +824,7 @@ pub(crate) struct Split<S> {
     pub trailing: bool,
     pub highlight_main_border: bool,
     pub highlight_fade: Option<f32>,
+    pub main_edge_blur: Option<(f32, f32, Color)>,
     pub resize_grip: bool,
     pub grip_bottom: Option<f32>,
     pub hide_collapsed_divider: bool,
@@ -849,7 +852,8 @@ impl<S> View<S> {
 
     /// Observes mouse motion anywhere in the window while this view is visible. The
     /// position is in this view's local coordinates (and can lie outside its bounds);
-    /// `None` means the mouse left the window. Does not capture clicks or drags.
+    /// `None` means the mouse left the window or a split divider owns the drag.
+    /// Does not capture clicks or drags.
     /// Unlike hover, this explicitly opts the visible view into redraws on movement.
     pub fn track_pointer(mut self, f: impl Fn(&mut S, Option<(f32, f32)>) + 'static) -> Self {
         self.extras().pointer = Some(Box::new(f));
@@ -1195,6 +1199,13 @@ impl<S> View<S> {
         self
     }
 
+    /// Lazy list only: smoothly reach the enclosing scroll's end, including a last row
+    /// taller than the viewport. Change `request` for each click; manual scrolling cancels.
+    pub fn scroll_to_end(mut self, request:u64)->Self {
+        if let Kind::List {target,..}=&mut self.kind {*target=Some((usize::MAX,request));}
+        self
+    }
+
     /// List only: reports the range of partially or fully visible rows after painting.
     /// Excludes the area covered by a scroll's bottom overlay. Called when the range
     /// changes or the list reappears, including an empty range; schedules a frame to reflect state changes.
@@ -1265,6 +1276,20 @@ impl<S> View<S> {
         if let Some(sp) = self.extra.as_mut().and_then(|x| x.split.as_mut()) {
             sp.highlight_main_border = true;
             sp.highlight_fade = Some(fraction.clamp(0.01, 1.0));
+        }
+        self
+    }
+
+    /// Split only: blur the main pane next to the divider on hover and during a drag.
+    /// The blur falls smoothly from `frost` points at the edge to zero across `fraction`
+    /// of the main pane. The tint fades over the same distance; use `Color::CLEAR` for
+    /// no tint. Uses `motion.smooth` independently of the divider highlight.
+    /// Borders, overlays and input targets remain unchanged.
+    pub fn blur_main_edge(mut self, fraction: f32, frost: f32, tint: Color) -> Self {
+        if let Some(sp) = self.extra.as_mut().and_then(|x| x.split.as_mut()) {
+            sp.main_edge_blur = if fraction.is_finite() && frost.is_finite() && fraction > 0.0 && frost > 0.0 {
+                Some((fraction.min(1.0), frost, tint))
+            } else { None };
         }
         self
     }
@@ -1805,7 +1830,7 @@ pub fn hstack<S>(children: impl Children<S>) -> View<S> {
 /// ```
 pub fn split<S>(width: f32, on_resize: impl Fn(&mut S, f32) + 'static, panel: View<S>, main: View<S>) -> View<S> {
     let mut v = stack(Axis::H, (panel.fill(), main.fill())).fill();
-    v.extras().split = Some(Split { width, on_resize: Rc::new(on_resize), collapse: None, reset: None, trailing: false, highlight_main_border: false, highlight_fade: None, resize_grip: false, grip_bottom: None, hide_collapsed_divider: false });
+    v.extras().split = Some(Split { width, on_resize: Rc::new(on_resize), collapse: None, reset: None, trailing: false, highlight_main_border: false, highlight_fade: None, main_edge_blur: None, resize_grip: false, grip_bottom: None, hide_collapsed_divider: false });
     v
 }
 /// Children layered back to front.

@@ -189,6 +189,8 @@ pub struct Controls {
     pub scrollbar: (f32, f32),
     /// Opacity of the scroll bar track on hover; zero hides the track.
     pub scrollbar_track_opacity: f32,
+    /// Thumb opacity while scrolling and while hovered or dragged.
+    pub scrollbar_thumb_opacity: (f32, f32),
     pub tip_padding: (f32, f32),
     pub tip_radius: f32,
     /// Plate of the default tooltip; `None` = `color.popover`.
@@ -342,6 +344,7 @@ impl Theme {
                 split_grip: (3.0, 24.0, 38.0),
                 scrollbar: (5.0, 9.0),
                 scrollbar_track_opacity: 0.06,
+                scrollbar_thumb_opacity: (0.45, 0.55),
                 tip_padding: (9.0, 5.0),
                 tip_radius: 9.0,
                 tip_background: None,
