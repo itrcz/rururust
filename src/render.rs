@@ -772,11 +772,11 @@ impl Renderer {
         let mut fused = Vec::new();
         for a in 0..panes.len() {
             let (qa, snap, ra) = panes[a];
-            if quads[qa].p0[2] > 0.0 || (quads[qa].np[3] as u32) & 240 != 0 { continue; }
+            if quads[qa].p0[2] > 0.0 || (quads[qa].np[3] as u32) & (240 | crate::ui::FLAG_MODAL_BACKDROP | crate::ui::FLAG_MODAL_CONTENT | crate::ui::FLAG_POINTER_GLASS) != 0 { continue; }
             let mut near = [(f32::MAX, 0usize); 2];
             for (b, p) in panes.iter().enumerate() {
                 if b == a || p.1 != snap || quads[p.0].p0[2] > 0.0
-                    || (quads[p.0].np[3] as u32) & 240 != 0
+                    || (quads[p.0].np[3] as u32) & (240 | crate::ui::FLAG_MODAL_BACKDROP | crate::ui::FLAG_MODAL_CONTENT | crate::ui::FLAG_POINTER_GLASS) != 0
                     || (quads[qa].np[3] as u32 & FLAG_HORIZONTAL_LIGHT) != (quads[p.0].np[3] as u32 & FLAG_HORIZONTAL_LIGHT)
                     || quads[qa].c0 != quads[p.0].c0 || quads[qa].c1 != quads[p.0].c1
                     || quads[qa].p1 != quads[p.0].p1 {
@@ -1137,9 +1137,14 @@ fn glass_reach(q: &Quad, s: f32) -> (PxBox, f32) {
     let depth = (q.c1[1] * s).max(1.0).min((half * 0.6).max(1.0));
     let eta = 1.5 + (q.c1[3] * 0.25).max(0.0);
     let bend = q.p1[1].max(0.0) * depth * (eta * eta - 1.0).sqrt();
-    let sigma = q.p1[0] * 0.5 * s;
+    // The shader may request stronger blur at the pointer than at the pane edges.
+    // Build those mip levels too; otherwise the focus reads stale pyramid pixels.
+    let pointer_glass=(q.np[3] as u32)&crate::ui::FLAG_POINTER_GLASS!=0;
+    let sigma = (q.p1[0]+if pointer_glass {q.n0[1].max(0.0)}else{0.0}) * 0.5 * s;
+    // Attraction can sample beyond a partial clip, but remains inside the source pane.
+    let sampled=if pointer_glass {drawn.union(&PxBox::of(q.rect,s))}else{drawn};
     // Plus two pixels for bilinear taps.
-    (drawn.grow(bend + 2.0), (sigma.max(1e-4) / 1.9).log2() + 1.0)
+    (sampled.grow(bend + 2.0), (sigma.max(1e-4) / 1.9).log2() + 1.0)
 }
 
 /// Size of pyramid level `k` when level 0 is `base`.
@@ -1289,6 +1294,23 @@ mod tests {
             assert!(pixels.last().unwrap()[0] < 0.05);
             assert_eq!(pixels[(50.0 * scale) as usize][0], 1.0);
             assert_eq!(pixels[(10.0 * scale) as usize][0], 1.0, "resting title stays opaque");
+        }
+    }
+
+    #[test]
+    fn pointer_glass_builds_the_strongest_requested_blur() {
+        let mut q=<Quad as bytemuck::Zeroable>::zeroed();
+        q.rect=[0.0,0.0,800.0,600.0];q.clip=q.rect;
+        q.p1[0]=0.8;q.np[3]=crate::ui::FLAG_POINTER_GLASS as f32;
+        for scale in [1.0,2.0] {
+            for extra in [0.0,8.0,22.0] {
+                q.n0[1]=extra;
+                let (reach,level)=glass_reach(&q,scale);
+                let expected=(((0.8+extra)*0.5*scale)/1.9).log2()+1.0;
+                assert!((level-expected).abs()<0.001);
+                let planned=plan(reach,level,8,(1600,1200),(800,600),true);
+                assert!(planned.mips>=level.ceil().max(0.0) as u32);
+            }
         }
     }
 

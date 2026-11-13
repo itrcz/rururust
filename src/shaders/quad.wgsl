@@ -67,6 +67,13 @@ fn vs(@builtin(vertex_index) vi: u32, in: Instance) -> VOut {
         o.n0 = in.n0; // Border gradient target color.
         o.n1 = in.n1; // Relative fade length and direction, not geometry.
     }
+    if in.p0.w == 2.0 && (u32(in.np.w + 0.5) & 131072u) != 0u {
+        o.n0 = in.n0; // Modal backdrop pull is dimensionless, not neighbour geometry.
+    }
+    if in.p0.w == 2.0 && (u32(in.np.w + 0.5) & 524288u) != 0u {
+        o.n0 = in.n0; // Pointer attraction and extra frost, not geometry.
+        o.n1 = in.n1; // Normalized focus within this glass pane.
+    }
     if in.p0.w == 3.0 {
         o.n1 = in.n1; // Picture: x is its turn in radians, not geometry.
     }
@@ -320,6 +327,16 @@ fn fs(in: VOut) -> @location(0) vec4f {
 
     var col: vec4f;
     if kind == 2.0 {
+        if (u32(in.np.w + 0.5) & 262144u) != 0u {
+            // Neutral composite blur: all foreground pixels share one transition.
+            // Fade the radius outside the panel so the effect meets the background
+            // without a rectangular seam; do not add glass tint, rim or dither.
+            let sigma = in.p1.x * 0.5 * g.scale;
+            let distance = sd_shape(in.xy - in.n0.xy, in.n0.zw, in.np.x, true);
+            let envelope = 1.0 - smoothstep(0.0, max(sigma * 3.0, 1.0), max(distance, 0.0));
+            let under = textureSampleLevel(sharp, samp, in.xy / g.screen, 0.0);
+            return mix(under, frost(in.xy, sigma * envelope), cover * opacity);
+        }
         // Glass. The pane is flat in the middle and bevelled at the rim. The backdrop is only
         // lightly frosted and is refracted through that bevel (index 1.5), slightly
         // differently per colour channel: most of the look is bent light, not blur.
@@ -336,22 +353,41 @@ fn fs(in: VOut) -> @location(0) vec4f {
         // The snapshot is premultiplied: the glass works on straight colour and keeps the
         // backdrop's alpha, so over a transparent window it stays as see-through as the
         // window around it instead of turning into dark, opaque premultiplied colour.
+        var sample_xy = in.xy;
+        if (u32(in.np.w + 0.5) & 131072u) != 0u {
+            // Inverse sampling points outward, so visible features move inward.
+            // The smooth envelope fixes the screen edges and avoids empty borders.
+            let delta = in.xy - g.screen * 0.5;
+            let unit = clamp(abs(delta) / max(g.screen * 0.5, vec2f(1.0)), vec2f(0.0), vec2f(1.0));
+            let envelope = (1.0 - unit.x * unit.x) * (1.0 - unit.y * unit.y);
+            sample_xy += delta * in.n0.x * envelope * envelope;
+        }
+        if (u32(in.np.w + 0.5) & 524288u) != 0u {
+            let focus = in.rect.xy + (in.n1.xy * 2.0 - 1.0) * half;
+            let delta = in.xy - focus;
+            let span = select(focus - (in.rect.xy - half), in.rect.xy + half - focus, delta >= vec2f(0.0));
+            let unit = clamp(abs(delta) / max(span, vec2f(1.0)), vec2f(0.0), vec2f(1.0));
+            let envelope = (1.0 - unit.x * unit.x) * (1.0 - unit.y * unit.y);
+            let weight = envelope * envelope;
+            sample_xy += delta * in.n0.x * weight;
+            sigma += in.n0.y * 0.5 * g.scale * envelope;
+        }
         var bg: vec3f;
         var ba: f32;
         if t < 1.0 && in.p1.y > 0.0 {
             let slope = bevel_slope(t);
             let reach = nrm * in.p1.y * depth;
             let disp = in.c1.w * 0.25;
-            let mid = frost(in.xy - reach * refract_offset(slope, 1.5), sigma);
+            let mid = frost(sample_xy - reach * refract_offset(slope, 1.5), sigma);
             ba = mid.a;
             bg = mid.rgb / max(mid.a, 1e-4);
             if disp > 0.0 {
-                let r = frost(in.xy - reach * refract_offset(slope, 1.5 - disp), sigma);
-                let b = frost(in.xy - reach * refract_offset(slope, 1.5 + disp), sigma);
+                let r = frost(sample_xy - reach * refract_offset(slope, 1.5 - disp), sigma);
+                let b = frost(sample_xy - reach * refract_offset(slope, 1.5 + disp), sigma);
                 bg = vec3f(r.r / max(r.a, 1e-4), bg.g, b.b / max(b.a, 1e-4));
             }
         } else {
-            let f = frost(in.xy, sigma);
+            let f = frost(sample_xy, sigma);
             ba = f.a;
             bg = f.rgb / max(f.a, 1e-4);
         }

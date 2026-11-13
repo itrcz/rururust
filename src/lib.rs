@@ -45,6 +45,10 @@ mod view;
 
 #[cfg(feature = "app")]
 pub use app::{App, Backdrop, Titlebar};
+#[cfg(feature = "app")]
+mod native_menu;
+#[cfg(feature = "app")]
+pub use native_menu::{NativeMenu, NativeMenuItem, NativeMenuAction};
 #[cfg(feature = "renderer")]
 pub use render::{RenderStats, Renderer};
 pub use task::{link, set_spawner, set_waker, spawn, Link, Task};
@@ -84,4 +88,4 @@ pub mod prelude {
 }
 
 #[cfg(feature = "app")]
-pub use app::{pick_folder,pick_files};
+pub use app::{pick_folder,try_pick_folder,pick_files};

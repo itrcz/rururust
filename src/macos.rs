@@ -358,3 +358,128 @@ pub(crate) fn pick_files()->Result<Vec<std::path::PathBuf>,String> {
         }).collect()
     }
 }
+
+// Native menu callbacks enqueue commands instead of re-entering a borrowed Runner.
+use crate::native_menu::{MenuCommand, NativeMenu, NativeMenuAction};
+use objc2_app_kit::{NSApplication, NSMenu, NSMenuItem, NSEventModifierFlags};
+use objc2_foundation::NSString;
+use std::{cell::RefCell, rc::Rc};
+
+struct MenuTargetData {
+    commands: RefCell<Vec<MenuCommand>>,
+    pending: Rc<RefCell<Vec<MenuCommand>>>,
+    wake: Box<dyn Fn()>,
+}
+declare_class!(
+    struct MenuTarget;
+    // SAFETY: NSObject subclass, accessed only from AppKit's main thread.
+    unsafe impl ClassType for MenuTarget {
+        type Super = NSObject;
+        type Mutability = mutability::MainThreadOnly;
+        const NAME: &'static str = "RuruMenuTarget";
+    }
+    impl DeclaredClass for MenuTarget { type Ivars = MenuTargetData; }
+    // SAFETY: one-object AppKit target/action signature; sender is the menu item we created.
+    unsafe impl MenuTarget {
+        #[method(invoke:)]
+        fn invoke(&self, item: &NSMenuItem) {
+            // SAFETY: main-thread getter on the live sender.
+            let index = unsafe { item.tag() } as usize;
+            if let Some(command) = self.ivars().commands.borrow().get(index).copied() {
+                self.ivars().pending.borrow_mut().push(command);
+                (self.ivars().wake)();
+            }
+        }
+    }
+);
+pub(crate) struct ApplicationMenu {
+    target: Retained<MenuTarget>,
+    pending: Rc<RefCell<Vec<MenuCommand>>>,
+    current: Vec<NativeMenu>,
+}
+impl ApplicationMenu {
+    pub(crate) fn new(wake: impl Fn() + 'static) -> Self {
+        let mtm = MainThreadMarker::new().expect("event loop runs on main thread");
+        let pending = Rc::new(RefCell::new(Vec::new()));
+        let object = mtm.alloc::<MenuTarget>().set_ivars(MenuTargetData { commands: RefCell::new(Vec::new()), pending: pending.clone(), wake: Box::new(wake) });
+        // SAFETY: freshly allocated NSObject subclass, initialized ivars.
+        let target = unsafe { msg_send_id![super(object), init] };
+        Self { target, pending, current: Vec::new() }
+    }
+    pub(crate) fn drain(&self) -> Vec<MenuCommand> { std::mem::take(&mut *self.pending.borrow_mut()) }
+    pub(crate) fn update(&mut self, menus: Vec<NativeMenu>) {
+        if menus == self.current { return; }
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        // SAFETY: all AppKit objects are created, retained and configured on the event-loop
+        // main thread. The owner retains the action target for the whole Runner lifetime.
+        unsafe {
+            let app = NSApplication::sharedApplication(mtm);
+            let bar = NSMenu::new(mtm);
+            let mut commands = self.target.ivars().commands.borrow_mut();
+            commands.clear();
+            app.setWindowsMenu(None);
+            app.setHelpMenu(None);
+            for description in &menus {
+                let menu = NSMenu::initWithTitle(mtm.alloc(), &NSString::from_str(&description.title));
+                menu.setAutoenablesItems(false);
+                for row in &description.items {
+                    let Some(command) = row.action else { menu.addItem(&NSMenuItem::separatorItem(mtm)); continue };
+                    let native = match command {
+                        MenuCommand::Standard(action) => match action {
+                            NativeMenuAction::About => Some(sel!(orderFrontStandardAboutPanel:)),
+                            NativeMenuAction::Hide => Some(sel!(hide:)),
+                            NativeMenuAction::HideOthers => Some(sel!(hideOtherApplications:)),
+                            NativeMenuAction::ShowAll => Some(sel!(unhideAllApplications:)),
+                            NativeMenuAction::Quit => Some(sel!(terminate:)),
+                            NativeMenuAction::Close => Some(sel!(performClose:)),
+                            NativeMenuAction::Minimize => Some(sel!(performMiniaturize:)),
+                            NativeMenuAction::Zoom => Some(sel!(zoom:)),
+                            NativeMenuAction::Fullscreen => Some(sel!(toggleFullScreen:)),
+                            NativeMenuAction::BringAllToFront => Some(sel!(arrangeInFront:)),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    let fullscreen = row.shortcut.is_none() && command == MenuCommand::Standard(NativeMenuAction::Fullscreen);
+                    let key = row.shortcut.and_then(|k| match k.key { crate::ShortcutKey::Char(c) => Some(c.to_string()), _ => None }).unwrap_or_else(|| if fullscreen { "f".into() } else { String::new() });
+                    let item = NSMenuItem::initWithTitle_action_keyEquivalent(mtm.alloc(), &NSString::from_str(&row.title), Some(native.unwrap_or(sel!(invoke:))), &NSString::from_str(&key));
+                    if native.is_none() {
+                        item.setTarget(Some(&self.target));
+                        item.setTag(commands.len() as isize);
+                        commands.push(command);
+                    }
+                    let mut flags = NSEventModifierFlags::empty();
+                    if let Some(key) = row.shortcut {
+                        if key.mods.command { flags |= NSEventModifierFlags::NSEventModifierFlagCommand; }
+                        if key.mods.shift { flags |= NSEventModifierFlags::NSEventModifierFlagShift; }
+                        if key.mods.alt { flags |= NSEventModifierFlags::NSEventModifierFlagOption; }
+                    }
+                    if fullscreen { flags = NSEventModifierFlags::NSEventModifierFlagCommand | NSEventModifierFlags::NSEventModifierFlagControl; }
+                    item.setKeyEquivalentModifierMask(flags);
+                    item.setEnabled(row.enabled);
+                    item.setState(if row.checked { 1 } else { 0 });
+                    menu.addItem(&item);
+                }
+                let top = NSMenuItem::new(mtm);
+                top.setTitle(&NSString::from_str(&description.title));
+                top.setSubmenu(Some(&menu));
+                bar.addItem(&top);
+                if description.role == 1 { app.setWindowsMenu(Some(&menu)); }
+                if description.role == 2 { app.setHelpMenu(Some(&menu)); }
+            }
+            app.setMainMenu(Some(&bar));
+        }
+        self.current = menus;
+    }
+}
+pub(crate) fn is_key(window: &Window) -> bool { ns_window(window).is_some_and(|win| win.isKeyWindow()) }
+
+/// AppKit's native drag loop may suppress CursorMoved; sample only during file hover.
+pub(crate) fn drag_pointer(window:&Window)->Option<(f32,f32)> {
+    let view=content_view(window)?;
+    let win=view.window()?;
+    // SAFETY: both objects belong to the live winit window, on its main event thread.
+    let point=unsafe {view.convertPoint_fromView(win.mouseLocationOutsideOfEventStream(),None)};
+    let y=if view.isFlipped(){point.y}else{view.bounds().size.height-point.y};
+    Some((point.x as f32,y as f32))
+}

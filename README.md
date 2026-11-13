@@ -67,7 +67,8 @@ cargo install wasm-bindgen-cli --version 0.2.130 --locked   # версия ка�
 | Контролы | `button` `toggle` `slider` `text_field` `picker` `tab_bar`; `button(..).secondary()` — нейтральная плашка `color.fill`, `button(..).plain()` — без заливки, подсветка `color.hover` под мышью; `.disabled(b)` у `button` / `icon_button` / любого вида с `.on_tap()` — не нажимается (и не пропускает нажатие вниз), без hover/press и курсора-руки, прозрачность `control.disabled_opacity` (0.4), подсказка `.tooltip()` остаётся; `icon_button(&img, f)` — квадрат `control.icon_button` (28) с глифом `icon_button_glyph` (16), глиф `text_muted` → `text` под мышью, сочетается с `.tooltip()`, `.size()`, `.icon_size(pt)`, `.radius()` (круглая — радиус в половину стороны); `progress_bar(v)` / `progress_ring(v)` — 0..1, дорожка `fill_strong`, заливка `accent` (или `.color()`), толщина `control.progress_bar`, кольцо `control.progress_ring`, новое значение доезжает пружиной `motion.smooth`; `tab_bar(..)` — вкладки по ширине своей подписи и отступов, капля преломляет текст; `.tab_widths(&[None, Some(120.0)])` — необязательная ширина каждой вкладки, `.tab_disabled(&[0])` — недоступные вкладки; `.tab_icons(&[&img, ..])` — глиф перед подписью вкладки; `slider(v, f).steps(5)` — прилипает к 5 делениям и рисует точки; `.slider_style(SliderStyle { track_height, track, track_border, fill, knob, knob_size, knob_shadow, tick_size, tick_on, tick_off })` |
 | Поповер | `.popover(open, Placement::top().start(), \|s\| s.open = false, content)` на якоре — слой поверх всего у якоря; переворачивается на другую сторону и сдвигается, чтобы не вылезать за окно; клик мимо только закрывает (не доходит до того, что под ним), Escape тоже; появляется за ~120 мс. `Placement::top/bottom/left/right()` + `.start/center/end()` + `.gap(pt)` + `.margin(pt)` (поле от края окна, 8) + `.offset(dx, dy)` |
 | Меню | `menu(vec![MenuItem::action("Rename", f).icon(&img).shortcut("⌥⌘R"), MenuItem::separator(), MenuItem::section("Plugins"), MenuItem::submenu("Copy", items)])`; у пункта `.hint(..)` `.disabled()` `.checked(b)`, `.icon(&img)` — шаблон в цвет строки, `.image(&img)` — картинка в своих цветах, `.height(h)` — своя высота строки (у секции — без `section_gap` над ней); подсветка под мышью, ↑↓ ←→ Enter Esc; `.menu_style(MenuStyle { highlight, row_height, font_size, .. })`: ещё `highlight_inset` (подсветка ниже шага строки), `icon_gap`, `separator_height`, `shortcut_size/_color`, `section_size/_weight/_color/_height/_gap`, тени `shadow` + `ambient` + `rim` (inset); `border` и `rim` рисуются поверх заливки и строк (и со стеклом). Меню в `scroll`/`.clip()` внутри поповера подсвечивается как обычно. Открыть: `.menu(menu(..))` / `.menu(..).menu_at(placement)` — по клику на якорь, `.context_menu(menu(..))` — по правому клику у курсора, или внутри `.popover` (выбор пункта вызывает `on_dismiss`) |
-| Появление | `.reveal(shown)` — zoom и opacity с пружиной темы; место в раскладке сохраняется, скрывающийся элемент не принимает ввод |
+| Фокус стекла | `.glass_attraction(0.7, 22.0)` — стягивание подложки к указателю с усилением размытия возле него; границы и hit testing неподвижны |
+| Появление | `.reveal(shown)` — zoom и opacity с пружиной темы; `.fade(shown)` — только плавная прозрачность; место в раскладке сохраняется, скрывающийся элемент не принимает ввод |
 | Поворот | `.rotation(deg)` — картинки и иконки узла (и глиф `icon_button`) поворачиваются по часовой вокруг своего центра, новый угол доезжает пружиной `motion.smooth`: шеврон раскрытия без растеризации кадров. Раскладка, hit-области, фон и текст не поворачиваются |
 | Нажатие | `.press_scale(1.0)` сохраняет геометрию кнопки и текста при клике, оставляя затемнение; `.press_opacity(1.0)` — без затемнения, только сжатие; по умолчанию — `motion.press_scale` (0.98) и `motion.press_opacity` (0.7) темы |
 | Тултип | `.tooltip("Back")`, `.tooltip_shortcut("Back", "⌘[")`, `.tooltip_with(view)`; место — `.tooltip_at(Placement::bottom().gap(2.0))` (по умолчанию снизу, зазор 6) — через 0.5 с покоя мыши (таймер, не кадры), соседний сразу; клик и уход прячут; ввод не перехватывает. Вид — из темы: `control.tip_background`, `tip_border`, `tip_text`, `tip_padding`, `tip_radius`, чип клавиш `tip_chip`, `tip_chip_padding`, `tip_chip_radius` |
@@ -83,7 +84,7 @@ cargo install wasm-bindgen-cli --version 0.2.130 --locked   # версия ка�
 | Время | `after(seconds, |s: &mut S| ...)` — таймер на состоянии (скрыть снекбар, закончить обновление) |
 | Буфер обмена | `copy_text(текст)` из любого обработчика — кнопка «копировать» под сообщением; уходит как `WindowRequest::SetClipboard` (из тапа — сразу, иначе со следующим кадром) |
 | Фон | `spawn(|link| async move {..})` → `Task` (drop = отмена), `link.send(|s| ..)` из любого потока, `sleep(секунды).await` |
-| Окно (десктоп) | `App::transparent(true)`, `App::blur(true)` — размытый рабочий стол за окном (macOS; где нет — просто прозрачно), `.background(цвет с альфой)` — тонировка; `App::backdrop(Backdrop::Sidebar)` — материал подложки на macOS (`Sidebar` по умолчанию, `UnderWindow`, `Window`, `Content`, `Titlebar`, `HeaderView`, `Menu`, `Popover`, `Sheet`, `Hud`, `FullScreenUi`; `Blur(r)` — старое CGS-размытие с радиусом), на других платформах — обычное размытие; `App::titlebar(Titlebar::Overlay)` — контент под заголовком, светофор на месте, отступы в `env.titlebar` / `env.window_buttons`; `App::titlebar_height(44.0)` — своя высокая шапка: светофор по центру полосы и с отступом слева как у нативных приложений с тулбаром, `env.titlebar` = 44, `env.window_buttons` — фактическая ширина кнопок (в полноэкранном режиме оба 0); `.window_drag()` — область таскает окно, двойной клик — zoom; кнопки и поля внутри поглощают нажатия, закрытие поповера не передаёт клик окну, а клики по контролам прерывают серию двойного клика (в том числе в нативной шапке macOS); `App::min_size(w, h)` / `App::max_size(w, h)` — пределы размера окна (меньше раскладка не сожмётся; у порога ширины сворачивайте панель по `env.width`). На macOS размытие — `NSVisualEffectView` под содержимым: у окна, размытия и тени один радиус углов (`docs/decisions/006-window-corners.md`). Пример: `examples/window.rs` |
+| Окно (десктоп) | `App::transparent(true)`, `App::blur(true)` — размытый рабочий стол за окном (macOS; где нет — просто прозрачно), `.background(цвет с альфой)` — тонировка; `App::backdrop(Backdrop::Sidebar)` — материал подложки на macOS (`Sidebar` по умолчанию, `UnderWindow`, `Window`, `Content`, `Titlebar`, `HeaderView`, `Menu`, `Popover`, `Sheet`, `Hud`, `FullScreenUi`; `Blur(r)` — старое CGS-размытие с радиусом), на других платформах — обычное размытие; `App::titlebar(Titlebar::Overlay)` — контент под заголовком, светофор на месте, отступы в `env.titlebar` / `env.window_buttons`; `App::titlebar_height(44.0)` — своя высокая шапка: светофор по центру полосы и с отступом слева как у нативных приложений с тулбаром, `env.titlebar` = 44, `env.window_buttons` — фактическая ширина кнопок (в полноэкранном режиме оба 0); `.window_drag()` — область таскает окно, двойной клик — zoom; `.window_action(WindowRequest::Minimize / Zoom / Close)` — оконная кнопка с обычными правилами tap/disabled/modal, `env.window_maximized` — реальное состояние maximize; на Windows `Titlebar::Overlay` убирает системный заголовок, приложение рисует кнопки, края сохраняют системное изменение размера; кнопки и поля внутри поглощают нажатия, закрытие поповера не передаёт клик окну, а клики по контролам прерывают серию двойного клика (в том числе в нативной шапке macOS); `App::min_size(w, h)` / `App::max_size(w, h)` — пределы размера окна (меньше раскладка не сожмётся; у порога ширины сворачивайте панель по `env.width`). На macOS размытие — `NSVisualEffectView` под содержимым: у окна, размытия и тени один радиус углов (`docs/decisions/006-window-corners.md`). Пример: `examples/window.rs` |
 | Отладка | `App::show_fps(true)`, `ruru::headless::render_png` |
 
 Модель: состояние `S` → `view(&S)` → дерево → layout → draw list → GPU. Обработчики — замыкания
@@ -217,9 +218,16 @@ macOS/iOS, DX12 + Vulkan на Windows, Vulkan + GLES на Linux/Android, WebGPU 
 
 Модальные окна (`modal`) появляются через прозрачность без масштабирования текста;
 подложка блокирует клики, наведение, смену курсора и подсказки элементов под ней.
-`.modal_style(ModalStyle { rise: 18.0, backdrop: Some(glass) })` добавляет короткий подъём
+`.modal_style(ModalStyle { rise: 18.0, backdrop: Some(glass), ..Default::default() })` добавляет короткий подъём
 снизу и размытие фона под подложкой. Сам диалог рисуется после размытия и остаётся резким.
 По умолчанию подъём и стекло выключены; оттенок затемнения берётся из темы.
+`scale: 1.1` вместо подъёма плавно уменьшает окно от центра до обычного размера;
+`backdrop_pull: 0.12` втягивает размытый фон к центру экрана, сохраняя края неподвижными.
+Закрытие разворачивает масштаб, прозрачность, размытие и втягивание обратно, даже если
+форма уже удалена из дерева. Фон требует `backdrop: Some(glass)`.
+`close_slowdown: 1.6` продлевает только закрытие, сохраняя мягкое замедление в конце.
+`content_blur: 3.0` мягко размывает весь диалог при уменьшении прозрачности, включая
+текст и границы контролов. В полностью открытом состоянии дополнительного прохода нет.
 
 `text("Thinking…").text_shimmer(1.8, Color::WHITE)` — мягкий блик по тексту без изменения раскладки; удаление модификатора прекращает перерисовки.
 
@@ -239,9 +247,12 @@ macOS/iOS, DX12 + Vulkan на Windows, Vulkan + GLES на Linux/Android, WebGPU 
 подходит для sticky-шапок. `CodeHeaderStyle::fade` использует его для шапок блоков кода.
 
 
-`ruru::pick_folder()` открывает нативный выбор директории из обработчика UI. На macOS это
-NSOpenPanel, возврат — `Option<PathBuf>`; отмена даёт `None`. На других платформах диалог пока
-не реализован и возвращается `None`.
+`ruru::try_pick_folder()` открывает выбор директории: NSOpenPanel на macOS,
+IFileOpenDialog на Windows, Zenity/KDialog/YAD из PATH на Linux. Возвращает
+`Result<Option<PathBuf>, String>`; отмена — `Ok(None)`, сбой — ошибка.
+Совместимый `pick_folder()` отбрасывает ошибки; в новом коде предпочтителен `try_pick_folder()`.
+Linux-пакет должен зависеть от Zenity (либо пользователь устанавливает KDialog/YAD).
+Нужна графическая сессия. См. [решение](docs/decisions/012-desktop-dialogs.md).
 
 Выбор углов: `.radius(16.0).round_corners([true, false, false, false])` оставляет скруглённым только верхний левый угол (порядок — по часовой стрелке). Фон, обводка, тени и `.clip()` используют одну форму.
 
@@ -279,8 +290,10 @@ NSOpenPanel, возврат — `Option<PathBuf>`; отмена даёт `None`.
 `App::on_file_drop(|state, path| ...)` получает каждый файл из нативного drag-and-drop,
 а `.on_file_hover(|state, over| ...)` включает и сбрасывает подсветку при наведении,
 отмене и отпускании. Обработчики относятся только к своему окну; framework не читает файлы.
-`ruru::pick_files()` открывает на UI-потоке macOS нативный диалог с множественным выбором:
-`Ok(Vec::new())` означает отмену, другие платформы возвращают понятную ошибку.
+`ruru::pick_files()` открывает нативный множественный выбор файлов на macOS, Windows и Linux
+из обработчика UI. Отмена — `Ok(Vec::new())`; сбои backend возвращаются отдельно.
+Optional-зависимость `native-dialog` ограничена Windows/Linux с фичей `app`;
+она не входит в ядро, macOS и Web/WASM.
 
 `VoiceSession::start("ru-RU", callback)` включает нативную диктовку macOS после явного
 пользовательского действия. `VoiceEvent` сообщает Ready, Level(0..1), Transcribing и Text/Error;
@@ -312,3 +325,17 @@ Picker применяет `.font_size()`, `.style()`, `.weight()`, `.line_height
 `theme.control.scrollbar_thumb_opacity = (0.20, 0.32)` задаёт прозрачность бегунка при прокрутке и наведении/перетаскивании; по умолчанию `(0.45, 0.55)`. На ширину и область захвата не влияет.
 
 Модальные окна плавно исчезают и при удалении формы из дерева: фреймворк удерживает только последний отрисованный вид, без обработчиков формы. `list(...).scroll_to_end(request)` плавно прокручивает к концу, включая последнюю строку выше окна; новое число request повторяет переход, ручная прокрутка его прерывает.
+
+### Нативное меню приложения (macOS)
+
+`App::native_menu(|state| Vec<NativeMenu>, |state, command_id| ...)` создаёт строку
+меню AppKit. `NativeMenu::new` принимает строки `NativeMenuItem::command`,
+`key_action`, `standard` и `separator`; `.enabled` и `.checked` задают состояние.
+Первое меню — меню приложения; `.window()` и `.help()` подключают системные
+списки окон и поиск команд. Описание обновляется после событий, поэтому язык и
+состояние берутся из актуального state. `key_action` вызывает shortcut текущего
+окна, редактирование работает с его полем и буфером, стандартные оконные команды
+выполняет AppKit. Другие платформы пока не показывают эту строку меню.
+
+`scroll(content).scroll_top_border(width, color)` показывает верхний разделитель только
+при прокрутке от начала списка, не меняя его компоновку и полосу прокрутки.

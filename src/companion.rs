@@ -15,6 +15,8 @@ impl<S: 'static> Pending for Setup<S> {
     }
 }
 pub(super) trait Running {
+    #[cfg(target_os = "macos")]
+    fn menu_command(&mut self, command: crate::native_menu::MenuCommand) -> bool;
     fn id(&self) -> Option<WindowId>;
     fn update(&mut self, event_loop: &ActiveEventLoop, parent: Option<&Window>) -> Option<web_time::Instant>;
     fn event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent);
@@ -26,8 +28,13 @@ struct Companion<S> {
     close: Box<dyn Fn(&mut S)>,
 }
 impl<S: 'static> Running for Companion<S> {
+    #[cfg(target_os = "macos")]
+    fn menu_command(&mut self, command: crate::native_menu::MenuCommand) -> bool { self.runner.menu_command(command) }
     fn id(&self) -> Option<WindowId> { self.runner.window.as_ref().map(|w| w.id()) }
     fn update(&mut self, event_loop: &ActiveEventLoop, parent: Option<&Window>) -> Option<web_time::Instant> {
+        if std::mem::take(&mut self.runner.close_requested) {
+            (self.close)(&mut self.runner.app.ui.state);
+        }
         let dirty = self.runner.app.ui.pump();
         let activation = (self.visible)(&self.runner.app.ui.state);
         let visible = activation.is_some();

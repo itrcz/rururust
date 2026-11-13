@@ -287,11 +287,14 @@ pub(crate) struct Style {
     pub inset: Option<Shadow>,
     pub glass: Option<Glass>,
     pub glass_fade: f32,
+    pub glass_attraction: Option<(f32,f32)>,
+    pub scroll_top_border: Option<(f32, Color)>,
     pub opacity: f32,
     /// Press feedback; `None` = the theme's `motion.press_scale` / `press_opacity`.
     pub press_scale: Option<f32>,
     pub press_opacity: Option<f32>,
     pub reveal: Option<bool>,
+    pub reveal_fade: bool,
     pub text_reveal: Option<TextReveal>,
     pub text_shimmer: Option<(f32, Color)>,
     pub text_cursor: Option<TextCursor>,
@@ -389,10 +392,13 @@ impl Default for Style {
             inset: None,
             glass: None,
             glass_fade: 0.0,
+            glass_attraction: None,
+            scroll_top_border: None,
             opacity: 1.0,
             press_scale: None,
             press_opacity: None,
             reveal: None,
+            reveal_fade: false,
             text_reveal: None,
             text_shimmer: None,
             text_cursor: None,
@@ -522,11 +528,13 @@ pub struct Env {
     pub width: f32,
     pub height: f32,
     /// Height of the title bar zone the content is drawn under (`App::titlebar(Titlebar::Overlay)`
-    /// on macOS); 0 when the system draws its own title bar. Put a `.window_drag()` strip here.
+    /// on macOS and Windows); 0 with a native title bar. Put a `.window_drag()` strip here.
     pub titlebar: f32,
     /// Width at the leading edge of that zone taken by the window buttons (the macOS traffic
     /// lights): start your own toolbar buttons after it.
     pub window_buttons: f32,
+    /// Actual maximized state reported by the window system; false in headless views.
+    pub window_maximized: bool,
     /// Latest operating-system appearance, independent of the application's override.
     pub system_dark: bool,
     /// The theme in use (`App::theme`): `env.theme.color.accent`, `env.theme.text.body`.
@@ -745,13 +753,35 @@ pub(crate) enum OverlayMode {
     Drawer,
 }
 
-/// Appearance and entrance motion of a centered modal. Text is never scaled.
-#[derive(Clone, Copy, Default)]
+/// Appearance and entrance motion of a centered modal.
+#[derive(Clone, Copy)]
 pub struct ModalStyle {
     /// Initial downward offset in points; the panel rises into place while fading in.
     pub rise: f32,
+    /// Initial scale about the panel center; returns to 1 while opening. Default: 1.
+    pub scale: f32,
+    /// Pull the backdrop toward the screen center, fading to zero at its edges.
+    /// Requires `backdrop`; clamped to 0..=0.3. Default: 0 (no distortion).
+    pub backdrop_pull: f32,
+    /// Multiplier of the closing time (1 keeps the theme fade); opening is unchanged.
+    pub close_slowdown: f32,
+    /// Composite blur of the dialog while fading; sharp when open. Points, default 0.
+    pub content_blur: f32,
     /// Glass over the background, below the scrim and the dialog contents.
     pub backdrop: Option<Glass>,
+}
+
+impl Default for ModalStyle {
+    fn default() -> Self {
+        Self { rise: 0.0, scale: 1.0, backdrop_pull: 0.0, close_slowdown: 1.0, content_blur: 0.0, backdrop: None }
+    }
+}
+
+impl ModalStyle {
+    pub(crate) fn scale_at(self, progress: f32) -> f32 {
+        let scale = if self.scale.is_finite() { self.scale.clamp(0.1, 4.0) } else { 1.0 };
+        1.0 + (scale - 1.0) * (1.0 - progress)
+    }
 }
 
 pub(crate) enum Kind<S> {
@@ -1229,6 +1259,12 @@ impl<S> View<S> {
         if let Kind::Scroll {bottom_overlay,..}=&mut self.kind {*bottom_overlay=Some(Box::new(overlay));}
         self
     }
+    /// Scroll only: draw a top separator after content scrolls away from the start.
+    /// This overlays the viewport without changing layout or the indicator track.
+    pub fn scroll_top_border(mut self, width: f32, color: Color) -> Self {
+        self.style.scroll_top_border = if width.is_finite() && width > 0.0 { Some((width, color)) } else { None };
+        self
+    }
     /// Scroll only: scroll bar visibility (default `Indicator::Auto`).
     pub fn indicator(mut self, mode: Indicator) -> Self {
         if let Kind::Scroll { indicator, .. } = &mut self.kind {
@@ -1522,6 +1558,12 @@ impl<S> View<S> {
         self.on_tap = Some(Box::new(f));
         self
     }
+    /// Sends a window request when tapped, replacing any existing tap handler.
+    /// Behaves like an ordinary button: respects disabled/modal state and blocks parent dragging.
+    /// Example: `text("×").window_action(ruru::WindowRequest::Close)`.
+    pub fn window_action(self, request: crate::WindowRequest) -> Self {
+        self.on_tap(move |_| crate::ui::request_window(request.clone()))
+    }
     /// Runs on the second nearby click. A normal tap still runs on the first click.
     /// Consumes the gesture instead of a parent window-drag or tap action.
     pub fn on_double_tap(mut self, f: impl Fn(&mut S) + 'static) -> Self {
@@ -1533,6 +1575,20 @@ impl<S> View<S> {
     /// A hidden or disappearing subtree does not receive pointer input or show attachments.
     pub fn reveal(mut self, shown: bool) -> Self {
         self.style.reveal = Some(shown);
+        self.style.reveal_fade = false;
+        self
+    }
+    /// Fade visibility without scaling; preserves layout and disables hidden input.
+    pub fn fade(mut self, shown:bool)->Self {
+        self.style.reveal=Some(shown);
+        self.style.reveal_fade=true;
+        self
+    }
+    /// Pull the glass backdrop toward the pointer, with extra blur at the focus.
+    /// Strength is clamped to 0..=0.85; `frost` is additional blur in points.
+    pub fn glass_attraction(mut self,strength:f32,frost:f32)->Self {
+        self.style.glass_attraction=Some((if strength.is_finite(){strength.clamp(0.0,0.85)}else{0.0},
+            if frost.is_finite(){frost.clamp(0.0,64.0)}else{0.0}));
         self
     }
     /// Opacity while pressed (the theme's `motion.press_opacity`, 0.7). Set to 1.0 for
@@ -1915,8 +1971,8 @@ fn overlay<S>(open: bool, mode: OverlayMode, on_dismiss: Option<Box<dyn Fn(&mut 
 }
 
 impl<S> View<S> {
-    /// A modal's background glass and optional rise-in motion; no effect on other views.
-    /// `modal(open, close, content).modal_style(ModalStyle { rise: 18.0, backdrop: None })`
+    /// A modal's backdrop and entrance motion; no effect on other views.
+    /// `modal(open, close, content).modal_style(ModalStyle { scale: 1.1, ..Default::default() })`
     pub fn modal_style(mut self, value: ModalStyle) -> Self {
         if let Kind::Overlay { mode: OverlayMode::Modal, style, .. } = &mut self.kind {
             *style = value;

@@ -27,7 +27,8 @@ pub enum Titlebar {
     /// buttons stay where they are (macOS traffic lights). The view learns the zone from
     /// [`Env::titlebar`](crate::Env::titlebar) and [`Env::window_buttons`](crate::Env::window_buttons)
     /// and moves the window with [`View::window_drag`](crate::View::window_drag).
-    /// Elsewhere for now: the standard title bar, and both insets are 0.
+    /// Windows: no native title bar; draw buttons with [`View::window_action`](crate::View::window_action).
+    /// Other platforms retain the standard title bar and zero insets.
     Overlay,
 }
 
@@ -88,6 +89,7 @@ pub struct App<S> {
     auto: Option<(Theme, Theme)>,
     file_drop: Option<Box<dyn Fn(&mut S, std::path::PathBuf)>>,
     file_hover: Option<Box<dyn Fn(&mut S, bool)>>,
+    native_menu: Option<(Box<dyn Fn(&S) -> Vec<crate::NativeMenu>>, Box<dyn Fn(&mut S, u32)>)>,
 }
 
 impl<S: 'static> App<S> {
@@ -108,7 +110,14 @@ impl<S: 'static> App<S> {
             auto: None,
             file_drop: None,
             file_hover: None,
+            native_menu: None,
         }
+    }
+    /// Create a native macOS menu; recompute labels and availability after UI events.
+    /// Other platforms currently retain the configuration without creating a menu.
+    pub fn native_menu(mut self, menu: impl Fn(&S) -> Vec<crate::NativeMenu> + 'static, action: impl Fn(&mut S, u32) + 'static) -> Self {
+        self.native_menu = Some((Box::new(menu), Box::new(action)));
+        self
     }
     pub fn title(mut self, t: impl Into<String>) -> Self {
         self.title = t.into();
@@ -417,10 +426,13 @@ struct Runner<S> {
     app: App<S>,
     window: Option<Arc<Window>>,
     visible: bool,
+    close_requested: bool,
     #[cfg(not(target_arch = "wasm32"))]
     companions: Vec<Box<dyn companion::Running>>,
     gfx: Rc<RefCell<Option<Gfx>>>,
     cursor: (f32, f32),
+    #[cfg(target_os = "macos")]
+    file_drag_active: bool,
     /// Pointer shape last given to the window.
     shown_cursor: Cursor,
     mods: winit::keyboard::ModifiersState,
@@ -434,6 +446,8 @@ struct Runner<S> {
     /// The backdrop view and the traffic lights' place.
     #[cfg(target_os = "macos")]
     chrome: Option<crate::macos::Chrome>,
+    #[cfg(target_os = "macos")]
+    menu: crate::macos::ApplicationMenu,
     /// Width of the traffic lights' zone as last placed (`titlebar_height`).
     #[cfg(target_os = "macos")]
     buttons: Option<f32>,
@@ -598,10 +612,13 @@ impl<S: 'static> Runner<S> {
             app,
             window: None,
             visible,
+            close_requested: false,
             #[cfg(not(target_arch = "wasm32"))]
             companions,
             gfx: Rc::new(RefCell::new(None)),
             cursor: (0.0, 0.0),
+            #[cfg(target_os = "macos")]
+            file_drag_active: false,
             shown_cursor: Cursor::Default,
             mods: Default::default(),
             wake_at: None,
@@ -610,6 +627,8 @@ impl<S: 'static> Runner<S> {
             ime: (false, None),
             #[cfg(target_os = "macos")]
             chrome: None,
+            #[cfg(target_os = "macos")]
+            menu: { let proxy = event_loop.create_proxy(); crate::macos::ApplicationMenu::new(move || { let _ = proxy.send_event(Wake); }) },
             #[cfg(target_os = "macos")]
             buttons: None,
         }
@@ -626,7 +645,23 @@ impl<S: 'static> Runner<S> {
     fn sync(&mut self) {
         let Some(w) = &self.window else { return };
         let cursor = self.app.ui.cursor;
-        if cursor != self.shown_cursor {
+        // Undecorated Windows have no non-client resize border; keep the system resize gesture.
+        #[cfg(target_os = "windows")]
+        let resizing = self.resize_direction();
+        #[cfg(target_os = "windows")]
+        if let Some(direction) = resizing {
+            w.set_cursor(match direction {
+                winit::window::ResizeDirection::East | winit::window::ResizeDirection::West => CursorIcon::EwResize,
+                winit::window::ResizeDirection::North | winit::window::ResizeDirection::South => CursorIcon::NsResize,
+                winit::window::ResizeDirection::NorthEast | winit::window::ResizeDirection::SouthWest => CursorIcon::NeswResize,
+                _ => CursorIcon::NwseResize,
+            });
+        }
+        #[cfg(target_os = "windows")]
+        let update_cursor = resizing.is_none();
+        #[cfg(not(target_os = "windows"))]
+        let update_cursor = cursor != self.shown_cursor;
+        if update_cursor {
             self.shown_cursor = cursor;
             w.set_cursor(match cursor {
                 Cursor::Default => CursorIcon::Default,
@@ -652,6 +687,14 @@ impl<S: 'static> Runner<S> {
                     crate::macos::request_zoom(w);
                     #[cfg(not(target_os = "macos"))]
                     w.set_maximized(!w.is_maximized());
+                }
+                WindowRequest::Minimize => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    w.set_minimized(true);
+                }
+                WindowRequest::Close => {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    { self.close_requested = true; }
                 }
                 WindowRequest::SetClipboard(t) => self.clipboard.set(t),
                 WindowRequest::OpenUrl(url) => open_url(&url),
@@ -711,6 +754,18 @@ impl<S: 'static> Runner<S> {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn menu_command(&mut self, command: crate::native_menu::MenuCommand) -> bool {
+        if !self.window.as_ref().is_some_and(|w| crate::macos::is_key(w)) { return false; }
+        let paste = if matches!(command, crate::native_menu::MenuCommand::Standard(crate::NativeMenuAction::Paste)) { self.clipboard.get() } else { String::new() };
+        crate::native_menu::dispatch(&mut self.app.ui, command, &paste);
+        let m = self.mods;
+        self.app.ui.set_modifiers(Mods { shift: m.shift_key(), command: m.control_key() || m.super_key(), alt: m.alt_key() });
+        self.sync();
+        if let Some(window) = &self.window { window.request_redraw(); }
+        true
+    }
+
     /// Navigation keys. Cmd (Meta) + arrows follow macOS: ←/→ to the row's ends, ↑/↓ to the
     /// text's ends, Backspace to the row start. Ctrl/Alt + arrows go by words.
     fn nav_key(&mut self, k: KeyInput) -> bool {
@@ -765,6 +820,7 @@ impl<S: 'static> Runner<S> {
         }
         let scale = window.scale_factor() as f32;
         let ui = &mut self.app.ui;
+        ui.window_maximized = window.is_maximized();
         // In full screen the title bar and its buttons slide away: nothing to make room for.
         #[cfg(target_os = "macos")]
         if self.app.titlebar == Titlebar::Overlay {
@@ -772,9 +828,19 @@ impl<S: 'static> Runner<S> {
             ui.titlebar = if full { 0.0 } else { self.app.titlebar_height.unwrap_or(MAC_TITLEBAR) };
             ui.window_buttons = if full { 0.0 } else { self.buttons.unwrap_or(MAC_BUTTONS) };
         }
+        #[cfg(target_os = "windows")]
+        if self.app.titlebar == Titlebar::Overlay {
+            ui.titlebar = if window.fullscreen().is_some() { 0.0 } else { self.app.titlebar_height.unwrap_or(28.0) };
+        }
         let started = web_time::Instant::now();
         ui.scale = scale;
+        #[cfg(target_os = "macos")]
+        if self.file_drag_active {
+            if let Some(at)=crate::macos::drag_pointer(window) {self.cursor=at;ui.pointer_move(at);}
+        }
         ui.frame((size.width as f32 / scale, size.height as f32 / scale));
+        #[cfg(target_os = "macos")]
+        if self.file_drag_active {ui.wake_in=Some(ui.wake_in.unwrap_or(1.0).min(1.0/60.0));}
         #[cfg(target_os = "macos")]
         if let Some(chrome)=&mut self.chrome {chrome.set_dark(ui.theme().dark);}
         let bg = ui.clear_color();
@@ -869,6 +935,16 @@ impl<S: 'static> Runner<S> {
     fn scale(&self) -> f32 {
         self.window.as_ref().map_or(1.0, |w| w.scale_factor() as f32)
     }
+
+    #[cfg(target_os = "windows")]
+    fn resize_direction(&self) -> Option<winit::window::ResizeDirection> {
+        let window = self.window.as_ref()?;
+        if self.app.titlebar != Titlebar::Overlay || !window.is_resizable() || window.is_maximized() || window.fullscreen().is_some() {
+            return None;
+        }
+        let size = window.inner_size().to_logical::<f32>(window.scale_factor());
+        resize_edge(self.cursor, (size.width, size.height))
+    }
 }
 
 impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
@@ -900,6 +976,24 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if std::mem::take(&mut self.close_requested) {
+            event_loop.exit();
+            return;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            for command in self.menu.drain() {
+                if let crate::native_menu::MenuCommand::Custom(id) = command {
+                    if let Some((_, action)) = &self.app.native_menu { action(&mut self.app.ui.state, id); }
+                    if let Some(window) = &self.window { window.set_minimized(false); window.focus_window(); window.request_redraw(); }
+                } else if !self.companions.iter_mut().any(|child| child.menu_command(command)) {
+                    self.menu_command(command);
+                }
+            }
+            if self.window.is_some() {
+                if let Some((menu, _)) = &self.app.native_menu { self.menu.update(menu(&self.app.ui.state)); }
+            }
+        }
         #[cfg(not(target_arch = "wasm32"))]
         let next = self.wake_at.into_iter().chain(self.update_companions(event_loop)).min();
         #[cfg(target_arch = "wasm32")]
@@ -949,6 +1043,10 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
             use winit::platform::web::WindowAttributesExtWebSys;
             attrs = attrs.with_append(true);
         }
+        #[cfg(target_os = "windows")]
+        if self.app.titlebar == Titlebar::Overlay {
+            attrs = attrs.with_decorations(false);
+        }
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         #[cfg(target_arch = "wasm32")]
         {
@@ -985,6 +1083,8 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        #[cfg(target_arch = "wasm32")]
+        let _ = event_loop;
         #[cfg(not(target_arch = "wasm32"))]
         if self.window.as_ref().is_none_or(|w| w.id() != id) {
             if let Some(child) = self.companions.iter_mut().find(|c| c.id() == Some(id)) {
@@ -995,6 +1095,8 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
         #[cfg(target_arch = "wasm32")]
         let _ = id;
         if let Some(dirty)=self.app.file_event(&event) {
+            #[cfg(target_os = "macos")]
+            {self.file_drag_active=dirty && matches!(event,WindowEvent::HoveredFile(_));}
             if dirty {if let Some(window)=&self.window {window.request_redraw();}}
             return;
         }
@@ -1026,6 +1128,12 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
             }
         }
         let scale = self.scale();
+        #[cfg(target_os = "windows")]
+        if matches!(event, WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. }) {
+            if let (Some(window), Some(direction)) = (self.window.as_ref(), self.resize_direction()) {
+                if window.drag_resize_window(direction).is_ok() { return; }
+            }
+        }
         let ui = &mut self.app.ui;
         let dirty = match event {
             WindowEvent::ThemeChanged(t) => {
@@ -1033,7 +1141,7 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
                 true
             }
             WindowEvent::CloseRequested => {
-                event_loop.exit();
+                self.close_requested = true;
                 false
             }
             WindowEvent::RedrawRequested => {
@@ -1176,23 +1284,79 @@ fn key_char(logical: &Key, physical: PhysicalKey) -> Option<char> {
 }
 
 
-/// Opens the native directory chooser from a UI event handler. Returns `None` on cancel.
-/// Currently available on macOS; other targets return `None` without opening a dialog.
+/// Opens a native directory chooser. Use `try_pick_folder` to distinguish errors
+/// from cancellation. Call from a UI event handler.
 pub fn pick_folder() -> Option<std::path::PathBuf> {
-    #[cfg(target_os = "macos")] { crate::macos::pick_folder() }
-    #[cfg(not(target_os = "macos"))] { None }
+    try_pick_folder().ok().flatten()
 }
 
-/// Opens a native multi-file chooser on the UI thread. Cancellation returns an empty
-/// vector. Platforms without a native implementation return an explicit error.
-pub fn pick_files()->Result<Vec<std::path::PathBuf>,String> {
-    #[cfg(target_os="macos")] {crate::macos::pick_files()}
-    #[cfg(not(target_os="macos"))] {Err("Native file selection is not available on this platform".into())}
+/// Opens a native directory chooser on desktop platforms. Cancellation is `Ok(None)`.
+/// Linux requires Zenity, KDialog or YAD installed in PATH; missing backends are errors.
+pub fn try_pick_folder() -> Result<Option<std::path::PathBuf>, String> {
+    #[cfg(target_os = "macos")] { Ok(crate::macos::pick_folder()) }
+    #[cfg(any(target_os = "windows", target_os = "linux"))] {
+        native_dialog::DialogBuilder::file().open_single_dir().show().map_err(dialog_error)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))] {
+        Err("Native folder selection is not available on this platform".into())
+    }
+}
+
+/// Opens a native multi-file chooser from a UI event handler. Cancellation returns
+/// an empty vector; unavailable backends return an error. Linux needs Zenity, KDialog or YAD.
+pub fn pick_files() -> Result<Vec<std::path::PathBuf>, String> {
+    #[cfg(target_os = "macos")] { crate::macos::pick_files() }
+    #[cfg(any(target_os = "windows", target_os = "linux"))] {
+        native_dialog::DialogBuilder::file().open_multiple_file().show().map_err(dialog_error)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))] {
+        Err("Native file selection is not available on this platform".into())
+    }
+}
+
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+fn dialog_error(error: native_dialog::Error) -> String {
+    #[cfg(target_os = "linux")]
+    if matches!(error, native_dialog::Error::MissingDep) {
+        return "File selection needs Zenity, KDialog or YAD. Install one with your Linux package manager and try again.".into();
+    }
+    format!("Could not open the file dialog: {error}")
+}
+
+/// Five logical pixels stay usable at any monitor scale; corners take precedence.
+#[cfg(any(target_os = "windows", test))]
+fn resize_edge((x, y): (f32, f32), (w, h): (f32, f32)) -> Option<winit::window::ResizeDirection> {
+    use winit::window::ResizeDirection::*;
+    if x < 0.0 || y < 0.0 || x >= w || y >= h { return None; }
+    match (x < 5.0, x >= w - 5.0, y < 5.0, y >= h - 5.0) {
+        (true, _, true, _) => Some(NorthWest),
+        (_, true, true, _) => Some(NorthEast),
+        (true, _, _, true) => Some(SouthWest),
+        (_, true, _, true) => Some(SouthEast),
+        (true, _, _, _) => Some(West),
+        (_, true, _, _) => Some(East),
+        (_, _, true, _) => Some(North),
+        (_, _, _, true) => Some(South),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod file_tests {
     use super::*;
+    #[test]
+    fn overlay_resize_edges_leave_content_untouched() {
+        use winit::window::ResizeDirection::*;
+        let size = (400.0, 300.0);
+        for (point, expected) in [((0.0, 0.0), NorthWest), ((399.0, 0.0), NorthEast),
+            ((0.0, 299.0), SouthWest), ((399.0, 299.0), SouthEast),
+            ((1.0, 100.0), West), ((399.0, 100.0), East), ((200.0, 1.0), North), ((200.0, 299.0), South)] {
+            assert_eq!(resize_edge(point, size), Some(expected));
+        }
+        for point in [(5.0, 5.0), (200.0, 20.0), (-1.0, 0.0), (400.0, 100.0)] {
+            assert_eq!(resize_edge(point, size), None);
+        }
+    }
     #[test]
     fn native_file_events_are_opt_in_keep_paths_and_clear_hover() {
         #[derive(Default)] struct Files {hovered:bool,paths:Vec<std::path::PathBuf>}

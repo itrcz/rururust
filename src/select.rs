@@ -448,6 +448,7 @@ impl<S: 'static> Ui<S> {
             height: self.size.1,
             titlebar: self.titlebar,
             window_buttons: self.window_buttons,
+            window_maximized: self.window_maximized,
             system_dark:self.system_dark,
             theme: self.theme_rc(),
         }

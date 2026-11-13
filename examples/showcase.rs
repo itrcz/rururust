@@ -553,8 +553,9 @@ fn overlays(s: &Demo, t: &Theme) -> Vec<View<Demo>> {
         modal(
             s.modal,
             |s: &mut Demo| s.modal = false,
-            panel("Modal", "Blocks everything underneath until it is closed.", |s| s.modal = false),
-        ),
+            panel("Modal", "Lands at the center while the blurred background recedes.", |s| s.modal = false),
+        ).modal_style(ModalStyle {scale:1.1,backdrop_pull:0.12,content_blur:3.0,close_slowdown:1.6,
+            backdrop:Some(Glass {frost:18.0,..t.glass_menu}),..Default::default()}),
         snackbar(
             s.toast.is_some(),
             hstack((icon(&s.icons.bell).size(18.0, 18.0), text(s.toast.clone().unwrap_or_default()).font_size(15.0)))

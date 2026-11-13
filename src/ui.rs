@@ -49,6 +49,9 @@ pub(crate) const FLAG_HORIZONTAL_LIGHT: u32 = 512;
 pub(crate) const FLAG_BORDER_FADE: u32 = 16384;
 pub(crate) const FLAG_EDGE_BLUR: u32 = 32768;
 pub(crate) const FLAG_EDGE_BLUR_TRAILING: u32 = 65536;
+pub(crate) const FLAG_MODAL_BACKDROP: u32 = 131072;
+pub(crate) const FLAG_MODAL_CONTENT: u32 = 262144;
+pub(crate) const FLAG_POINTER_GLASS: u32 = 524288;
 
 /// One GPU instance. Units are logical points; the shader applies the scale factor.
 #[repr(C)]
@@ -323,6 +326,11 @@ pub enum WheelPhase {
 thread_local! {
     static PENDING: RefCell<Vec<(f32, Box<dyn Any>)>> = const { RefCell::new(Vec::new()) };
     static COPIES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static WINDOW_ACTIONS: RefCell<Vec<WindowRequest>> = const { RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn request_window(request: WindowRequest) {
+    WINDOW_ACTIONS.with(|requests| requests.borrow_mut().push(request));
 }
 
 /// Puts `text` on the system clipboard. Call it from any event handler, e.g. a "copy"
@@ -397,6 +405,10 @@ pub enum WindowRequest {
     DragWindow,
     /// Zoom / maximize or restore the window (a double click on `.window_drag()`).
     Zoom,
+    /// Minimize the window to the system taskbar or dock.
+    Minimize,
+    /// Request the same close behavior as the window's native close button.
+    Close,
     /// Put this text on the system clipboard (copy / cut in a text field, copy of selected text).
     SetClipboard(String),
     /// Open this http(s) or mailto URL in the browser (a click on a link without `.on_link()`).
@@ -772,6 +784,7 @@ struct Painter<'a, S> {
     open_menu: Option<u64>,
     menu: Option<Menu<S>>,
     pointer_x: f32,
+    pointer_y: f32,
     /// Set by a scroll view for its content stack: local y where sticky children pin.
     sticky: Option<f32>,
     /// Earliest moment (seconds from now) something needs a frame without input.
@@ -1240,8 +1253,10 @@ impl<S> Painter<'_, S> {
         }
 
         if let Some(shown) = st.reveal {
-            let progress = self.spring(id, slot::REVEAL, if shown { 1.0 } else { 0.0 });
-            let from = self.look.theme.motion.reveal_scale;
+            let target=if shown {1.0}else{0.0};
+            let progress=if st.reveal_fade {self.spring_with(id,slot::REVEAL,target,target,self.look.theme.motion.smooth).x}
+                else {self.spring(id,slot::REVEAL,target)};
+            let from=if st.reveal_fade {1.0}else{self.look.theme.motion.reveal_scale};
             xf.scale_about(r.x + r.w * 0.5, r.y + r.h * 0.5, from + (1.0 - from) * progress.max(0.0));
             xf.opacity *= progress.clamp(0.0, 1.0);
         }
@@ -1292,6 +1307,14 @@ impl<S> Painter<'_, S> {
         if let Some(g) = st.glass {
             self.glass(&xf, r, st.radius, g, st.border.filter(|_| late_border.is_none()));
             if let Some(Cmd::Quad(q)) = self.list.cmds.last_mut() { q.p0[2] = st.glass_fade * xf.s; }
+            if let Some((strength,frost))=st.glass_attraction {
+                if let Some(Cmd::Quad(q))=self.list.cmds.last_mut() {
+                    q.np[3]=((q.np[3] as u32)|FLAG_POINTER_GLASS) as f32;
+                    q.n0=[strength*xf.opacity,frost*xf.opacity,0.0,0.0];
+                    q.n1=[((self.pointer_x-sr.x)/sr.w.max(1.0)).clamp(0.08,0.92),
+                        ((self.pointer_y-sr.y)/sr.h.max(1.0)).clamp(0.08,0.92),0.0,0.0];
+                }
+            }
         }
         match (st.bg, st.border.filter(|_| late_border.is_none()), st.glass) {
             (Some(bg), border, None) => self.fill(&xf, r, st.radius, bg, border),
@@ -1512,7 +1535,7 @@ impl<S> Painter<'_, S> {
             Kind::Overlay { open, mode, child, on_dismiss, style } => {
                 if mode==OverlayMode::Modal && !open {return;}
                 let target = if open { 1.0 } else { 0.0 };
-                let t = if mode == OverlayMode::Modal { self.fade(id, target) }
+                let t = if mode == OverlayMode::Modal { self.modal_fade(id, target, style) }
                     else { self.spring_from(id, slot::OVERLAY, 0.0, target) };
                 if t <= 0.004 && !open {
                     return;
@@ -1524,8 +1547,9 @@ impl<S> Painter<'_, S> {
                 let mut cxf = xf;
                 let pos = match mode {
                     OverlayMode::Modal => {
-                        // Dialogs fade and rise at their final size.
+                        // Geometry, glyphs and input share the same center-anchored transform.
                         cxf.opacity *= tc;
+                        cxf.scale_about(r.x + r.w * 0.5, r.y + r.h * 0.5, style.scale_at(tc));
                         (cx, r.y + (r.h - h) * 0.5 + style.rise * (1.0 - tc))
                     }
                     OverlayMode::Sheet => (cx, r.y + r.h - h + (1.0 - t) * (h + 24.0)),
@@ -1548,6 +1572,12 @@ impl<S> Painter<'_, S> {
                         let mut backdrop_xf = xf;
                         backdrop_xf.opacity *= tc;
                         self.glass(&backdrop_xf, r, 0.0, glass, None);
+                        if mode == OverlayMode::Modal {
+                            if let Some(Cmd::Quad(q)) = self.list.cmds.last_mut() {
+                                q.np[3] = ((q.np[3] as u32) | FLAG_MODAL_BACKDROP) as f32;
+                                q.n0[0] = if style.backdrop_pull.is_finite() {style.backdrop_pull.clamp(0.0, 0.3) * tc} else {0.0};
+                            }
+                        }
                     }
                     let scrim = self.look.theme.color.scrim;
                     self.fill(&xf, r, 0.0, Fill::Solid(scrim.alpha(scrim.a * tc)), None);
@@ -1561,11 +1591,13 @@ impl<S> Painter<'_, S> {
                 let body = cxf.rect(Rect::new(pos.0, pos.1, w, h));
                 self.hits.push(Hit { id: child_id(id, 1, None), rect: body, round: NO_ROUND, action: Action::Swallow });
                 let cid = child_id(id, 0, child.key);
+                let body_radius=child.style.radius*cxf.s;
                 self.tbase = tbase;
                 self.paint(*child, cn, pos, cxf, cid);
                 if mode==OverlayMode::Modal {
                     self.flush_bars();
-                    self.remember_modal(id,modal_start,modal_body,tc,style.rise*xf.s);
+                    self.remember_modal(id,modal_start,modal_body,tc,style,xf.s,xf.rect(r),body,body_radius);
+                    self.modal_content_blur(body,body_radius,style.content_blur,tc);
                 }
             }
             Kind::Collapse {child,..} => {
@@ -1968,6 +2000,9 @@ impl<S> Painter<'_, S> {
                         bar.hit = Some(Action::ScrollBar { scroll: id, y0, track: track * xf.s, len: len * xf.s, lo, hi, page: (r.h * 0.9).max(1.0) });
                     }
                 }
+                if let Some((width, color)) = st.scroll_top_border.filter(|_| offset > 0.5) {
+                    self.fill(&cxf, Rect::new(r.x, r.y, r.w, width), 0.0, Fill::Solid(color), None);
+                }
                 self.bars.push(bar);
                 if let Some(overlay)=bottom_overlay {
                     let cid=child_id(id,1,overlay.key);
@@ -2142,6 +2177,8 @@ pub struct Ui<S> {
     pub titlebar: f32,
     /// Passed to the view as [`Env::window_buttons`]; set by the runner.
     pub window_buttons: f32,
+    /// Passed to the view as [`Env::window_maximized`]; set by the runner.
+    pub window_maximized: bool,
     /// Device pixels per point (2 on a Retina screen); set by the runner every frame, so a
     /// window moved to another monitor follows. Edges, hairlines and text are snapped to
     /// this pixel grid. Default 1.
@@ -2202,6 +2239,7 @@ impl<S: 'static> Ui<S> {
             requests: Vec::new(),
             titlebar: 0.0,
             window_buttons: 0.0,
+            window_maximized: false,
             scale: 1.0,
             fps: 0.0,
             fps_label: String::new(),
@@ -2416,6 +2454,7 @@ impl<S: 'static> Ui<S> {
             open_menu: self.open_menu,
             menu: None,
             pointer_x: self.ptr.last.0,
+            pointer_y: self.ptr.last.1,
             sticky: None,
             wake: None,
             now,
@@ -2796,7 +2835,9 @@ impl<S: 'static> Ui<S> {
             if changed {
                 self.menu_hover();
             }
-            changed || tracked
+            let pointer_glass=moved && self.list.cmds.iter().any(|cmd|matches!(cmd,
+                Cmd::Quad(q) if q.p0[3]==KIND_GLASS && (q.np[3] as u32)&FLAG_POINTER_GLASS!=0));
+            changed || tracked || pointer_glass
         };
         if self.split_drag.is_some() {
             return self.split_move(pos.0) || hover;
@@ -2939,6 +2980,7 @@ impl<S: 'static> Ui<S> {
     /// Moves texts queued by [`copy_text`] into [`Ui::requests`].
     fn take_copies(&mut self) {
         COPIES.with(|c| self.requests.extend(c.borrow_mut().drain(..).map(WindowRequest::SetClipboard)));
+        WINDOW_ACTIONS.with(|requests| self.requests.extend(requests.borrow_mut().drain(..)));
     }
 
     /// True while a text field has keyboard focus.

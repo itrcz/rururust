@@ -590,6 +590,52 @@ fn window_drag_asks_the_window_to_move_but_not_through_buttons() {
     assert!(ui.requests.is_empty());
 }
 
+#[test]
+fn window_actions_activate_once_and_never_drag_the_parent() {
+    use ruru::WindowRequest::*;
+    for request in [Minimize, Zoom, Close] {
+        let action = request.clone();
+        let mut ui = Ui::new(false, move |disabled: &bool| {
+            hstack((spacer(), rect().size(40.0, 28.0).window_action(action.clone()).disabled(*disabled)))
+                .height(28.0).window_drag().place(Align::Start, Align::Start)
+        });
+        ui.frame((400.0, 300.0));
+        assert!(!ui.window_drag_at((380.0, 10.0)));
+        ui.pointer_down((380.0, 10.0), false);
+        assert!(ui.requests.is_empty(), "only release activates a window button");
+        ui.pointer_up((380.0, 10.0));
+        assert_eq!(std::mem::take(&mut ui.requests), vec![request]);
+        ui.frame((400.0, 300.0));
+        assert!(ui.requests.is_empty(), "a frame must not repeat the action");
+        ui.pointer_down((380.0, 10.0), false);
+        ui.pointer_up((200.0, 100.0));
+        assert!(ui.requests.is_empty(), "releasing outside cancels");
+        ui.state = true;
+        ui.frame((400.0, 300.0));
+        ui.pointer_down((380.0, 10.0), false);
+        ui.pointer_up((380.0, 10.0));
+        assert!(ui.requests.is_empty(), "disabled controls neither act nor drag");
+    }
+}
+
+#[test]
+fn window_actions_respect_modal_isolation_and_receive_maximized_state() {
+    use ruru::WindowRequest::Close;
+    let observed = std::rc::Rc::new(std::cell::Cell::new(false));
+    let output = observed.clone();
+    let mut ui = Ui::new(true, move |open: &bool, env: &Env| {
+        output.set(env.window_maximized);
+        zstack((rect().fill().window_action(Close),
+            modal(*open, |open: &mut bool| *open = false, text("Dialog").padding(30.0))))
+    });
+    ui.window_maximized = true;
+    ui.frame((400.0, 300.0));
+    assert!(observed.get());
+    ui.pointer_down((10.0, 10.0), false);
+    ui.pointer_up((10.0, 10.0));
+    assert!(ui.requests.is_empty(), "window actions below a modal stay isolated");
+}
+
 // ---- clip, truncate, hover, size limits, animate, padding
 
 #[test]
@@ -3675,7 +3721,7 @@ fn modal_rise_keeps_text_scale_and_x_fixed_above_a_blurred_backdrop() {
             text("Background content"),
             modal(*open, |open: &mut bool| *open = false,
                 text("Search results").padding(20.0).width(300.0).height(120.0))
-                .modal_style(ModalStyle { rise: 18.0, backdrop: Some(Glass { frost: 12.0, ..Glass::dark() }) }),
+                .modal_style(ModalStyle { rise: 18.0, backdrop: Some(Glass { frost: 12.0, ..Glass::dark() }), ..Default::default() }),
         )).fill()
     });
     let size = (600.0, 400.0);
@@ -5079,7 +5125,7 @@ fn removed_modal_fades_out_without_live_form_actions_and_can_reopen() {
         if s.0 {modal(true,|s:&mut (bool,usize)|s.0=false,
             button("Dismissed form",|s:&mut (bool,usize)|s.1+=1)
                 .size(260.0,120.0).background(PANEL))
-                .modal_style(ModalStyle{rise:18.0,backdrop:Some(Glass::dark())})
+                .modal_style(ModalStyle{rise:18.0,backdrop:Some(Glass::dark()),..Default::default()})
         }else{rect().size(0.0,0.0)},
     )));
     let size=(800.0,500.0);
@@ -5116,4 +5162,76 @@ fn scroll_to_end_reaches_bottom_of_a_row_taller_than_the_viewport() {
     ui.wheel((300.0,150.0),200.0,ruru::WheelPhase::Line);ui.frame(size);
     let bottom=ui.list.cmds.iter().find_map(|c|match c {ruru::Cmd::Quad(q) if q.rect[3]==900.0=>Some(q.rect[1]+q.rect[3]),_=>None}).unwrap();
     assert!(bottom>400.0,"manual scrolling resumes after reaching the end");
+}
+
+
+#[test]
+fn nested_modal_closes_above_its_parent_without_dismissing_it() {
+    let mut ui=Ui::new((true,true),|s:&(bool,bool)|zstack((
+        modal(s.0,|s:&mut (bool,bool)|s.0=false,rect().size(400.0,250.0).background(Color::BLUE)),
+        if s.1 {modal(true,|s:&mut (bool,bool)|s.1=false,rect().size(200.0,100.0).background(Color::RED))
+            .modal_style(ModalStyle {scale:1.1,..Default::default()})}else{rect()},
+    )));
+    let step=|ui:&mut Ui<(bool,bool)>|{std::thread::sleep(std::time::Duration::from_millis(16));ui.frame((800.0,500.0));};
+    for _ in 0..40 {step(&mut ui);}
+    ui.key(KeyInput::Escape);assert_eq!(ui.state,(true,false));
+    for _ in 0..4 {step(&mut ui);}
+    assert!(ui.list.cmds.iter().any(|cmd|matches!(cmd,ruru::Cmd::Quad(q) if q.c0==[Color::RED.r,Color::RED.g,Color::RED.b,1.0] && q.p1[3]<1.0 && q.rect[2]>200.0)));
+    ui.pointer_down((10.0,10.0),false);ui.pointer_up((10.0,10.0));assert!(ui.state.0,"closing child shields parent");
+    for _ in 0..50 {step(&mut ui);}
+    assert!(!ui.list.cmds.iter().any(|cmd|matches!(cmd,ruru::Cmd::Quad(q) if q.c0==[Color::RED.r,Color::RED.g,Color::RED.b,1.0])));
+    ui.pointer_down((10.0,10.0),false);ui.pointer_up((10.0,10.0));assert!(!ui.state.0);
+}
+
+
+#[test]
+fn modal_content_blur_composites_the_whole_panel_only_during_transitions() {
+    let mut ui=Ui::new(false,|open:&bool|modal(*open,|open:&mut bool|*open=false,
+        vstack((text("Sharp when open"),text_field("Input", "",|_:&mut bool,_|{}),
+            button("Close",|open:&mut bool|*open=false))).size(320.0,180.0)
+            .background(Color::BLUE).radius(20.0))
+        .modal_style(ModalStyle {scale:1.1,content_blur:3.0,close_slowdown:1.6,..Default::default()}));
+    let size=(700.0,500.0);
+    let step=|ui:&mut Ui<bool>|{std::thread::sleep(std::time::Duration::from_millis(16));ui.frame(size);};
+    let post=|ui:&Ui<bool>|ui.list.cmds.iter().enumerate().find_map(|(index,cmd)|match cmd {
+        ruru::Cmd::Quad(q) if (q.np[3] as u32)&262144!=0=>Some((index,*q)),_=>None,
+    });
+    ui.frame(size);ui.state=true;for _ in 0..3 {step(&mut ui);}
+    let (index,opening)=post(&ui).expect("opening postprocess");
+    assert_eq!(index,ui.list.cmds.len()-1,"blur follows every panel primitive");
+    assert!(ui.list.cmds[..index].iter().any(|cmd|matches!(cmd,ruru::Cmd::Text(_))),"native text is composited before blur");
+    assert!(opening.p1[0]>0.0 && opening.p1[0]<3.0);
+    assert!(opening.rect[2]>opening.n0[2] && opening.rect[3]>opening.n0[3],"the feather extends beyond the panel edge");
+    for _ in 0..40 {step(&mut ui);}
+    assert!(post(&ui).is_none(),"settled dialog uses sharp native rendering without an extra snapshot");
+    ui.state=false;for _ in 0..5 {step(&mut ui);}
+    let (index,closing)=post(&ui).expect("a previously sharp cached panel blurs on exit");
+    assert_eq!(index,ui.list.cmds.len()-1);assert!(closing.p1[0]>0.0 && closing.p1[0]<3.0);
+    assert!((closing.n0[0]+closing.n0[2]/2.0-350.0).abs()<0.01);
+    assert!((closing.n0[1]+closing.n0[3]/2.0-250.0).abs()<0.01);
+    let opacity=ui.list.cmds[..index].iter().find_map(|cmd|match cmd {ruru::Cmd::Text(t)=>Some(t.color.a),_=>None}).unwrap();
+    assert!((closing.p1[0]-3.0*(1.0-opacity)).abs()<0.01,"blur follows the same progress as opacity");
+    for _ in 0..70 {step(&mut ui);}
+    assert!(post(&ui).is_none());assert!(!ui.animating);
+}
+
+#[test]
+fn fade_keeps_geometry_and_pointer_glass_tracks_its_local_focus() {
+    let mut ui=Ui::new(false,|shown:&bool|rect().size(240.0,160.0)
+        .glass_with(ruru::Glass::regular()).glass_attraction(0.72,22.0).fade(*shown));
+    let size=(240.0,160.0);ui.frame(size);
+    ui.state=true;ui.pointer_move((60.0,120.0));
+    let mut intermediate=false;
+    for _ in 0..80 {
+        std::thread::sleep(std::time::Duration::from_millis(8));ui.frame(size);
+        if let Some(q)=ui.list.cmds.iter().find_map(|cmd|match cmd {ruru::Cmd::Quad(q) if q.p0[3]==2.0=>Some(q),_=>None}) {
+            assert_eq!(&q.rect[2..],&[240.0,160.0]);
+            assert!((q.n1[0]-0.25).abs()<0.01 && (q.n1[1]-0.75).abs()<0.01);
+            if q.p1[3]>0.0 && q.p1[3]<0.95 {intermediate=true;}
+        }
+    }
+    assert!(intermediate,"fade has intermediate opacity without a zoom");
+    assert!(ui.pointer_move((180.0,40.0)),"pointer glass requests a frame even without hover controls");ui.frame(size);
+    let q=ui.list.cmds.iter().find_map(|cmd|match cmd {ruru::Cmd::Quad(q) if q.p0[3]==2.0=>Some(q),_=>None}).unwrap();
+    assert!((q.n1[0]-0.75).abs()<0.01 && (q.n1[1]-0.25).abs()<0.01);
 }
