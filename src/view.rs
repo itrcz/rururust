@@ -299,6 +299,7 @@ pub(crate) struct Style {
     pub hover_marquee_leading_outset: f32,
     pub hover_scope: bool,
     pub hover_offset: Option<(f32,f32)>,
+    pub hover_scale: Option<f32>,
     /// Turn of pictures in this subtree, degrees clockwise (`.rotation()`).
     pub rotation: Option<f32>,
     pub fg: Option<Color>,
@@ -397,6 +398,7 @@ impl Default for Style {
             hover_marquee_leading_outset: 0.0,
             hover_scope: false,
             hover_offset: None,
+            hover_scale: None,
             rotation: None,
             fg: None,
             place: None,
@@ -752,10 +754,12 @@ pub struct ModalStyle {
 
 pub(crate) enum Kind<S> {
     /// Picture; `true` = template (only its alpha is used, tinted with the text color).
+    Collapse { open: bool, child: Box<View<S>> },
     Image(Image, bool),
+    AnimatedIcon { progress: f32, hover: Option<f32>, cycle: Option<f32>, duration: Option<f32>, frame: Box<dyn Fn(f32) -> Image> },
     TextField(crate::ui::edit::Field<S>),
     Picker { options: Vec<String>, selected: usize, on_select: Rc<dyn Fn(&mut S, usize)>, label: TextData },
-    Tabs { labels: Vec<String>, icons: Vec<Image>, widths: Vec<Option<f32>>, disabled: Vec<usize>, selected: usize, on_select: Box<dyn Fn(&mut S, usize)> },
+    Tabs { labels: Vec<String>, icons: Vec<Image>, icon_frames: Vec<Box<dyn Fn(f32)->Image>>, widths: Vec<Option<f32>>, disabled: Vec<usize>, selected: usize, on_select: Box<dyn Fn(&mut S, usize)> },
     /// Value 0..=1; a ring instead of a bar.
     Progress { value: f32, ring: bool },
     Empty,
@@ -764,7 +768,7 @@ pub(crate) enum Kind<S> {
     Stack { axis: Axis, spacing: f32, align: Align, children: Vec<View<S>> },
     Text(TextData),
     Scroll { child: Box<View<S>>, refresh: Option<(bool, Box<dyn Fn(&mut S)>)>, indicator: Indicator, stick: bool, bar_insets: (f32, f32), bottom_overlay: Option<Box<View<S>>> },
-    List { count: usize, row_h: f32, row: Box<dyn Fn(usize) -> View<S>> },
+    List { count: usize, row_h: f32, row: Box<dyn Fn(usize) -> View<S>>, target: Option<(usize,u64)>, visible: Option<Box<dyn Fn(&mut S, std::ops::Range<usize>)>> },
     Overlay { open: bool, mode: OverlayMode, child: Box<View<S>>, on_dismiss: Option<Box<dyn Fn(&mut S)>>, style: ModalStyle },
     Toggle(bool, Box<dyn Fn(&mut S, bool)>),
     /// Value, number of stops (0 = continuous), handler, look (default when `None`).
@@ -1183,6 +1187,22 @@ impl<S> View<S> {
         }
         self
     }
+    /// Lazy list only: smoothly reveal a row in its enclosing scroll view. Change the
+    /// request number for every navigation, including repeated clicks on the same row.
+    /// Manual scrolling cancels the motion. Unknown preceding rows are measured on demand.
+    pub fn scroll_to_row(mut self, index:usize, request:u64)->Self {
+        if let Kind::List {target,..}=&mut self.kind {*target=Some((index,request));}
+        self
+    }
+
+    /// List only: reports the range of partially or fully visible rows after painting.
+    /// Excludes the area covered by a scroll's bottom overlay. Called when the range
+    /// changes or the list reappears, including an empty range; schedules a frame to reflect state changes.
+    pub fn on_visible_rows(mut self, f: impl Fn(&mut S, std::ops::Range<usize>) + 'static) -> Self {
+        if let Kind::List {visible,..}=&mut self.kind {*visible=Some(Box::new(f));}
+        self
+    }
+
     /// Scroll only: start at the end and stay there while content is appended, unless the
     /// user has scrolled up. For chats and logs.
     pub fn stick_to_bottom(mut self) -> Self {
@@ -1394,6 +1414,35 @@ impl<S> View<S> {
     }
     /// Use this container's hover area for descendant `.hover_marquee()` labels.
     /// The scope observes the pointer and never intercepts child clicks.
+    /// Animated icons only: animate toward the open pose while their hover scope is active.
+    pub fn animate_on_hover(mut self) -> Self {
+        if let Kind::AnimatedIcon { hover, .. } = &mut self.kind { *hover = Some(1.0); }
+        self
+    }
+
+    /// Animated icons: use a specific pose on hover.
+    pub fn animate_on_hover_to(mut self, progress:f32) -> Self {
+        if let Kind::AnimatedIcon { hover, .. } = &mut self.kind { *hover=Some(progress); }
+        self
+    }
+    /// Animated icons: advance through a repeating phase instead of reversing.
+    /// The frame callback receives an unwrapped phase; wrap it by this period.
+    pub fn forward_cycle(mut self, period:f32) -> Self {
+        if period.is_finite() && period>0.0 {
+            if let Kind::AnimatedIcon { cycle, .. } = &mut self.kind { *cycle=Some(period); }
+        }
+        self
+    }
+
+    /// Animated icons: linear phase over a fixed duration; apply easing in the frame.
+    /// Reversing preserves the current pose instead of restarting the sequence.
+    pub fn icon_duration(mut self, seconds:f32) -> Self {
+        if seconds.is_finite()&&seconds>0.0 {
+            if let Kind::AnimatedIcon { duration, .. } = &mut self.kind { *duration=Some(seconds); }
+        }
+        self
+    }
+
     pub fn hover_scope(mut self) -> Self {
         self.style.hover_scope = true;
         self
@@ -1402,6 +1451,11 @@ impl<S> View<S> {
     /// changing layout. Its hit region follows the animated presentation position.
     pub fn hover_offset(mut self, x:f32, y:f32)->Self {
         self.style.hover_offset=Some((x,y));self
+    }
+
+    /// Scale inside an ancestor hover scope without changing layout or its hit target.
+    pub fn hover_scale(mut self, factor:f32)->Self {
+        self.style.hover_scale=Some(factor.max(0.0));self
     }
 
     /// Text only: center lines of multi-line text.
@@ -1816,12 +1870,20 @@ pub fn image<S>(img: &Image) -> View<S> {
 pub fn icon<S>(img: &Image) -> View<S> {
     View::new(Kind::Image(img.clone(), true)).size(22.0, 22.0)
 }
+
+/// A template icon driven by a reversible 0..1 animation. The first frame starts
+/// at the supplied state; later changes animate without changing layout. Cache
+/// generated images in `frame` so settled frames reuse their GPU texture.
+pub fn animated_icon<S>(progress: f32, frame: impl Fn(f32) -> Image + 'static) -> View<S> {
+    View::new(Kind::AnimatedIcon { progress: if progress.is_finite(){progress}else{0.0}, hover: None, cycle: None, duration: None, frame: Box::new(frame) }).size(22.0, 22.0)
+}
+
 /// A lazily built list for long data: only the rows on screen are created, laid out and
 /// drawn, so 100 000 rows cost the same as 20. Rows may have different heights;
 /// `row_height` is the estimate used for rows that have not been seen yet (the scroll
 /// range is corrected as they are measured). Put it inside a `scroll`.
 pub fn list<S>(count: usize, row_height: f32, row: impl Fn(usize) -> View<S> + 'static) -> View<S> {
-    View::new(Kind::List { count, row_h: row_height.max(1.0), row: Box::new(row) }).fill_width()
+    View::new(Kind::List { count, row_h: row_height.max(1.0), row: Box::new(row), target: None, visible: None }).fill_width()
 }
 fn overlay<S>(open: bool, mode: OverlayMode, on_dismiss: Option<Box<dyn Fn(&mut S)>>, content: View<S>) -> View<S> {
     View::new(Kind::Overlay { open, mode, child: Box::new(content), on_dismiss, style: ModalStyle::default() }).fill()
@@ -1888,7 +1950,7 @@ pub fn picker<S, T: AsRef<str>>(options: &[T], selected: usize, on_select: impl 
 pub fn tab_bar<S, T: AsRef<str>>(labels: &[T], selected: usize, on_select: impl Fn(&mut S, usize) + 'static) -> View<S> {
     let labels: Vec<String> = labels.iter().map(|l| l.as_ref().to_string()).collect();
     let selected = selected.min(labels.len().saturating_sub(1));
-    let mut v = View::new(Kind::Tabs { labels, icons: Vec::new(), widths: Vec::new(), disabled: Vec::new(), selected, on_select: Box::new(on_select) });
+    let mut v = View::new(Kind::Tabs { labels, icons: Vec::new(), icon_frames: Vec::new(), widths: Vec::new(), disabled: Vec::new(), selected, on_select: Box::new(on_select) });
     v.style.role = Role::Tabs;
     v
 }
@@ -1974,6 +2036,15 @@ impl<S> View<S> {
         self
     }
     /// Visible but unavailable tabs: no selection or drag can activate these indices.
+    /// Animated tab icons receive 1 for the selected tab and 0 for the others.
+    pub fn tab_animated_icons(mut self, frames: Vec<Box<dyn Fn(f32)->Image>>) -> Self {
+        if let Kind::Tabs {icons,icon_frames,selected,..}=&mut self.kind {
+            *icons=frames.iter().enumerate().map(|(i,f)|f(if i==*selected{1.0}else{0.0})).collect();
+            *icon_frames=frames;
+        }
+        self
+    }
+
     pub fn tab_disabled(mut self, indices: &[usize]) -> Self {
         if let Kind::Tabs { disabled, .. } = &mut self.kind { *disabled=indices.to_vec(); }
         self
@@ -1986,4 +2057,9 @@ impl<S> View<S> {
         }
         self
     }
+}
+
+/// Keep content mounted while smoothly collapsing its height, fading and blurring it.
+pub fn collapse<S>(open: bool, child: View<S>) -> View<S> {
+    View::new(Kind::Collapse { open, child: Box::new(child) }).fill_width()
 }

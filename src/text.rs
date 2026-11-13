@@ -72,6 +72,9 @@ fn sf_tracking(size: f32, weight: u16) -> f32 {
 /// Measured row heights of one lazy list.
 #[derive(Default)]
 pub(crate) struct ListCache {
+    pub target_request: Option<u64>,
+    pub reported_visible: Option<std::ops::Range<usize>>,
+    pub reported_frame: u64,
     pub width: f32,
     pub heights: Vec<f32>,
     /// Rows painted last frame, and the first of them whose top was inside the viewport:

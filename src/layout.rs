@@ -62,9 +62,11 @@ pub(crate) struct LNode {
     pub marquee_width: f32,
     /// Content height (Scroll nodes only).
     pub content_h: f32,
+    pub collapse_progress: f32,
     /// Scroll nodes: how much the content above the visible rows grew (a lazy list re-wrapped
     /// its rows); the offset follows so the screen stays put.
     pub shift: f32,
+    pub row_target: Option<(u64,f32)>,
     /// Shaped labels with their sizes (Tabs nodes only).
     pub texts: Vec<(u64, (f32, f32))>,
     /// Measured or explicitly supplied width of each tab.
@@ -180,6 +182,14 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
                 size
             }
         }
+        Kind::Collapse {open, child} => {
+            let child_node=layout(child,(inner.0,None),lx,child_id(id,0,child.key));
+            let target=if *open{1.0}else{0.0};
+            let p=crate::ui::spring_with(lx.springs,(lx.frame,lx.resizing),(id,slot::COLLAPSE),target,target,lx.look.theme.motion.crisp).x.clamp(0.0,1.0);
+            let size=(child_node.size.0,child_node.size.1*p);
+            node.collapse_progress=p;node.children.push(child_node);size
+        }
+        Kind::AnimatedIcon { .. } => (22.0, 22.0),
         Kind::Image(img, _) => {
             let (nw, nh) = (img.0.width as f32, img.0.height.max(1) as f32);
             let w = match dim_w {
@@ -228,7 +238,7 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
             let st = style.clone().unwrap_or_else(|| lx.look.menu.clone());
             crate::ui::popup::layout_menu(items, &st, lx, id, &mut node)
         }
-        Kind::List { count, row_h, row } => {
+        Kind::List { count, row_h, row, target, .. } => {
             // Rows are built during paint (only the visible ones); here we just need the
             // total height: measured rows as measured, the rest at the estimate.
             let w = inner.0.unwrap_or(0.0);
@@ -238,6 +248,8 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
             cache.heights.resize(*count, f32::NAN);
             {
                 let was = std::mem::replace(&mut cache.width, w);
+                let seeking=target.filter(|(_,request)|cache.target_request!=Some(*request) || (was-w).abs()>0.5);
+                if let Some((_,request))=target {cache.target_request=Some(*request);}
                 // Measure visible rows BEFORE the enclosing scroll chooses its offset.
                 // Content can change at the same width (streamed markdown), not just on
                 // resize. Measuring only in paint left the scroll range one frame behind,
@@ -251,6 +263,11 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
                     layout(&rv, (Some(w + pad_w), None), lx, child_id(id, i, rv.key)).size.1
                 };
                 let mut fresh = HashMap::new();
+                if let Some((index,_))=seeking {
+                    for i in 0..=index.min(count.saturating_sub(1)) {
+                        if i<*count {fresh.insert(i,measure(i));}
+                    }
+                }
                 if was > 0.0 {
                     let (a, b) = (seen.0.min(*count), (seen.1 + 2).min(*count));
                     let on_screen: f32 = old[a..seen.1.min(*count)].iter().sum();
@@ -285,6 +302,9 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
             }
             lx.tail_viewport = tail_viewport;
             let cache = lx.text.lists.entry(id).or_default();
+            if let Some((index,request))=target.filter(|(index,_)|*index<*count) {
+                node.row_target=Some((request,cache.heights[..index].iter().map(|h|if h.is_nan(){*row_h}else{*h}).sum::<f32>()+pad[1]));
+            }
             (w, cache.heights.iter().map(|h| if h.is_nan() { *row_h } else { *h }).sum())
         }
         Kind::Overlay { mode, child, .. } => {

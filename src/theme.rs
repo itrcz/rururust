@@ -673,7 +673,7 @@ pub(crate) fn apply<S>(v: &mut View<S>, look: &Look) {
             apply(child,look);
             if let Some(overlay)=bottom_overlay {apply(overlay,look);}
         }
-        Kind::Overlay { child, .. } => apply(child, look),
+        Kind::Overlay { child, .. } | Kind::Collapse { child, .. } => apply(child, look),
         _ => {}
     }
     if let Some(x) = &mut v.extra {

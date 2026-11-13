@@ -55,7 +55,7 @@ pub use theme::{inter_tracking, Controls, Font, Motion, Palette, Radii, Shadows,
 pub use types::{Color, Rect};
 pub use ui::{after, copy_text, Cmd, DrawList, KeyInput, Quad, TextCmd, Ui, WheelPhase, WindowRequest};
 pub use view::{
-    activity_indicator, button, hstack, icon, icon_button, image, list, modal, progress_bar, progress_ring, picker, rect, scroll, sheet, slider, snackbar, spacer, tab_bar, text,
+    activity_indicator, animated_icon, collapse, button, hstack, icon, icon_button, image, list, modal, progress_bar, progress_ring, picker, rect, scroll, sheet, slider, snackbar, spacer, tab_bar, text,
     split, text_field, toggle, vstack, zstack, Align, Children, Cursor, Dim, Fill, Glass, Image, Indicator, Shadow, SliderStyle,
     ModalStyle, TextCursor, Truncate, View, Weight,
 };
@@ -70,7 +70,7 @@ pub mod prelude {
     #[cfg(feature = "app")]
     pub use crate::{App, Backdrop, Titlebar};
     pub use crate::{
-        activity_indicator, after, button, copy_text, hstack, icon, icon_button, image, list, modal, progress_bar, progress_ring, picker, rect, scroll, sheet, slider, snackbar, spacer,
+        activity_indicator, animated_icon, collapse, after, button, copy_text, hstack, icon, icon_button, image, list, modal, progress_bar, progress_ring, picker, rect, scroll, sheet, slider, snackbar, spacer,
         split, tab_bar, text, text_field, toggle, vstack, zstack, Align, Color, Cursor, Fill, Glass, Image, Indicator, Shadow,
         ModalStyle, SliderStyle, TextCursor, Truncate, View, Weight,
     };

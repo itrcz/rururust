@@ -95,6 +95,7 @@ impl<S> Painter<'_, S> {
     pub(super) fn paint_reveal(&mut self, xf: &Xf, id: u64, key: u64, spans: &[Span], content: &str, pos: (f32, f32), scale: f32) -> bool {
         let effect = xf.text_reveal.unwrap_or_default();
         let duration = effect.duration;
+        if xf.blur<=0.001 {
         let source = crate::text::shaped_text(spans, content);
         let run = self.reveals.nodes.entry(id).or_default();
         run.used = self.frame;
@@ -107,11 +108,12 @@ impl<S> Painter<'_, S> {
             return false;
         }
         self.spin = true; // redraw only until the last new glyph has become sharp
+        }
         let px = self.px.max(1.0);
         let physical_scale = scale * px;
         let glyphs = self.text.reveal_glyphs(key, (pos.0 * px, (pos.1 * px).round()), physical_scale);
         for (glyph, baseline, byte, color) in glyphs {
-            let progress = self.reveals.nodes[&id].progress(byte, self.time, duration);
+            let progress = if xf.blur>0.001 {1.0}else{self.reveals.nodes[&id].progress(byte, self.time, duration)};
             if progress <= 0.001 {
                 continue;
             }
@@ -176,7 +178,7 @@ impl<S> Painter<'_, S> {
             self.picture(&image_xf, rect, 0.0, &image, tint, None);
             if let Some(Cmd::Quad(q)) = self.list.cmds.last_mut() {
                 // n0.x is unused by ordinary pictures; shader converts pt to pixels.
-                q.n0[0] = 1.4 * (1.0 - progress);
+                q.n0[0] = xf.blur.max(1.4 * (1.0 - progress));
             }
         }
         true

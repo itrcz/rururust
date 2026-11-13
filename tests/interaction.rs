@@ -4849,3 +4849,184 @@ fn icon_size_overrides_the_theme_glyph() {
     let glyph = ui.list.cmds.iter().find_map(|c| match c { ruru::Cmd::Quad(q) if q.p0[3] == 3.0 => Some(q.rect), _ => None }).expect("glyph");
     assert_eq!((glyph[2], glyph[3]), (14.0, 14.0));
 }
+
+
+#[test]
+fn animated_icon_reverses_without_jumping_and_settles() {
+    use std::{cell::Cell,rc::Rc};
+    let progress=Rc::new(Cell::new(-1.0f32));let seen=progress.clone();
+    let img=Image::from_rgba(2,2,vec![255;16]);
+    let mut ui=Ui::new(false,move |open:&bool| {
+        let seen=seen.clone();let img=img.clone();
+        ruru::animated_icon(if *open{1.0}else{0.0},move |p|{seen.set(p);img.clone()}).size(24.0,24.0)
+    });
+    let size=(100.0,100.0);ui.frame(size);assert_eq!(progress.get(),0.0);assert!(!ui.animating);
+    ui.state=true;ui.frame(size);
+    for _ in 0..5 {std::thread::sleep(std::time::Duration::from_millis(8));ui.frame(size);}
+    let middle=progress.get();assert!(middle>0.0&&middle<1.0);
+    ui.state=false;ui.frame(size);assert!((progress.get()-middle).abs()<0.05,"reverse starts from current pose");
+    for _ in 0..180 {std::thread::sleep(std::time::Duration::from_millis(8));ui.frame(size);if !ui.animating{break;}}
+    assert_eq!(progress.get(),0.0);assert!(!ui.animating);
+    ui.state=true;ui.frame(size);
+    for _ in 0..180 {std::thread::sleep(std::time::Duration::from_millis(8));ui.frame(size);if !ui.animating{break;}}
+    assert_eq!(progress.get(),1.0);assert!(!ui.animating);
+}
+
+#[test]
+fn lazy_row_navigation_is_smooth_exact_repeatable_and_cancelled_by_wheel() {
+    use std::time::Duration;
+    let mut ui=ruru::Ui::new((None::<(usize,u64)>,400.0f32),|s:&(Option<(usize,u64)>,f32)| {
+        let rows=list(30,30.0,|index|rect().height(if index%2==0{80.0}else{140.0}).fill_width().background(Color::hex(0x100000+index as u32)));
+        let rows=if let Some((index,request))=s.0 {rows.scroll_to_row(index,request)}else{rows};
+        scroll(vstack((rect().height(24.0),rows)).fill_width()).stick_to_bottom().fill()
+    });
+    let size=(400.0,300.0);ui.frame(size);ui.frame(size);
+    let row_y=|ui:&ruru::Ui<(Option<(usize,u64)>,f32)>,index:usize|ui.list.cmds.iter().find_map(|cmd|match cmd {
+        ruru::Cmd::Quad(q) if {let c=Color::hex(0x100000+index as u32);q.c0==[c.r,c.g,c.b,c.a]}=>Some(q.rect[1]),_=>None,
+    });
+    ui.state.0=Some((4,1));ui.frame(size);
+    assert!(row_y(&ui,4).is_none(),"first frame retains the current offset");
+    std::thread::sleep(Duration::from_millis(160));ui.frame(size);
+    assert!(ui.animating,"jump is animated rather than immediate");
+    for _ in 0..35 {std::thread::sleep(Duration::from_millis(16));ui.frame(size);}
+    assert!(row_y(&ui,4).unwrap().abs()<1.0,"real variable heights put the requested row at viewport top");
+    ui.wheel((200.0,150.0),-70.0,ruru::WheelPhase::Line);ui.frame(size);
+    assert!((row_y(&ui,4).unwrap()+70.0).abs()<1.0,"completed request does not override manual scroll");
+    ui.state.0=Some((4,2));ui.frame(size);
+    for _ in 0..32 {std::thread::sleep(Duration::from_millis(16));ui.frame(size);}
+    assert!(row_y(&ui,4).unwrap().abs()<1.0,"a repeated click restarts navigation");
+    ui.state.0=Some((20,3));ui.frame(size);
+    std::thread::sleep(Duration::from_millis(80));ui.frame(size);
+    ui.wheel((200.0,150.0),40.0,ruru::WheelPhase::Line);ui.frame(size);
+    let before=ui.list.cmds.iter().filter_map(|cmd|match cmd {ruru::Cmd::Quad(q)=>Some(q.rect),_=>None}).collect::<Vec<_>>();
+    std::thread::sleep(Duration::from_millis(450));ui.frame(size);
+    let after=ui.list.cmds.iter().filter_map(|cmd|match cmd {ruru::Cmd::Quad(q)=>Some(q.rect),_=>None}).collect::<Vec<_>>();
+    assert_eq!(before,after,"wheel input cancels navigation");
+}
+
+#[test]
+fn collapse_moves_following_content_blurs_and_reverses_without_jumping() {
+    let mut ui=Ui::new(true,|open:&bool|vstack((
+        ruru::collapse(*open,vstack((text("First chat"),text("Second chat"))).height(80.0)),
+        rect().size(200.0,10.0).background(Color::RED),
+    )).align(Align::Start).place(Align::Start,Align::Start));
+    let size=(300.0,250.0);ui.scale=2.0;ui.frame(size);
+    let y=|ui:&Ui<bool>|quads(ui,Color::RED)[0][1];
+    assert_eq!(y(&ui),80.0);ui.state=false;ui.frame(size);
+    for _ in 0..6 {std::thread::sleep(std::time::Duration::from_millis(8));ui.frame(size);}
+    let middle=y(&ui);assert!(middle>0.0&&middle<80.0);
+    assert!(ui.list.cmds.iter().any(|c|matches!(c,ruru::Cmd::Quad(q) if q.p0[3]==3.0&&q.n0[0]>0.0)),"closing text uses blurred glyph masks");
+    ui.state=true;ui.frame(size);assert!((y(&ui)-middle).abs()<3.0);
+    for _ in 0..180 {std::thread::sleep(std::time::Duration::from_millis(8));ui.frame(size);if !ui.animating{break;}}
+    assert_eq!(y(&ui),80.0);assert!(!ui.animating);
+    ui.state=false;ui.frame(size);
+    for _ in 0..180 {std::thread::sleep(std::time::Duration::from_millis(8));ui.frame(size);if !ui.animating{break;}}
+    assert_eq!(y(&ui),0.0);assert!(!ui.animating);
+}
+
+#[test]
+fn animated_icon_forward_cycle_never_reverses_on_state_changes() {
+    use std::{cell::Cell,rc::Rc,time::Duration};
+    let progress=Rc::new(Cell::new(0.0f32));let seen=progress.clone();
+    let img=Image::from_rgba(2,2,vec![255;16]);
+    let mut ui=Ui::new(0.0f32,move |phase:&f32| {
+        let seen=seen.clone();let img=img.clone();
+        ruru::animated_icon(*phase,move |p|{seen.set(p);img.clone()}).forward_cycle(3.0)
+    });
+    let size=(100.0,100.0);ui.frame(size);
+    // Hover, return, select, leave, then interrupt a return with selection.
+    for (target,frames) in [(2.0,150),(0.0,150),(1.0,150),(0.0,5),(1.0,150)] {
+        ui.state=target;
+        let mut previous=progress.get();
+        for _ in 0..frames {
+            ui.frame(size);
+            assert!(progress.get()+0.0001>=previous,"phase must only advance");
+            previous=progress.get();
+            std::thread::sleep(Duration::from_millis(8));
+        }
+    }
+    assert!(!ui.animating);
+    assert!((progress.get().rem_euclid(3.0)-1.0).abs()<0.001);
+}
+
+#[test]
+fn animated_icon_hover_and_selection_share_one_pose() {
+    use std::{cell::Cell,rc::Rc,time::Duration};
+    let progress=Rc::new(Cell::new(-1.0f32));let seen=progress.clone();
+    let img=Image::from_rgba(2,2,vec![255;16]);
+    let mut ui=Ui::new(false,move |active:&bool| {
+        let seen=seen.clone();let img=img.clone();
+        ruru::animated_icon(if *active{1.0}else{0.0},move |p|{seen.set(p);img.clone()})
+            .animate_on_hover().size(24.0,24.0).hover_scope().place(Align::Start,Align::Start)
+    });
+    let size=(100.0,100.0);ui.frame(size);assert_eq!(progress.get(),0.0);
+    ui.pointer_move((12.0,12.0));ui.frame(size);
+    for _ in 0..150 {std::thread::sleep(Duration::from_millis(8));ui.frame(size);if !ui.animating{break;}}
+    assert_eq!(progress.get(),1.0);
+    ui.state=true;ui.frame(size);assert_eq!(progress.get(),1.0);
+    ui.pointer_move((90.0,90.0));ui.frame(size);assert_eq!(progress.get(),1.0);
+    assert!(!ui.animating,"click and pointer leave must not start another rotation");
+    ui.state=false;ui.frame(size);
+    for _ in 0..150 {std::thread::sleep(Duration::from_millis(8));ui.frame(size);if !ui.animating{break;}}
+    assert_eq!(progress.get(),0.0);
+}
+
+#[test]
+fn timed_icon_phase_has_constant_speed_and_reverses_without_a_jump() {
+    use std::{cell::Cell,rc::Rc,time::Duration};
+    let progress=Rc::new(Cell::new(-1.0f32));let seen=progress.clone();
+    let img=Image::from_rgba(2,2,vec![255;16]);
+    let mut ui=Ui::new(false,move |active:&bool| {
+        let seen=seen.clone();let img=img.clone();
+        ruru::animated_icon(if *active{1.0}else{0.0},move |p|{seen.set(p);img.clone()}).icon_duration(0.46)
+    });
+    let size=(100.0,100.0);ui.frame(size);
+    std::thread::sleep(Duration::from_millis(60));ui.state=true;ui.frame(size);
+    assert_eq!(progress.get(),0.0,"idle time must not advance a new transition");
+    for _ in 0..5 {std::thread::sleep(Duration::from_millis(20));ui.frame(size);}
+    let middle=progress.get();assert!(middle>0.19&&middle<0.40);
+    ui.state=false;ui.frame(size);assert_eq!(progress.get(),middle);
+    for _ in 0..40 {std::thread::sleep(Duration::from_millis(16));ui.frame(size);if !ui.animating{break;}}
+    assert_eq!(progress.get(),0.0);assert!(!ui.animating);
+}
+
+#[test]
+fn visible_rows_follow_clipping_scroll_resize_and_bottom_overlay() {
+    #[derive(Default)]
+    struct Seen { range:std::ops::Range<usize>, calls:usize, count:usize }
+    let mut ui=Ui::new(Seen{count:8,..Default::default()},|s:&Seen| {
+        let rows=list(s.count,100.0,|i|rect().fill_width().height(if i%2==0{60.0}else{140.0}))
+            .on_visible_rows(|s:&mut Seen,range|{s.range=range;s.calls+=1;});
+        scroll(rows).bottom_overlay(rect().height(70.0).fill_width()).fill()
+    });
+    let size=(400.0,250.0);ui.frame(size);ui.frame(size);
+    assert_eq!(ui.state.range,0..2,"partially visible row counts, covered row does not");
+    let calls=ui.state.calls;ui.frame(size);assert_eq!(ui.state.calls,calls,"unchanged range does not notify or perpetually redraw");
+    assert!(!ui.animating);
+    ui.wheel((200.0,100.0),-65.0,ruru::WheelPhase::Line);ui.frame(size);ui.frame(size);
+    assert_eq!(ui.state.range,1..3);
+    ui.frame((400.0,160.0));ui.frame((400.0,160.0));assert_eq!(ui.state.range,1..2);
+    ui.state.count=0;ui.frame(size);assert_eq!(ui.state.range,0..0,"an empty or culled list clears visibility");
+}
+
+#[test]
+fn visible_rows_clear_when_entire_list_scrolls_out_of_view() {
+    let mut ui=Ui::new((0..0,0usize),|_:&(std::ops::Range<usize>,usize)| {
+        scroll(vstack((list(2,40.0,|_|rect().height(40.0).fill_width())
+            .on_visible_rows(|s:&mut (std::ops::Range<usize>,usize),range|{s.0=range;s.1+=1;}),rect().height(500.0))).spacing(0.0)).fill()
+    });
+    ui.frame((300.0,200.0));assert_eq!(ui.state.0,0..2);
+    ui.wheel((100.0,100.0),-300.0,ruru::WheelPhase::Line);ui.frame((300.0,200.0));assert_eq!(ui.state.0,0..0);
+    ui.wheel((100.0,100.0),300.0,ruru::WheelPhase::Line);ui.frame((300.0,200.0));assert_eq!(ui.state.0,0..2);
+}
+
+#[test]
+fn visible_rows_report_again_when_returning_to_a_cached_list() {
+    let mut ui=Ui::new((true,0usize),|s:&(bool,usize)| {
+        if s.0 {list(3,40.0,|_|rect().height(40.0).fill_width()).key("messages")
+            .on_visible_rows(|s:&mut (bool,usize),_|s.1+=1)}else{rect().fill()}
+    });
+    let size=(300.0,200.0);ui.frame(size);ui.frame(size);assert_eq!(ui.state.1,1);
+    ui.state.0=false;ui.frame(size);ui.state.0=true;ui.frame(size);
+    assert_eq!(ui.state.1,2,"returning to a chat restores its visible markers even if its range is unchanged");
+}

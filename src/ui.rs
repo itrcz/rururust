@@ -157,6 +157,8 @@ pub(crate) mod slot {
     pub const TAB_DROP: u8 = 5;
     pub const TAB_HELD: u8 = 6;
     pub const TAB_WIDTH: u8 = 24;
+    pub const ICON_PROGRESS: u8 = 25;
+    pub const COLLAPSE: u8 = 26;
     /// Fade of a layer (popover, menu, tooltip) or a modal.
     pub const FADE: u8 = 7;
     /// Scroll bar visibility.
@@ -208,6 +210,8 @@ pub(crate) fn spring_with<'a>(
 
 #[derive(Clone, Copy, Default)]
 struct ScrollState {
+    request: Option<u64>,
+    navigation: Option<(f32,Instant)>,
     offset: f32,
     vel: f32,
     max: f32,
@@ -565,6 +569,7 @@ struct Xf {
     ty: f32,
     opacity: f32,
     text_reveal: Option<crate::view::TextReveal>,
+    blur: f32,
     hover_scope: Option<bool>,
     clip: Rect,
     clip_r: f32,
@@ -610,7 +615,7 @@ pub(crate) fn snap_rect(r: Rect, px: f32) -> Rect {
 impl Xf {
     /// No transform: screen points, clipped to `clip`, text in `fg`, snapped at `px`.
     fn screen(clip: Rect, fg: Color, px: f32) -> Xf {
-        Xf { s: 1.0, tx: 0.0, ty: 0.0, opacity: 1.0, text_reveal: None, hover_scope: None, clip, clip_r: 0.0, clip_smooth: false, clip_sq: 0, shape_sq: 0, border_hidden: 0, fg, px, rot: 0.0 }
+        Xf { s: 1.0, tx: 0.0, ty: 0.0, opacity: 1.0, text_reveal: None, blur: 0.0, hover_scope: None, clip, clip_r: 0.0, clip_smooth: false, clip_sq: 0, shape_sq: 0, border_hidden: 0, fg, px, rot: 0.0 }
     }
     /// Scales what follows by `k` about the local point `(cx, cy)`, which stays put on
     /// screen: press squeeze, reveal, popovers growing out of their anchor.
@@ -723,7 +728,16 @@ struct PointerObserver<S> {
     handler: Box<dyn Fn(&mut S, Option<(f32, f32)>)>,
 }
 
+struct IconTimeline {
+    value:f32,
+    target:f32,
+    at:Instant,
+    used:u64,
+}
+
 struct Painter<'a, S> {
+    visible_clip: Option<Rect>,
+    visible_events: Vec<(Box<dyn Fn(&mut S, std::ops::Range<usize>)>, std::ops::Range<usize>)>,
     list: &'a mut DrawList,
     look: &'a Look,
     hits: &'a mut Vec<Hit<S>>,
@@ -737,6 +751,7 @@ struct Painter<'a, S> {
     split_drag: Option<u64>,
     springs: &'a mut HashMap<(u64, u8), Spring>,
     scrolls: &'a mut HashMap<u64, ScrollState>,
+    icon_timelines: &'a mut HashMap<u64, IconTimeline>,
     pressed: Option<u64>,
     frame: u64,
     resizing: bool,
@@ -910,6 +925,7 @@ impl<S> Painter<'_, S> {
     /// A picture filling `r`; with `tint` only its shape is used, painted in that color.
     fn picture(&mut self, xf: &Xf, r: Rect, radius: f32, img: &Image, tint: Option<Color>, border: Option<(f32, Color)>) {
         let mut q = self.quad(xf, r, radius, KIND_IMAGE);
+        q.n0[0]=xf.blur;
         if let Some(c) = tint {
             q.c1[1] = 1.0;
             q.c1[2] = c.r;
@@ -1129,8 +1145,20 @@ impl<S> Painter<'_, S> {
         self.smooth = false;
     }
 
+    fn report_visible_rows(&mut self,id:u64,handler:Option<Box<dyn Fn(&mut S,std::ops::Range<usize>)>>,range:std::ops::Range<usize>) {
+        if let Some(handler)=handler {
+            let cache=self.text.lists.entry(id).or_default();
+            if cache.reported_visible.as_ref()!=Some(&range) || cache.reported_frame+1<self.frame {
+                cache.reported_visible=Some(range.clone());
+                self.visible_events.push((handler,range));
+                self.relayout=true;
+            }
+            cache.reported_frame=self.frame;
+        }
+    }
+
     fn paint(&mut self, v: View<S>, ln: &LNode, origin: (f32, f32), xf: Xf, id: u64) {
-        let hidden = (v.style.reveal == Some(false)).then(||
+        let hidden = (v.style.reveal == Some(false) || matches!(&v.kind,Kind::Collapse {open:false,..})).then(||
             (self.hits.len(), self.zones.len(), self.layers.len(), self.bars.len(), self.shortcuts.len(), self.pointer_observers.len()));
         let saved_pin = self.sticky;
         let saved = self.enter_text_ctx(&v, id);
@@ -1182,6 +1210,10 @@ impl<S> Painter<'_, S> {
             let amount=self.crisp(id,slot::HOVER_OFFSET,if xf.hover_scope.unwrap_or(false) {1.0}else{0.0});
             xf.tx+=x*amount*xf.s;xf.ty+=y*amount*xf.s;
         }
+        if let Some(factor)=st.hover_scale {
+            let amount=self.crisp(id,slot::HOVER_OFFSET,if xf.hover_scope.unwrap_or(false){1.0}else{0.0}).clamp(0.0,1.0);
+            xf.scale_about(r.x+r.w*0.5,r.y+r.h*0.5,1.0+(factor-1.0)*amount);
+        }
         if let Some(deg) = st.rotation {
             let smooth = self.look.theme.motion.smooth;
             xf.rot += self.spring_with(id, slot::ROTATION, deg, deg, smooth).x.to_radians();
@@ -1213,6 +1245,7 @@ impl<S> Painter<'_, S> {
         let sr = xf.rect_px(r);
         let margin = st.shadow.iter().flatten().map(Shadow::reach).fold(0.0, f32::max);
         if !sr.inflate(margin * xf.s).intersects(&xf.clip) || xf.opacity <= 0.001 {
+            if let Kind::List {visible,..}=v.kind {self.report_visible_rows(id,visible,0..0);}
             return; // culled
         }
         if let Some(handler) = extra.as_mut().and_then(|x|x.pointer.take()) {
@@ -1360,7 +1393,7 @@ impl<S> Painter<'_, S> {
                     self.spin|=period>0.0;
                 }
             }
-            Kind::List { count, row_h, row } => {
+            Kind::List { count, row_h, row, visible, .. } => {
                 // Only the rows inside the clip are built, laid out and painted. Their real
                 // heights are remembered so the scroll range converges on the truth.
                 let top = (xf.clip.y - xf.ty) / xf.s;
@@ -1428,6 +1461,10 @@ impl<S> Painter<'_, S> {
                     }
                 }
                 rows.sort_by_key(|r| r.1 .0);
+                let clip=self.visible_clip.map_or(xf.clip,|clip|clip.intersect(&xf.clip));
+                let visible_top=(clip.y-xf.ty)/xf.s;
+                let visible_bottom=visible_top+clip.h/xf.s;
+                let mut visible_range=count..0;
                 let mut seen = (usize::MAX, 0, usize::MAX);
                 for (y, (i, rv, n, cid)) in rows {
                     let known = known(self.text, i);
@@ -1438,6 +1475,10 @@ impl<S> Painter<'_, S> {
                         }
                     }
                     seen = (seen.0.min(i), seen.1.max(i + 1), if y >= top { seen.2.min(i) } else { seen.2 });
+                    if clip.w>0.0 && clip.h>0.0 && y+n.size.1>visible_top && y<visible_bottom {
+                        visible_range.start=visible_range.start.min(i);
+                        visible_range.end=visible_range.end.max(i+1);
+                    }
                     let saved_row = self.tctx.row;
                     self.enter_row(id, i, count);
                     self.path.push((id, i));
@@ -1445,6 +1486,8 @@ impl<S> Painter<'_, S> {
                     self.path.pop();
                     self.tctx.row = saved_row;
                 }
+                if visible_range.is_empty(){visible_range=0..0;}
+                self.report_visible_rows(id,visible,visible_range);
                 if let Some(c) = self.text.lists.get_mut(&id) {
                     (c.seen, c.anchor) = if seen.0 == usize::MAX { ((0, 0), 0) } else { ((seen.0, seen.1), seen.2.min(seen.1)) };
                 }
@@ -1501,6 +1544,40 @@ impl<S> Painter<'_, S> {
                 self.tbase = tbase;
                 self.paint(*child, cn, pos, cxf, cid);
             }
+            Kind::Collapse {child,..} => {
+                let p=ln.collapse_progress;
+                if p>0.001 {
+                    let mut child_xf=xf;
+                    child_xf.clip_to(xf.rect(cr),0.0,false);
+                    child_xf.opacity*=p;
+                    child_xf.ty-=8.0*(1.0-p)*xf.s;
+                    child_xf.blur=1.6*(1.0-p);
+                    let cid=child_id(id,0,child.key);
+                    self.paint(*child,&ln.children[0],(cr.x,cr.y),child_xf,cid);
+                }
+            }
+            Kind::AnimatedIcon { progress, hover, cycle, duration, frame } => {
+                let target=if xf.hover_scope.unwrap_or_else(||self.hovered.contains(&id)){hover.unwrap_or(progress)}else{progress};
+                let p=if let Some(duration)=duration {
+                    let target=target.clamp(0.0,1.0);
+                    let timeline=self.icon_timelines.entry(id).or_insert(IconTimeline{value:target,target,at:self.now,used:self.frame});
+                    if timeline.target!=target {timeline.target=target;timeline.at=self.now;}
+                    let step=self.now.duration_since(timeline.at).as_secs_f32().min(0.05)/duration;
+                    timeline.value+=(target-timeline.value).clamp(-step,step);
+                    timeline.at=self.now;timeline.used=self.frame;
+                    if (target-timeline.value).abs()>0.0001 {self.spin=true;}else{timeline.value=target;}
+                    timeline.value
+                }else if let Some(period)=cycle {
+                    let phase=target.rem_euclid(period);
+                    let target=self.springs.get(&(id,slot::ICON_PROGRESS)).map_or(phase,|s| {
+                        let delta=(phase-s.target.rem_euclid(period)).rem_euclid(period);
+                        s.target+if delta<0.0001||period-delta<0.0001{0.0}else{delta}
+                    });
+                    self.crisp(id,slot::ICON_PROGRESS,target)
+                }else{self.crisp(id, slot::ICON_PROGRESS, target).clamp(0.0, 1.0)};
+                let img = frame(p);
+                self.picture(&xf, cr, st.radius, &img, Some(xf.fg), None);
+            }
             Kind::Image(img, template) => {
                 // Padded, the frame (background, border) is the node's and the picture sits inside.
                 if pad == [0.0; 4] {
@@ -1511,7 +1588,7 @@ impl<S> Painter<'_, S> {
                 }
             }
             Kind::TextField(f) => self.paint_field(f, &st, r, sr, xf, id),
-            Kind::Tabs { labels, icons, disabled, selected, on_select, .. } => {
+            Kind::Tabs { labels, icons, icon_frames, disabled, selected, on_select, .. } => {
                 let (tabs_pad, drop_tint, lift) = (self.look.theme.control.tab_padding, self.look.theme.control.tab_drop, self.look.theme.shadow.lift);
                 let n=labels.len();
                 if n==0 {return;}
@@ -1585,7 +1662,11 @@ impl<S> Painter<'_, S> {
                     if let Some(img) = icons.get(i) {
                         let g = self.look.theme.control.tab_icon;
                         x = center(i) - (g * 1.5 + ts.0) * 0.5;
-                        self.picture(&label_xf, Rect::new(x, r.y + (r.h - g) * 0.5, g, g), 0.0, img, Some(color), None);
+                        let animated=icon_frames.get(i).map(|frame| {
+                            let progress=self.crisp(child_id(id,i,None),slot::ICON_PROGRESS,if i==selected{1.0}else{0.0});
+                            frame(progress.clamp(0.0,1.0))
+                        });
+                        self.picture(&label_xf, Rect::new(x, r.y + (r.h - g) * 0.5, g, g), 0.0, animated.as_ref().unwrap_or(img), Some(color), None);
                         x += g * 1.5;
                     }
                     self.label(&label_xf, *key, (x, r.y + (r.h - ts.1) * 0.5), *ts, color);
@@ -1651,7 +1732,7 @@ impl<S> Painter<'_, S> {
                 self.text_extras(&dxf, id, ln.text, &t.spans, &t.content, (inner.x, inner.y), (inner.w, inner.h), tbase);
                 self.span_decor(&dxf, ln.text, &t.spans, (inner.x, inner.y));
                 let (pos, scale) = xf.text_at(at, (inner.w, inner.h));
-                let revealed = xf.text_reveal.is_some_and(|reveal| reveal.duration > 0.0) && fade.is_none()
+                let revealed = (xf.blur>0.001 || (xf.text_reveal.is_some_and(|reveal| reveal.duration > 0.0) && fade.is_none()))
                     && self.paint_reveal(&dxf, id, ln.text, &t.spans, &t.content, pos, scale);
                 if !revealed {
                     self.list.cmds.push(Cmd::Text(TextCmd {
@@ -1745,7 +1826,7 @@ impl<S> Painter<'_, S> {
                 let s = self.scrolls.entry(id).or_default();
                 let max = (content - r.h).max(0.0);
                 let parked = s.offset >= s.max - 1.0 && s.vel == 0.0;
-                if ln.shift != 0.0 && s.used != 0 {
+                if ln.shift != 0.0 && s.used != 0 && s.navigation.is_none() {
                     // A lazy list inside re-wrapped for a new width: same rows on screen.
                     let (lo, hi) = s.bounds();
                     let inside = s.offset >= lo && s.offset <= hi;
@@ -1757,7 +1838,7 @@ impl<S> Painter<'_, S> {
                 // Chat-style: start at the end and follow new content while parked there.
                 // Shrinking too: a lazy row measured smaller than its estimate must not
                 // leave the view hanging past the end and bouncing back.
-                if stick && (s.used == 0 || (parked && max != s.max)) {
+                if stick && s.navigation.is_none() && (s.used == 0 || (parked && max != s.max)) {
                     s.offset = max;
                 }
                 s.max = max;
@@ -1766,6 +1847,24 @@ impl<S> Painter<'_, S> {
                     s.offset = s.offset.clamp(lo, hi);
                     s.vel = 0.0;
                 }
+                fn row_target(n:&LNode,y:f32)->Option<(u64,f32)> {
+                    let y=y+n.pos.1;
+                    n.row_target.map(|(request,offset)|(request,y+offset))
+                        .or_else(||n.children.iter().find_map(|child|row_target(child,y)))
+                }
+                if let Some((request,target))=row_target(&ln.children[0],0.0) {
+                    if s.request!=Some(request) {
+                        s.request=Some(request);s.navigation=Some((s.offset,now));
+                        s.vel=0.0;s.pad=Pad::Idle;s.wheel_at=None;
+                    }
+                    if let Some((from,started))=s.navigation {
+                        let p=((now-started).as_secs_f32()/0.42).clamp(0.0,1.0);
+                        let ease=p*p*(3.0-2.0*p);
+                        s.offset=from+(target.clamp(0.0,max)-from)*ease;
+                        s.active_at=Some(now);
+                        if p>=1.0 {s.navigation=None;}else{self.spin=true;}
+                    }
+                }else{s.navigation=None;}
                 s.used = frame;
                 s.refreshing = refresh.as_ref().is_some_and(|r| r.0);
                 let (offset, over, refreshing, active_at) = (s.offset, s.over(), s.refreshing, s.active_at);
@@ -1782,7 +1881,12 @@ impl<S> Painter<'_, S> {
                 // The physics stays fractional; the content is drawn whole pixels off, so text
                 // stays sharp and hairlines don't flicker while it moves.
                 let top = cxf.at_px((r.x, r.y - offset)).1;
+                let outer_visible=self.visible_clip;
+                let overlay_h=ln.children.get(1).map_or(0.0,|overlay|overlay.size.1);
+                let visible=xf.rect(Rect::new(r.x,r.y,r.w,(r.h-overlay_h).max(0.0))).intersect(&cxf.clip);
+                self.visible_clip=Some(outer_visible.map_or(visible,|outer|outer.intersect(&visible)));
                 self.paint(*child, &ln.children[0], (r.x, top), cxf, cid);
+                self.visible_clip=outer_visible;
                 self.tctx = outer;
                 self.sticky = None;
 
@@ -1957,6 +2061,7 @@ pub struct Ui<S> {
     pub cursor: Cursor,
     springs: HashMap<(u64, u8), Spring>,
     scrolls: HashMap<u64, ScrollState>,
+    icon_timelines: HashMap<u64, IconTimeline>,
     reveals: reveal::Reveals,
     marquees: marquee::Marquees,
     ptr: Pointer,
@@ -2031,6 +2136,7 @@ impl<S: 'static> Ui<S> {
             cursor: Cursor::Default,
             springs: HashMap::new(),
             scrolls: HashMap::new(),
+            icon_timelines: HashMap::new(),
             reveals: reveal::Reveals::default(),
             marquees: marquee::Marquees::default(),
             ptr: Pointer::default(),
@@ -2155,6 +2261,7 @@ impl<S: 'static> Ui<S> {
         let mut refresh = Vec::new();
         let mut scroll_wake: Option<f32> = None;
         for (id, s) in self.scrolls.iter_mut() {
+            if s.navigation.is_some() {continue;}
             let hold = if s.refreshing { REFRESH_HOLD } else { 0.0 };
             s.hold = if (s.hold - hold).abs() > 0.2 { s.hold + (hold - s.hold) * (1.0 - (-dt * 10.0).exp()) } else { hold };
             let since_wheel = s.wheel_at.map_or(f32::MAX, |t| (now - t).as_secs_f32());
@@ -2242,6 +2349,8 @@ impl<S: 'static> Ui<S> {
         let xf = Xf::screen(Rect::new(0.0, 0.0, size.0, size.1), fg, self.scale);
         let frame = self.frame;
         let mut p = Painter {
+            visible_clip: None,
+            visible_events: Vec::new(),
             list: &mut self.list,
             look: &look,
             hits: &mut self.hits,
@@ -2250,6 +2359,7 @@ impl<S: 'static> Ui<S> {
             hovered: &self.hovered,
             springs: &mut self.springs,
             scrolls: &mut self.scrolls,
+            icon_timelines: &mut self.icon_timelines,
             pressed: self.ptr.pressed,
             bar_drag: self.ptr.bar.map(|b| b.0),
             split_drag: self.split_drag.as_ref().map(|d| d.hit.id),
@@ -2304,6 +2414,7 @@ impl<S: 'static> Ui<S> {
         if p.sel.is_some_and(|s| s.stale) {
             self.sel.sel = None; // its rows are gone
         }
+        for (handler,range) in std::mem::take(&mut p.visible_events) {handler(&mut self.state,range);}
         if autoscroll.is_some() {
             self.sel_drag(self.ptr.last); // the text under the pointer moved
         }
@@ -2333,6 +2444,7 @@ impl<S: 'static> Ui<S> {
         self.menu_state.retain(|_, m| m.used == frame);
         self.springs.retain(|_, s| s.used == frame);
         self.scrolls.retain(|_, s| s.used == frame);
+        self.icon_timelines.retain(|_, s| s.used == frame);
         self.reveals.end_frame(frame);
         self.marquees.end_frame(frame);
         self.text.end_frame();
@@ -2402,6 +2514,7 @@ impl<S: 'static> Ui<S> {
     fn bar_press(&mut self, i: usize, y: f32) {
         let Action::ScrollBar { scroll, y0, track, len, lo, hi, page } = self.hits[i].action else { return };
         let Some(s) = self.scrolls.get_mut(&scroll) else { return };
+        s.navigation=None;
         let at = ((s.offset - lo) / (hi - lo).max(1.0)).clamp(0.0, 1.0);
         let top = y0 + (track - len) * at;
         if y >= top && y <= top + len {
@@ -2504,6 +2617,7 @@ impl<S: 'static> Ui<S> {
         self.ptr.drag_scroll = if touch { self.hit(pos, true).map(|i| self.hits[i].id) } else { None };
         if let Some(id) = self.ptr.drag_scroll {
             if let Some(s) = self.scrolls.get_mut(&id) {
+                s.navigation=None;
                 s.vel = 0.0; // catch a coasting list
             }
         }
@@ -2833,6 +2947,7 @@ impl<S: 'static> Ui<S> {
                 _ => continue,
             }
             let Some(s) = self.scrolls.get_mut(&h.id) else { continue };
+            s.navigation=None;
             let (lo, hi) = s.bounds();
             if phase == WheelPhase::Line {
                 // Mouse wheel: stops dead at the ends, and lets an outer scroll view take over.
