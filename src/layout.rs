@@ -245,6 +245,7 @@ pub(crate) fn layout<S>(v: &View<S>, prop: (Option<f32>, Option<f32>), lx: &mut 
             // Do not pass the outer tail budget into a nested list inside one row.
             let tail_viewport = lx.tail_viewport.take();
             let cache = lx.text.lists.entry(id).or_default();
+            cache.used = true;
             cache.heights.resize(*count, f32::NAN);
             {
                 let was = std::mem::replace(&mut cache.width, w);

@@ -2527,6 +2527,7 @@ impl<S: 'static> Ui<S> {
         self.springs.retain(|_, s| s.used == frame);
         self.scrolls.retain(|_, s| s.used == frame);
         self.icon_timelines.retain(|_, s| s.used == frame);
+        self.text.lists.retain(|_, l| std::mem::take(&mut l.used));
         self.reveals.end_frame(frame);
         self.marquees.end_frame(frame);
         self.text.end_frame();

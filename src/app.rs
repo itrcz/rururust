@@ -88,6 +88,7 @@ pub struct App<S> {
     /// Light and dark theme to follow the system appearance with (`theme_auto`).
     auto: Option<(Theme, Theme)>,
     file_drop: Option<Box<dyn Fn(&mut S, std::path::PathBuf)>>,
+    exit: Option<Box<dyn Fn(&mut S)>>,
     file_hover: Option<Box<dyn Fn(&mut S, bool)>>,
     native_menu: Option<(Box<dyn Fn(&S) -> Vec<crate::NativeMenu>>, Box<dyn Fn(&mut S, u32)>)>,
 }
@@ -109,6 +110,7 @@ impl<S: 'static> App<S> {
             titlebar_height: None,
             auto: None,
             file_drop: None,
+            exit: None,
             file_hover: None,
             native_menu: None,
         }
@@ -127,6 +129,13 @@ impl<S: 'static> App<S> {
     /// whether to copy, stage, reject, or open the file; the runner never reads it.
     pub fn on_file_drop(mut self, handler:impl Fn(&mut S,std::path::PathBuf)+'static)->Self {
         self.file_drop=Some(Box::new(handler));self
+    }
+    /// Runs once as the event loop ends: window closed, or Quit (Cmd+Q). On macOS Quit ends
+    /// the process without dropping the state, so `Drop` is not the place to flush files or
+    /// stop child processes; this is.
+    pub fn on_exit(mut self, handler: impl Fn(&mut S) + 'static) -> Self {
+        self.exit = Some(Box::new(handler));
+        self
     }
     /// Native file-drag highlight. `false` follows a drop or a cancelled drag.
     pub fn on_file_hover(mut self, handler:impl Fn(&mut S,bool)+'static)->Self {
@@ -972,6 +981,12 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
+        }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(f) = self.app.exit.take() {
+            f(&mut self.app.ui.state);
         }
     }
 
