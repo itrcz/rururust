@@ -90,6 +90,8 @@ pub struct App<S> {
     file_drop: Option<Box<dyn Fn(&mut S, std::path::PathBuf)>>,
     file_hover: Option<Box<dyn Fn(&mut S, bool)>>,
     native_menu: Option<(Box<dyn Fn(&S) -> Vec<crate::NativeMenu>>, Box<dyn Fn(&mut S, u32)>)>,
+    /// Desktop-entry id for Linux (`app_id`).
+    app_id: Option<String>,
 }
 
 impl<S: 'static> App<S> {
@@ -111,7 +113,15 @@ impl<S: 'static> App<S> {
             file_drop: None,
             file_hover: None,
             native_menu: None,
+            app_id: None,
         }
+    }
+    /// Desktop-entry id, e.g. `"com.example.Chat"`: the Wayland `app_id` and X11 `WM_CLASS`
+    /// that docks and taskbars use to match the window with its `.desktop` file and icon.
+    /// Linux only; elsewhere the executable identifies the app.
+    pub fn app_id(mut self, id: impl Into<String>) -> Self {
+        self.app_id = Some(id.into());
+        self
     }
     /// Create a native macOS menu; recompute labels and availability after UI events.
     /// Other platforms currently retain the configuration without creating a menu.
@@ -1056,6 +1066,12 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
         #[cfg(target_os = "windows")]
         if self.app.titlebar == Titlebar::Overlay {
             attrs = attrs.with_decorations(false);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(id) = &self.app.app_id {
+            // Both traits name the method `with_name`; whichever backend runs reads its own field.
+            attrs = winit::platform::wayland::WindowAttributesExtWayland::with_name(attrs, id.clone(), id.clone());
+            attrs = winit::platform::x11::WindowAttributesExtX11::with_name(attrs, id.clone(), id.clone());
         }
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         #[cfg(target_arch = "wasm32")]
