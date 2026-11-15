@@ -54,6 +54,30 @@
 - Welcome-layout приложения всё ещё оценивает текст для скрытия приветствия в маленьком окне;
   нижняя панель обычного чата уже использует фактически измеренную высоту.
 
+### Windows / Linux (аудит 15.11.2026, ветка `platform`)
+
+Сделано: `cargo check` lib+examples+tests для `x86_64-pc-windows-msvc`, `x86_64-unknown-linux-gnu`, wasm —
+без ошибок и предупреждений; wgpu получает display handle (GLES на Wayland) и `WGPU_BACKEND` из env;
+непрозрачное окно явно просит `CompositeAlphaMode::Opaque`; `App::app_id` (Wayland app_id / X11 WM_CLASS).
+Ничего не запускалось на настоящих Windows/Linux. По приоритету:
+
+1. **Буфер обмена на чистом Wayland** — arboard без `wayland-data-control`; GNOME не реализует wlr-data-control,
+   значит нужен буфер через соединение winit (smithay-clipboard) или portal. Проверка: GNOME/KDE Wayland без XWayland.
+2. **Нет GPU-адаптера → panic** (`expect` в `init_gfx`): повтор с `force_fallback_adapter` (WARP/lavapipe),
+   затем понятная ошибка вместо падения. Проверка: Windows RDP/VM без драйвера, Linux без Vulkan.
+3. **Snap Layouts Windows 11** на своей кнопке maximize при `Titlebar::Overlay` — нужен `WM_NCHITTEST → HTMAXBUTTON`
+   (сабклассинг окна, `unsafe` вне `macos.rs` → сначала запись в `docs/decisions/`).
+4. **Открытие ссылок на Windows через `explorer <url>`**: explorer режет аргумент по запятым — нужен `ShellExecuteW`
+   (тот же вопрос про `unsafe`). Проверка: ссылка с `,` в markdown.
+5. **Иконка окна** (`App::icon` → `with_window_icon`, Windows/X11; Wayland берёт её из `.desktop` по `app_id`).
+6. **Меню и стандартные шорткаты вне macOS**: `native_menu` там пустой; Ctrl+Q/Ctrl+W не обрабатываются.
+   Решить: внутриоконное меню или карта `NativeMenuAction` → клавиши.
+7. **Файловые диалоги** синхронные и без родительского окна (native-dialog); на Linux нужен Zenity/KDialog/YAD —
+   перейти на xdg-desktop-portal, на Windows передавать HWND владельца.
+8. **Системный шрифт Linux** — фиксированный список (Cantarell → Ubuntu → Noto → DejaVu), а не fontconfig/gsettings;
+   эмодзи/CJK держатся на фолбэке cosmic-text и установленных Noto. Проверка: минимальный Debian/Arch.
+9. **Дробный масштаб 125/150 %** (пиксельная сетка) и IME (XIM / text-input-v3, Windows TSF) — только живой прогон.
+
 ## Позже
 
 - Сборки Windows, Linux, iOS, Android (тач, безопасные зоны, клавиатура); резинка трекпада вне macOS.
