@@ -91,6 +91,8 @@ pub struct App<S> {
     exit: Option<Box<dyn Fn(&mut S)>>,
     file_hover: Option<Box<dyn Fn(&mut S, bool)>>,
     native_menu: Option<(Box<dyn Fn(&S) -> Vec<crate::NativeMenu>>, Box<dyn Fn(&mut S, u32)>)>,
+    /// Desktop-entry id for Linux (`app_id`).
+    app_id: Option<String>,
 }
 
 impl<S: 'static> App<S> {
@@ -113,7 +115,15 @@ impl<S: 'static> App<S> {
             exit: None,
             file_hover: None,
             native_menu: None,
+            app_id: None,
         }
+    }
+    /// Desktop-entry id, e.g. `"com.example.Chat"`: the Wayland `app_id` and X11 `WM_CLASS`
+    /// that docks and taskbars use to match the window with its `.desktop` file and icon.
+    /// Linux only; elsewhere the executable identifies the app.
+    pub fn app_id(mut self, id: impl Into<String>) -> Self {
+        self.app_id = Some(id.into());
+        self
     }
     /// Create a native macOS menu; recompute labels and availability after UI events.
     /// Other platforms currently retain the configuration without creating a menu.
@@ -383,11 +393,17 @@ struct Gfx {
     can_copy: bool,
 }
 
-async fn init_gfx(window: Arc<Window>, transparent: bool) -> Gfx {
+async fn init_gfx(window: Arc<Window>, transparent: bool, display: Option<winit::event_loop::OwnedDisplayHandle>) -> Gfx {
+    // GLES (the Linux fallback for VMs and old GPUs) needs the compositor connection up front,
+    // or it cannot present on Wayland; Vulkan, Metal and DX12 ignore it. `with_env` lets
+    // `WGPU_BACKEND=gl|vulkan|dx12` pick a backend when a driver misbehaves on someone's machine.
+    let desc = match display {
+        Some(d) => wgpu::InstanceDescriptor::new_with_display_handle(Box::new(d)).with_env(),
+        None => wgpu::InstanceDescriptor::new_without_display_handle(),
+    };
     // In the browser `navigator.gpu` can exist without a usable adapter (some Safari
     // configurations); this probes it and falls back to WebGL2 instead of failing.
-    let instance =
-        wgpu::util::new_instance_with_webgpu_detection(wgpu::InstanceDescriptor::new_without_display_handle()).await;
+    let instance = wgpu::util::new_instance_with_webgpu_detection(desc).await;
     let surface = instance.create_surface(window.clone()).expect("create surface");
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
@@ -424,6 +440,10 @@ async fn init_gfx(window: Arc<Window>, transparent: bool) -> Gfx {
         if let Some(m) = [M::PreMultiplied, M::PostMultiplied, M::Inherit].into_iter().find(|m| modes.contains(m)) {
             config.alpha_mode = m;
         }
+    } else if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+        // The default is the first mode the driver lists; some Wayland/GL stacks list a
+        // blended one first, and a stray alpha < 1 would then show the desktop through.
+        config.alpha_mode = wgpu::CompositeAlphaMode::Opaque;
     }
     surface.configure(&device, &config);
     // Native only: in the browser the canvas stays a plain render target.
@@ -1062,6 +1082,12 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
         if self.app.titlebar == Titlebar::Overlay {
             attrs = attrs.with_decorations(false);
         }
+        #[cfg(target_os = "linux")]
+        if let Some(id) = &self.app.app_id {
+            // Both traits name the method `with_name`; whichever backend runs reads its own field.
+            attrs = winit::platform::wayland::WindowAttributesExtWayland::with_name(attrs, id.clone(), id.clone());
+            attrs = winit::platform::x11::WindowAttributesExtX11::with_name(attrs, id.clone(), id.clone());
+        }
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         #[cfg(target_arch = "wasm32")]
         {
@@ -1075,7 +1101,7 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
             }
             let (slot, win) = (self.gfx.clone(), window.clone());
             wasm_bindgen_futures::spawn_local(async move {
-                let gfx = init_gfx(win.clone(), false).await;
+                let gfx = init_gfx(win.clone(), false, None).await;
                 *slot.borrow_mut() = Some(gfx);
                 win.request_redraw();
             });
@@ -1089,7 +1115,7 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            *self.gfx.borrow_mut() = Some(pollster::block_on(init_gfx(window.clone(), self.transparent)));
+            *self.gfx.borrow_mut() = Some(pollster::block_on(init_gfx(window.clone(), self.transparent, Some(event_loop.owned_display_handle()))));
         }
         let system = window.theme();
         self.follow_system(system);
