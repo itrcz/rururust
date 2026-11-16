@@ -26,6 +26,7 @@ pub(crate) struct Field<S> {
     pub placeholder: String,
     pub on_change: Box<dyn Fn(&mut S, String)>,
     pub on_submit: Option<Box<dyn Fn(&mut S)>>,
+    pub on_focus: Option<Box<dyn Fn(&mut S)>>,
     pub on_blur: Option<Box<dyn Fn(&mut S)>>,
     pub on_cancel: Option<Box<dyn Fn(&mut S)>>,
     pub autofocus: bool,
@@ -60,7 +61,7 @@ impl<S> Field<S> {
             placeholder,
             on_change,
             on_submit: None,
-            on_blur: None, on_cancel: None, autofocus: false, select_on_focus: false,
+            on_focus: None, on_blur: None, on_cancel: None, autofocus: false, select_on_focus: false,
             size: body.size,
             weight: body.weight as u16, weighted: false, intrinsic: false,
             sized: false,
@@ -151,6 +152,11 @@ impl<S> View<S> {
     /// Select the whole value when focus enters this field.
     pub fn select_on_focus(mut self) -> Self {
         if let Some(f) = self.field() { f.select_on_focus = true; }
+        self
+    }
+    /// Run once when focus enters the field by pointer, keyboard navigation or autofocus.
+    pub fn on_focus(mut self, f: impl Fn(&mut S) + 'static) -> Self {
+        if let Some(field) = self.field() { field.on_focus = Some(Box::new(f)); }
         self
     }
     /// Run when focus leaves the field, for example to commit an inline edit.
@@ -255,6 +261,7 @@ pub(crate) struct FieldHit<S> {
     value: String,
     on_change: Box<dyn Fn(&mut S, String)>,
     on_submit: Option<Box<dyn Fn(&mut S)>>,
+    on_focus: Option<Box<dyn Fn(&mut S)>>,
     on_blur: Option<Box<dyn Fn(&mut S)>>,
     on_cancel: Option<Box<dyn Fn(&mut S)>>,
     autofocus: bool,
@@ -447,10 +454,12 @@ impl<S: 'static> Ui<S> {
     /// Gives hit `i` (a field) keyboard focus with the caret at the end, or everything selected.
     fn focus_at(&mut self, i: usize, select_all: bool) {
         let id = self.hits[i].id;
-        if self.focus != Some(id) {
+        let entering = self.focus != Some(id);
+        if entering {
             self.blur();
         }
         let Action::Field(h) = &self.hits[i].action else { return };
+        if entering { if let Some(f) = &h.on_focus { f(&mut self.state); } }
         let len = h.value.len();
         self.focus = Some(id);
         self.ed = Editor { field: Some(id), mods: self.ed.mods, caret: len, anchor: if select_all { 0 } else { len }, ..Editor::default() };
@@ -495,6 +504,7 @@ impl<S: 'static> Ui<S> {
         self.ed.click = Some((now, pos, n));
         let (key, at) = self.shaped(i, pos);
         let Action::Field(h) = &self.hits[i].action else { return };
+        if entering { if let Some(f) = &h.on_focus { f(&mut self.state); } }
         let (len, secure) = (h.value.len(), h.secure);
         if self.ed.known.as_deref() != Some(h.value.as_str()) {
             self.ed.known = Some(h.value.clone());
@@ -868,7 +878,7 @@ impl<S> Painter<'_, S> {
                 value: f.value,
                 on_change: f.on_change,
                 on_submit: f.on_submit,
-                on_blur: f.on_blur, on_cancel: f.on_cancel,
+                on_focus: f.on_focus, on_blur: f.on_blur, on_cancel: f.on_cancel,
                 autofocus: f.autofocus, select_on_focus: f.select_on_focus,
                 secure,
             })),

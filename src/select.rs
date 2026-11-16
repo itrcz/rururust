@@ -9,7 +9,7 @@
 
 use super::{Action, Painter, Ui, WindowRequest, Xf, DOUBLE_CLICK};
 use crate::layout::child_id;
-use crate::text::{shaped_text, strip_slots};
+use crate::text::{shaped_text, strip_slots, TextSpec};
 use crate::types::{Color, Rect};
 use crate::view::{Axis, Cursor, Env, Fill, Kind, Span, View};
 use crate::KeyInput;
@@ -74,6 +74,7 @@ pub(crate) struct TextBox {
 /// A selectable area painted this frame.
 pub(crate) struct Area {
     id: u64,
+    actionable: bool,
     path: Path,
     /// The scroll view it scrolls in, with its screen rect (for autoscroll).
     scroll: Option<(u64, Rect)>,
@@ -112,6 +113,8 @@ pub(crate) struct LinkHit<S> {
 #[derive(Default)]
 pub(crate) struct SelState {
     pub sel: Option<Selection>,
+    /// Collected once at mouse-up, never rebuilt by hover, paint or activation.
+    pub quote: Option<String>,
     pub texts: Vec<TextBox>,
     pub areas: Vec<Area>,
     /// Last press: time, place, click count (1..=3).
@@ -127,15 +130,21 @@ pub(crate) struct PaintSel {
     pub area: u64,
     pub lo: TextPos,
     pub hi: TextPos,
+    pub action_focus: Option<TextPos>,
     /// The selection reaches past the end of its list (rows were removed): drop it.
     pub stale: bool,
 }
 
 impl SelState {
+    pub(super) fn clear(&mut self) -> bool {
+        self.quote = None;
+        self.sel.take().is_some()
+    }
+
     pub(super) fn for_paint(&self) -> Option<PaintSel> {
         let s = self.sel.as_ref()?;
         let (lo, hi) = s.range();
-        (lo != hi).then_some(PaintSel { area: s.area, lo, hi, stale: false })
+        (lo != hi).then_some(PaintSel { area: s.area, lo, hi, stale: false, action_focus: self.quote.as_ref().map(|_| s.focus) })
     }
 }
 
@@ -170,7 +179,8 @@ impl<S> Painter<'_, S> {
             self.tctx.area = Some((id, path.clone()));
             self.tctx.row = 0;
             self.tbase = 0; // the area numbers its texts from zero
-            self.areas.push(Area { id, path, scroll: self.tctx.scroll });
+            let actionable = v.extra.as_ref().is_some_and(|x| x.selection_action.is_some());
+            self.areas.push(Area { id, path, actionable, scroll: self.tctx.scroll });
         }
         if let Some(c) = st.sel_color {
             self.tctx.color = c;
@@ -179,6 +189,40 @@ impl<S> Painter<'_, S> {
             self.tctx.link = Some(f.clone());
         }
         Some(saved)
+    }
+
+    /// Placed from the shaped caret, so it follows reflow/scroll and disappears off screen.
+    /// Only the native label is measured here; the quote is already owned by the UI.
+    pub(super) fn paint_selection_action(&mut self) {
+        let Some(action) = self.selection_action.take() else { return };
+        let Some(sel) = self.sel.as_ref().filter(|s| !s.stale) else { return };
+        let Some(focus) = sel.action_focus else { return };
+        let area = sel.area;
+        if !self.hits.iter().any(|hit| matches!(hit.action, Action::Select { area: id } if id == area)) { return; }
+        let Some(b) = self.texts.iter().find(|b| b.area == area && (b.row,b.node) == focus.at()
+            && b.rect.w > 0.0 && b.rect.h > 0.0) else { return };
+        let (cx,cy,h) = self.text.caret(b.key, focus.byte as usize);
+        let (x,y) = (b.origin.0 + cx*b.scale, b.origin.1 + cy*b.scale);
+        if x < b.rect.x-1.0 || x > b.rect.x+b.rect.w+1.0 || y+h*b.scale <= b.rect.y || y >= b.rect.y+b.rect.h { return; }
+        let anchor = Rect::new(x, y.max(b.rect.y), 0.0, (y+h*b.scale).min(b.rect.y+b.rect.h)-y.max(b.rect.y));
+        let st = self.look.menu.clone();
+        let placement = super::popup::Placement::top();
+        let pad = st.padding + st.row_padding;
+        let max = (self.screen.w - 2.0*(placement.margin + pad)).max(1.0);
+        let spec = TextSpec { text: &action.label, size: st.font_size, weight: 500, ..Default::default() };
+        let (key, label, _) = self.text.measure_lines(&spec, Some(max), 1, false);
+        let size = (label.0 + 2.0*pad, st.row_height.max(label.1));
+        let ((x,y),_) = super::popup::place(anchor,size,placement,self.screen);
+        let r = Rect::new(x,y,size.0,size.1);
+        let id = child_id(area, 0, Some(0x5155_4F54_4500));
+        let xf = Xf::screen(self.screen,st.text,self.px);
+        self.menu_plate(&xf,r,&st);
+        let lit = self.hovered.contains(&id) || self.pressed == Some(id);
+        if lit { self.fill(&xf,r,st.radius,Fill::Solid(st.highlight),None); }
+        self.label(&xf,key,(x+pad,y+(size.1-label.1)*0.5),label,if lit {st.highlight_text.unwrap_or(st.text)} else {st.text});
+        self.menu_edge(&xf,r,&st);
+        self.zone(&xf,id,r,Some(Cursor::Pointer));
+        self.hit(&xf,id,r,Action::SelectionPick(action.run));
     }
 
     pub(super) fn area_hit(&mut self, xf: &Xf, id: u64, sr: Rect) {
@@ -288,6 +332,7 @@ impl<S: 'static> Ui<S> {
 
     /// Mouse press on a selectable area (not on a link or a control inside it).
     pub(super) fn sel_press(&mut self, area: u64, pos: (f32, f32)) {
+        self.sel.quote = None;
         let now = Instant::now();
         let n = match self.sel.click {
             Some((t, p, n)) if (now - t).as_secs_f32() < DOUBLE_CLICK && (p.0 - pos.0).abs() < 4.0 && (p.1 - pos.1).abs() < 4.0 => n % 3 + 1,
@@ -338,7 +383,11 @@ impl<S: 'static> Ui<S> {
     /// A click without a drag leaves an empty selection: nothing is highlighted or copied,
     /// but Shift+click extends from there.
     pub(super) fn sel_release(&mut self) {
-        self.sel.dragging = false;
+        if std::mem::take(&mut self.sel.dragging) {
+            self.sel.quote = self.sel.sel.as_ref()
+                .filter(|s| s.anchor != s.focus && self.sel.areas.iter().any(|a| a.id == s.area && a.actionable))
+                .and_then(|_| self.feed_text());
+        }
     }
 
     /// A press on a link that moved away: select from where it started instead.
@@ -404,6 +453,7 @@ impl<S: 'static> Ui<S> {
                     Some(s) if s.area == area && path.is_empty() => s.path.clone(),
                     _ => path,
                 };
+                self.sel.quote = None;
                 self.sel.sel = Some(Selection { area, path, anchor: TextPos::default(), focus: TextPos::MAX });
                 true
             }
@@ -414,7 +464,7 @@ impl<S: 'static> Ui<S> {
                 }
                 None => false,
             },
-            KeyInput::Escape => self.sel.sel.take().is_some(),
+            KeyInput::Escape => self.sel.clear(),
             _ => false,
         }
     }
@@ -480,7 +530,7 @@ fn find<S>(v: View<S>, id: u64, area: u64, path: &[(u64, usize)], c: &mut Collec
                 let cid=child_id(id,1,overlay.key);find(*overlay,cid,area,path,c)
             }))
         }
-        Kind::Overlay { child, .. } => {
+        Kind::Collapse { open: true, child } | Kind::Overlay { child, .. } => {
             let cid = child_id(id, 0, child.key);
             find(*child, cid, area, path, c)
         }
@@ -499,7 +549,7 @@ fn count_text<S>(v: &View<S>) -> u32 {
         Kind::Text(_) => 1,
         Kind::Stack { children, .. } => children.iter().map(count_text).sum(),
         Kind::Scroll {child,bottom_overlay,..} => count_text(child)+bottom_overlay.as_ref().map_or(0,|overlay|count_text(overlay)),
-        Kind::Overlay { child, .. } => count_text(child),
+        Kind::Collapse { child, .. } | Kind::Overlay { child, .. } => count_text(child),
         _ => 0,
     }
 }
@@ -547,7 +597,7 @@ fn collect<S>(v: &View<S>, c: &mut Collect) -> Option<String> {
             if let Some(overlay)=bottom_overlay {parts.push(collect(overlay,c));}
             join(parts,"\n")
         }
-        Kind::Overlay { open, child, .. } => {
+        Kind::Collapse { open, child } | Kind::Overlay { open, child, .. } => {
             if *open {
                 collect(child, c)
             } else {

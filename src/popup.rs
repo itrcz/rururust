@@ -605,7 +605,7 @@ impl<S> Painter<'_, S> {
         let (nh, nz) = (self.hits.len(), self.zones.len());
         self.tbase = 0;
         self.paint(l.view, &l.node, (x - l.node.pos.0, y - l.node.pos.1), xf, l.id);
-        self.flush_bars();
+        self.flush_layer_decorations();
         if tip || !l.open {
             // Tooltips and closing layers never take input.
             self.hits.truncate(nh);
@@ -618,6 +618,9 @@ impl<S> Painter<'_, S> {
     /// The anchor's attachments: its popover and tooltip go to the layer queue.
     pub(super) fn attach(&mut self, x: crate::view::Extras<S>, ln: &LNode, xf: &Xf, id: u64, sr: Rect, layout_anchor: Rect) {
         use crate::view::Opens;
+        if self.sel.as_ref().is_some_and(|s| s.area == id && s.action_focus.is_some()) {
+            self.selection_action = x.selection_action;
+        }
         if let Some(f) = x.secondary {
             self.hit(xf, id ^ 0x5EC0, sr, Action::Secondary(Some(f), id));
         }
@@ -669,18 +672,31 @@ impl<S> Painter<'_, S> {
         }
     }
 
-    pub(super) fn paint_menu(&mut self, items: Vec<MenuItem<S>>, style: Rc<MenuStyle>, ln: &LNode, r: Rect, xf: Xf, id: u64) {
-        let st = &*style;
-        let sr = xf.rect(r);
+    pub(super) fn menu_plate(&mut self, xf: &Xf, r: Rect, st: &MenuStyle) {
         for sh in [st.shadow, st.ambient].into_iter().flatten() {
-            self.shadow(&xf, r, st.radius, sh, true);
+            self.shadow(xf, r, st.radius, sh, true);
         }
         // The border goes on last, over the (often translucent) background and the rows,
         // as a container's does: under a translucent fill it would fade.
         if let Some(g) = st.glass {
-            self.glass(&xf, r, st.radius, g, None);
+            self.glass(xf, r, st.radius, g, None);
         }
-        self.fill(&xf, r, st.radius, Fill::Solid(st.background), None);
+        self.fill(xf, r, st.radius, Fill::Solid(st.background), None);
+    }
+
+    pub(super) fn menu_edge(&mut self, xf: &Xf, r: Rect, st: &MenuStyle) {
+        if let Some(rim) = st.rim {
+            self.shadow(xf, r, st.radius, rim, false);
+        }
+        if let Some(b) = st.border {
+            self.fill(xf, r, st.radius, Fill::Solid(Color::CLEAR), Some(b));
+        }
+    }
+
+    pub(super) fn paint_menu(&mut self, items: Vec<MenuItem<S>>, style: Rc<MenuStyle>, ln: &LNode, r: Rect, xf: Xf, id: u64) {
+        let st = &*style;
+        let sr = xf.rect(r);
+        self.menu_plate(&xf, r, st);
         self.hit(&xf, id ^ 0x5A11, sr, Action::Swallow);
         let first = items.iter().position(MenuItem::selectable);
         let frame = self.frame;
@@ -798,12 +814,7 @@ impl<S> Painter<'_, S> {
                 }
             }
         }
-        if let Some(rim) = st.rim {
-            self.shadow(&xf, r, st.radius, rim, false);
-        }
-        if let Some(b) = st.border {
-            self.fill(&xf, r, st.radius, Fill::Solid(Color::CLEAR), Some(b));
-        }
+        self.menu_edge(&xf, r, st);
         self.menu_nav.push(MenuNav { id, parent: self.layer.parent_menu, rows: nav, keys: self.layer.inside });
     }
 }

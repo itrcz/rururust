@@ -374,6 +374,7 @@ enum Action<S> {
     DragWindow,
     /// A `.selectable()` area, under the views inside it: a press starts a selection.
     Select { area: u64 },
+    SelectionPick(Box<dyn Fn(&mut S, String)>),
     /// A link in rich text (`Span::link`).
     Link(Box<select::LinkHit<S>>),
     /// Everything outside an open popover: a press closes it and goes no further.
@@ -802,6 +803,7 @@ struct Painter<'a, S> {
     texts: &'a mut Vec<select::TextBox>,
     areas: &'a mut Vec<select::Area>,
     sel: Option<select::PaintSel>,
+    selection_action: Option<crate::view::SelectionAction<S>>,
     /// Inherited by text views: selectable area, link handler, highlight color.
     tctx: select::TextCtx<S>,
     /// Number (in tree order) of the next text view; set by the parent before each child.
@@ -908,12 +910,13 @@ impl<S> Painter<'_, S> {
         self.bars.push(Bar { xf: bxf, id: div, strip: xf.rect(grab), zone: Some(Some(Cursor::ResizeH)), rail: None, thumb: None, hit: Some(Action::Split(Rc::new(hit))) });
     }
 
-    /// Paints the scroll bars collected so far, over everything painted before them: content
+    /// Paints selection actions and the scroll bars collected so far, over everything painted before them: content
     /// laid over a scroll view (a fade, a floating composer) never covers its bar or takes its
     /// presses. Called at the end of the tree and of each layer, and before a modal's scrim,
     /// so popovers, menus and modals still cover bars beneath them.
-    fn flush_bars(&mut self) {
+    fn flush_layer_decorations(&mut self) {
         self.smooth = false;
+        self.paint_selection_action();
         for b in std::mem::take(&mut self.bars) {
             if let Some(cursor) = b.zone {
                 self.zone(&b.xf, b.id, b.strip, cursor);
@@ -1562,7 +1565,7 @@ impl<S> Painter<'_, S> {
                 // Slides as one piece in whole pixels: its parts keep their sizes on the way.
                 let pos = cxf.at_px(pos);
                 // Bars of what lies underneath go under the scrim with it.
-                self.flush_bars();
+                self.flush_layer_decorations();
                 let modal_start=self.list.cmds.len();
                 if mode != OverlayMode::Toast {
                     if let Some(mut glass) = style.backdrop {
@@ -1595,7 +1598,7 @@ impl<S> Painter<'_, S> {
                 self.tbase = tbase;
                 self.paint(*child, cn, pos, cxf, cid);
                 if mode==OverlayMode::Modal {
-                    self.flush_bars();
+                    self.flush_layer_decorations();
                     self.remember_modal(id,modal_start,modal_body,tc,style,xf.s,xf.rect(r),body,body_radius);
                     self.modal_content_blur(body,body_radius,style.content_blur,tc);
                 }
@@ -1609,6 +1612,7 @@ impl<S> Painter<'_, S> {
                     child_xf.ty-=8.0*(1.0-p)*xf.s;
                     child_xf.blur=1.6*(1.0-p);
                     let cid=child_id(id,0,child.key);
+                    self.tbase = tbase;
                     self.paint(*child,&ln.children[0],(cr.x,cr.y),child_xf,cid);
                 }
             }
@@ -2465,6 +2469,7 @@ impl<S: 'static> Ui<S> {
             texts: &mut self.sel.texts,
             areas: &mut self.sel.areas,
             sel: paint_sel,
+            selection_action: None,
             tctx: select::TextCtx::with_color(look.theme.color.selection),
             tbase: 0,
             path: Vec::new(),
@@ -2481,13 +2486,13 @@ impl<S: 'static> Ui<S> {
             px: self.scale,
         };
         p.paint(view, &root, (0.0, 0.0), xf, 1);
-        p.flush_bars();
+        p.flush_layer_decorations();
         p.closing_modals();
         p.paint_layers();
         match p.menu.take() {
             Some(menu) => {
                 p.paint_picker_menu(menu, size);
-                p.flush_bars();
+                p.flush_layer_decorations();
             }
             None if !p.managed_seen => self.open_menu = None, // its picker or anchor is gone
             None => {}
@@ -2495,6 +2500,7 @@ impl<S: 'static> Ui<S> {
         let (paint_wake, spin, relayout) = (p.wake, p.spin, p.relayout);
         if p.sel.is_some_and(|s| s.stale) {
             self.sel.sel = None; // its rows are gone
+            self.sel.quote = None;
         }
         for (handler,range) in std::mem::take(&mut p.visible_events) {handler(&mut self.state,range);}
         if autoscroll.is_some() {
@@ -2770,8 +2776,8 @@ impl<S: 'static> Ui<S> {
         // only scrolls (no long-press selection yet), a link keeps it until released.
         match hit.map(|i| &self.hits[i].action) {
             Some(&Action::Select { area }) if !touch => self.sel_press(area, pos),
-            Some(Action::Link(_)) => {}
-            _ => self.sel.sel = None,
+            Some(Action::Link(_) | Action::SelectionPick(_)) => {}
+            _ => { self.sel.clear(); }
         }
         true
     }
@@ -2970,8 +2976,14 @@ impl<S: 'static> Ui<S> {
                 st.hl = Some(row);
                 st.sub = Some(row);
             }
+            Action::SelectionPick(run) => {
+                if let Some(quote) = self.sel.quote.take() {
+                    self.sel.sel = None;
+                    run(&mut self.state, quote);
+                }
+            }
             Action::Link(_) => {
-                self.sel.sel = None;
+                self.sel.clear();
                 self.open_link(i);
             }
             _ => {}

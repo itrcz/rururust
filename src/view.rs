@@ -826,10 +826,16 @@ pub(crate) struct Pop<S> {
     pub match_anchor_width: bool,
 }
 
+pub(crate) struct SelectionAction<S> {
+    pub label: String,
+    pub run: Box<dyn Fn(&mut S, String)>,
+}
+
 /// Rarely used attachments, boxed so that a plain view stays small.
 pub(crate) struct Extras<S> {
     pub pop: Option<Pop<S>>,
     pub select_popup: bool,
+    pub selection_action: Option<SelectionAction<S>>,
     pub tip: Option<Box<View<S>>>,
     /// A default tooltip (label, key hint), built with the theme by `theme::apply`.
     pub tip_text: Option<(String, Option<String>)>,
@@ -877,7 +883,7 @@ impl<S> View<S> {
     }
 
     fn extras(&mut self) -> &mut Extras<S> {
-        self.extra.get_or_insert_with(|| Box::new(Extras { pop: None, select_popup: false, tip: None, tip_text: None, tip_at: None, shortcuts: Vec::new(), secondary: None, pointer: None, split: None }))
+        self.extra.get_or_insert_with(|| Box::new(Extras { pop: None, select_popup: false, selection_action: None, tip: None, tip_text: None, tip_at: None, shortcuts: Vec::new(), secondary: None, pointer: None, split: None }))
     }
 
     /// Observes mouse motion anywhere in the window while this view is visible. The
@@ -1627,6 +1633,19 @@ impl<S> View<S> {
     /// ```
     pub fn selectable(mut self) -> Self {
         self.style.select = true;
+        self
+    }
+    /// Makes this area selectable and shows a floating action beside a released, nonempty
+    /// mouse selection. Its handler receives the plain text as selected at release, even
+    /// if a streaming row changes before the click. The clipboard is left alone.
+    /// Attach this to the outermost selectable view (the list itself for a chat).
+    ///
+    /// ```ignore
+    /// list(n, 80.0, row).selection_action("Ask in side chat", |s, quote| s.ask(quote))
+    /// ```
+    pub fn selection_action(mut self, label: impl Into<String>, run: impl Fn(&mut S, String) + 'static) -> Self {
+        self.style.select = true;
+        self.extras().selection_action = Some(SelectionAction { label: label.into(), run: Box::new(run) });
         self
     }
     /// Color of the selection highlight under selected text, here and in text fields of the

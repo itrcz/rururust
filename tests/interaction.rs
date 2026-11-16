@@ -1439,6 +1439,87 @@ fn selection_spans_texts_with_separators_copy_as_and_sticky_order() {
 }
 
 #[test]
+fn selection_action_uses_the_released_quote_across_lazy_rows_while_streaming() {
+    #[derive(Default)]
+    struct Feed { revised: bool, quotes: Vec<String> }
+    let builds = std::rc::Rc::new(std::cell::Cell::new(0));
+    let count = builds.clone();
+    let mut ui = Ui::new(Feed::default(), move |s: &Feed| {
+        count.set(count.get() + 1);
+        let revised = s.revised;
+        scroll(list(2, 36.0, move |row| {
+            let body = match (row, revised) {
+                (0, false) => "Привет", (0, true) => "Правка", _ => "мир 🌍",
+            };
+            vstack(collapse(true, text(body).selectable())).height(36.0).align(Align::Start)
+        }).selectable().selection_action("Ask in side chat", |s: &mut Feed, quote| s.quotes.push(quote)))
+    });
+    let size = (420.0, 320.0);
+    ui.frame(size);
+    ui.frame(size);
+    let r = text_rects(&ui);
+    let start = (r[0].0 + 0.1, r[0].1 + 5.0);
+    let end = (r[1].0 + r[1].2 + 1.0, r[1].1 + 5.0);
+    ui.pointer_down(start, false);
+    ui.pointer_move(end);
+    ui.frame(size);
+    assert_eq!(texts(&ui).len(), 2, "no action while dragging");
+    ui.pointer_up(end);
+    let before = builds.get();
+    ui.frame(size);
+    assert_eq!(builds.get(), before + 1, "painting the action must not rebuild the feed");
+    let r = text_rects(&ui);
+    assert_eq!(r.len(), 3, "a floating action is visible after release");
+    let (x,y,w,h) = r[2];
+    assert!((y-end.1).abs() < 70.0, "action stays beside the selected line");
+    let at = (x+w*0.5, y+h*0.5);
+    ui.state.revised = true;
+    ui.frame(size);
+    ui.pointer_down(at, false);
+    ui.frame(size); // native runners can redraw between mouse down and mouse up
+    ui.pointer_up(at);
+    assert_eq!(ui.state.quotes, ["Привет\n\nмир 🌍"]);
+    assert!(ui.requests.is_empty(), "the action must leave the clipboard alone");
+    ui.frame(size);
+    assert_eq!(texts(&ui).len(), 2, "the action closes after activation");
+}
+
+#[test]
+fn selection_action_is_scoped_and_does_not_consume_outside_clicks() {
+    let mut ui = Ui::new(0, |_: &i32| vstack((
+        text("Private feed").selection_action("Ask", |s: &mut i32, _| *s += 10),
+        text("Other text").selectable(),
+        button("Continue", |s: &mut i32| *s += 1),
+    )).spacing(50.0).align(Align::Start).place(Align::Start, Align::Start));
+    let size = (400.0,300.0);
+    ui.frame(size);
+    let rows = text_rects(&ui);
+    let range = |i: usize| {
+        let (x,y,w,_) = rows[i];
+        ((x+0.1,y+4.0),(x+w-0.1,y+4.0))
+    };
+    let (a,b)=range(1);
+    drag(&mut ui,a,b);
+    ui.frame(size);
+    assert_eq!(clipboard(&mut ui).as_deref(), Some("Other text"));
+    assert_eq!(texts(&ui).len(),3,"other areas have no selection action");
+    let (a,b)=range(0);
+    click(&mut ui,a);
+    ui.frame(size);
+    assert_eq!(texts(&ui).len(),3,"a caret alone has no action");
+    drag(&mut ui,a,b);
+    ui.frame(size);
+    assert_eq!(texts(&ui).len(),4,"an action implies selectable text");
+    assert!(ui.key(KeyInput::Escape));
+    ui.frame(size);
+    assert_eq!(texts(&ui).len(),3);
+    drag(&mut ui,a,b);
+    ui.frame(size);
+    click(&mut ui,range(2).0);
+    assert_eq!(ui.state,1,"the first outside click reaches its own control");
+}
+
+#[test]
 fn selection_runs_across_lazy_rows_and_copies_rows_off_screen() {
     use std::cell::Cell;
     use std::rc::Rc;
