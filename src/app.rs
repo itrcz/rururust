@@ -93,6 +93,8 @@ pub struct App<S> {
     native_menu: Option<(Box<dyn Fn(&S) -> Vec<crate::NativeMenu>>, Box<dyn Fn(&mut S, u32)>)>,
     /// Desktop-entry id for Linux (`app_id`).
     app_id: Option<String>,
+    /// Window icon as RGBA pixels, width, height (`icon`).
+    icon: Option<(Vec<u8>, u32, u32)>,
 }
 
 impl<S: 'static> App<S> {
@@ -116,7 +118,24 @@ impl<S: 'static> App<S> {
             file_hover: None,
             native_menu: None,
             app_id: None,
+            icon: None,
         }
+    }
+    /// Window icon from straight (non-premultiplied) RGBA8 pixels, row by row:
+    /// `rgba.len() == width * height * 4`. Windows shows it in the title bar and taskbar
+    /// (give 32x32 or larger: it is scaled down for the title bar, up to 256 for the taskbar),
+    /// X11 hands it to the window manager. A no-op on macOS (the bundle icon wins), Wayland
+    /// (the compositor takes the icon from the `.desktop` file named by [`App::app_id`]) and
+    /// the web. Pixels that do not match the size are ignored with a message on stderr.
+    ///
+    /// ```ignore
+    /// let img = image::load_from_memory(include_bytes!("icon.png"))?.to_rgba8();
+    /// let (w, h) = img.dimensions();
+    /// App::new(state, view).icon(img.into_raw(), w, h).run();
+    /// ```
+    pub fn icon(mut self, rgba: Vec<u8>, width: u32, height: u32) -> Self {
+        self.icon = Some((rgba, width, height));
+        self
     }
     /// Desktop-entry id, e.g. `"com.example.Chat"`: the Wayland `app_id` and X11 `WM_CLASS`
     /// that docks and taskbars use to match the window with its `.desktop` file and icon.
@@ -1087,6 +1106,20 @@ impl<S: 'static> ApplicationHandler<Wake> for Runner<S> {
             // Both traits name the method `with_name`; whichever backend runs reads its own field.
             attrs = winit::platform::wayland::WindowAttributesExtWayland::with_name(attrs, id.clone(), id.clone());
             attrs = winit::platform::x11::WindowAttributesExtX11::with_name(attrs, id.clone(), id.clone());
+        }
+        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd", target_os = "openbsd"))]
+        if let Some((rgba, w, h)) = self.app.icon.clone() {
+            match winit::window::Icon::from_rgba(rgba, w, h) {
+                Ok(icon) => {
+                    // ICON_BIG for the taskbar and Alt-Tab; the attribute alone sets only ICON_SMALL.
+                    #[cfg(target_os = "windows")]
+                    {
+                        attrs = winit::platform::windows::WindowAttributesExtWindows::with_taskbar_icon(attrs, Some(icon.clone()));
+                    }
+                    attrs = attrs.with_window_icon(Some(icon));
+                }
+                Err(e) => eprintln!("ruru: window icon ignored: {e}"),
+            }
         }
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         #[cfg(target_arch = "wasm32")]
