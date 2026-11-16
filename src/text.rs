@@ -15,11 +15,25 @@ static INTER: &[u8] = include_bytes!("../assets/Inter.ttf");
 #[cfg(feature = "markdown")]
 static MONO: &[u8] = include_bytes!("../assets/JetBrainsMono.ttf");
 
-const BUNDLED_SANS: &str = "Inter";
+/// The bundled faces are registered under these private family names, not their own: an
+/// installed "Inter" or "JetBrains Mono" (static files of another version are common on
+/// Linux) would otherwise win every query at its exact weights and mix into the bundled one.
+const BUNDLED_SANS: &str = "Inter (ruru)";
 #[cfg(feature = "markdown")]
-const BUNDLED_MONO: Option<&str> = Some("JetBrains Mono");
+const BUNDLED_MONO: Option<&str> = Some("JetBrains Mono (ruru)");
 #[cfg(not(feature = "markdown"))]
 const BUNDLED_MONO: Option<&str> = None;
+
+/// Adds a bundled font to `db` under the private family `family` (see [`BUNDLED_SANS`]).
+fn load_bundled(db: &mut fontdb::Database, data: &'static [u8], family: &str) {
+    let mut own = fontdb::Database::new();
+    own.load_font_source(fontdb::Source::Binary(std::sync::Arc::new(data)));
+    for face in own.faces() {
+        let mut face = face.clone();
+        face.families = vec![(family.to_string(), fontdb::Language::English_UnitedStates)];
+        db.push_face_info(face);
+    }
+}
 
 /// The platform's UI font, best first. macOS lists its variable San Francisco as "System
 /// Font" (SFNS.ttf), with ".SF NS" as another name; an installed SF Pro comes first.
@@ -288,8 +302,8 @@ impl Layout {
 
 impl TextSystem {
     /// Hinting snaps outlines to the pixel grid: crisper stems on a 1x screen, but on 2x and
-    /// up it only bends the shapes (most visibly JetBrains Mono, which carries hints; Inter
-    /// has next to none) and macOS never hints anyway. The choice lives in the shaped glyphs'
+    /// up it only bends the shapes (neither bundled font carries hinting instructions now,
+    /// but a system fallback may) and macOS never hints anyway. The choice lives in the shaped glyphs'
     /// cache keys, so a change (window moved to another screen) reshapes everything once.
     /// Glyph positions do not depend on it, so the layout stays the same.
     pub(crate) fn set_scale(&mut self, scale: f32) {
@@ -305,19 +319,24 @@ impl TextSystem {
         // Inter is embedded so text looks identical on every platform (and works
         // in the browser, where there are no system fonts). On native the system
         // fonts are loaded too and serve as fallback for emoji / CJK / etc.
-        let source = fontdb::Source::Binary(std::sync::Arc::new(INTER));
         #[cfg(not(target_arch = "wasm32"))]
-        let mut fonts = {
-            let mut f = FontSystem::new();
-            f.db_mut().load_font_source(source);
-            f
-        };
+        let fonts = FontSystem::new();
         #[cfg(target_arch = "wasm32")]
-        let mut fonts = FontSystem::new_with_fonts([source]);
+        let fonts = FontSystem::new_with_fonts([]);
+        Self::with_fonts(fonts)
+    }
+
+    /// Adds the bundled fonts to `fonts` (its system fonts, if any, stay as fallback).
+    fn with_fonts(mut fonts: FontSystem) -> Self {
+        load_bundled(fonts.db_mut(), INTER, BUNDLED_SANS);
         fonts.db_mut().set_sans_serif_family(BUNDLED_SANS);
         #[cfg(feature = "markdown")]
-        fonts.db_mut().load_font_source(fontdb::Source::Binary(std::sync::Arc::new(MONO)));
-        if let Some(m) = BUNDLED_MONO {
+        load_bundled(fonts.db_mut(), MONO, BUNDLED_MONO.unwrap_or_default());
+        let has = |db: &fontdb::Database, name: &str| db.faces().any(|f| f.families.iter().any(|(n, _)| n == name));
+        // Without a bundled mono, code takes the platform's own rather than cosmic-text's
+        // default (Noto Sans Mono), which most systems lack.
+        let mono = BUNDLED_MONO.or_else(|| SYSTEM_MONO.iter().copied().find(|n| has(fonts.db(), n)));
+        if let Some(m) = mono {
             fonts.db_mut().set_monospace_family(m);
         }
         TextSystem {
@@ -376,7 +395,10 @@ impl TextSystem {
 
     /// The family plain text is set in right now (after fallback).
     pub fn font_family(&self) -> &str {
-        self.fonts.db().family_name(&Family::SansSerif)
+        match self.fonts.db().family_name(&Family::SansSerif) {
+            BUNDLED_SANS => "Inter",
+            name => name,
+        }
     }
 
     /// Content and style, not width: one entry serves every width the text is shown at.
@@ -456,7 +478,10 @@ impl TextSystem {
                     a = a.cache_key_flags(flags | CacheKeyFlags::FAKE_ITALIC); // slanted, no extra font file
                 }
                 if s.mono {
-                    a = a.family(Family::Monospace);
+                    // The bundled JetBrains Mono spans 100..=800; past it cosmic-text would take
+                    // whatever monospace the system has (DejaVu Sans Mono on Linux, Menlo on macOS).
+                    let w = a.weight.0.min(800);
+                    a = a.family(Family::Monospace).weight(Weight(w));
                 }
                 if optical {
                     let t = if s.mono { spec.tracking } else { track(s.size.unwrap_or(spec.size), a.weight.0) };
@@ -933,6 +958,49 @@ impl Default for TextSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Linux often has Inter / JetBrains Mono installed as static files of another version.
+    /// They must not take over the bundled faces at their exact weights (they did: a
+    /// "Inter Regular" on the system won every weight-400 run), and code at any weight stays
+    /// in the bundled mono (a static Regular sent bold or medium code to any system
+    /// monospace). Also the bare case, a machine with no fonts: all of it still shaped.
+    #[cfg(feature = "markdown")]
+    #[test]
+    fn installed_namesakes_do_not_replace_bundled_fonts() {
+        // Static copies that load first, as system fonts do, plus some other monospace.
+        let impostor = |db: &mut fontdb::Database, data: &'static [u8], family: &str, weight: u16| {
+            let mut own = fontdb::Database::new();
+            own.load_font_source(fontdb::Source::Binary(std::sync::Arc::new(data)));
+            let mut face = own.faces().next().unwrap().clone();
+            face.families = vec![(family.into(), fontdb::Language::English_UnitedStates)];
+            face.weight = fontdb::Weight(weight);
+            face.post_script_name = format!("Impostor-{weight}");
+            db.push_face_info(face);
+        };
+        let mut system = fontdb::Database::new();
+        for w in [400, 500, 600, 700, 900] {
+            impostor(&mut system, INTER, "Inter", w);
+            impostor(&mut system, MONO, "JetBrains Mono", w);
+            impostor(&mut system, MONO, "DejaVu Sans Mono", w);
+        }
+        for db in [system, fontdb::Database::new()] {
+            let mut ts = TextSystem::with_fonts(FontSystem::new_with_locale_and_db("en-US".into(), db));
+            assert_eq!(ts.font_family(), "Inter");
+            for weight in [400u16, 500, 600, 700, 900] {
+                let spans = [Span::new("Привет, "), Span::new("world").bold(), Span::new(" let x = 1;").code(), Span::new(" fn").code().bold()];
+                let spec = TextSpec { spans: &spans, text: "", weight, ..Default::default() };
+                let key = ts.measure(&spec, None).0;
+                let buffer = ts.get(key).unwrap().buffer;
+                for g in buffer.layout_runs().flat_map(|r| r.glyphs.iter()) {
+                    let face = ts.fonts.db().face(g.font_id).unwrap();
+                    let want = if g.start >= "Привет, world".len() { BUNDLED_MONO.unwrap() } else { BUNDLED_SANS };
+                    assert_eq!(face.families[0].0, want, "weight {weight}, glyph at {}", g.start);
+                    assert!(!face.post_script_name.starts_with("Impostor"), "weight {weight}, glyph at {}", g.start);
+                    assert_ne!(g.glyph_id, 0, "missing glyph at {}", g.start);
+                }
+            }
+        }
+    }
 
     fn shaped(ts: &mut TextSystem, text: &str, w: Option<f32>) -> u64 {
         ts.measure(&TextSpec { text, ..Default::default() }, w).0
